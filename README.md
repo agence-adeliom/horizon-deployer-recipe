@@ -6,6 +6,12 @@ Le recipe `horizon-transfer` ajoute quatre tâches pour déplacer la base de don
 uploads entre environnements, avec confirmations explicites, progression en temps réel et
 nettoyage systématique des fichiers temporaires.
 
+## Prérequis
+
+PHP >= 8.0 et Deployer ^7.4. Testé en exécution réelle sur PHP 8.0, 8.1 et 8.2 — un projet
+encore en 8.0 ou 8.1 peut donc l'utiliser. PHP 7.4 n'est pas supporté : le code s'appuie sur
+`catch` sans variable, les arguments nommés, l'opérateur `?->` et `str_contains`.
+
 ## Installation
 
 Le dépôt n'étant pas sur Packagist, ajouter dans le `composer.json` du projet :
