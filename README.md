@@ -8,11 +8,7 @@ nettoyage systématique des fichiers temporaires.
 
 ## Installation
 
-```bash
-composer require --dev agence-adeliom/horizon-deployer-recipe
-```
-
-Le dépôt n'étant pas sur Packagist, ajouter au préalable dans le `composer.json` du projet :
+Le dépôt n'étant pas sur Packagist, ajouter dans le `composer.json` du projet :
 
 ```json
 {
@@ -23,6 +19,34 @@ Le dépôt n'étant pas sur Packagist, ajouter au préalable dans le `composer.j
         }
     ]
 }
+```
+
+**Ce dépôt est privé.** Composer a donc besoin d'un token GitHub, sans quoi l'installation échoue sur
+une erreur trompeuse : un `404` de l'API GitHub sur l'archive, celle-ci ne révélant pas l'existence
+d'un dépôt privé. Renseigner dans le `auth.json` du projet, à garder hors du dépôt :
+
+```json
+{
+    "github-oauth": {
+        "github.com": "TOKEN_GITHUB"
+    }
+}
+```
+
+Un token *fine-grained* suffit, avec le minimum de droits : `agence-adeliom` comme propriétaire, accès
+limité à ce dépôt, permission **Contents : Read-only**. En token *classic*, il faut le scope `repo`
+complet, faute de variante en lecture seule.
+
+Sans token, l'alternative est de cloner par SSH au lieu de télécharger l'archive :
+
+```bash
+composer config preferred-install.agence-adeliom/horizon-deployer-recipe source
+```
+
+Puis dans les deux cas :
+
+```bash
+composer require --dev agence-adeliom/horizon-deployer-recipe
 ```
 
 Puis dans `deploy.php`, **avec `require_once`** :
