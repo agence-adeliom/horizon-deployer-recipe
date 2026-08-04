@@ -21,9 +21,10 @@
 |
 | Sûreté :
 |  - un pull ne modifie JAMAIS le distant, hormis ses propres fichiers temporaires ;
-|  - toutes les commandes WP-CLI de lecture tournent avec --skip-plugins
-|    --skip-themes : aucun code de plugin n'est chargé, donc aucune routine de mise
-|    à jour ne peut se déclencher au passage ;
+|  - toutes les commandes WP-CLI tournent avec --skip-plugins --skip-themes, ce qui
+|    évite qu'une routine de mise à jour de plugin ne se déclenche au passage.
+|    Attention : les mu-plugins échappent à --skip-plugins, WordPress les chargeant
+|    inconditionnellement ;
 |  - un push demande toujours confirmation de la destination, et exige la saisie de
 |    l'alias en clair quand l'hôte est protégé ({{transfer_protected}}, vrai par
 |    défaut si l'alias ou le stage contient « prod ») ;
@@ -111,6 +112,7 @@ option('from', null, InputOption::VALUE_REQUIRED, 'Environnement source : local 
 option('to', null, InputOption::VALUE_REQUIRED, 'Environnement de destination : alias d\'hôte');
 option('strategy', null, InputOption::VALUE_REQUIRED, 'uploads:push : merge (fusion) ou mirror (miroir, supprime à la destination)');
 option('checksum', null, InputOption::VALUE_NONE, 'uploads:push : compare les fichiers sur leur contenu et non sur taille + date (lent)');
+option('precise', null, InputOption::VALUE_NONE, 'search-replace : force le traitement PHP de toutes les colonnes (plus lent, gourmand en mémoire)');
 
 /*
 |--------------------------------------------------------------------------
@@ -886,14 +888,23 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
         info(sprintf('   Tables exclues : <comment>%s</comment>', $skipTables));
     }
 
+    // --precise reste optionnel : il force le traitement PHP de TOUTES les colonnes
+    // et sature la mémoire sur les grosses tables. Par défaut, WP-CLI n'emploie PHP
+    // que pour les colonnes contenant du sérialisé (et corrige alors les longueurs
+    // s:NN, vérifié) et passe par un REPLACE() SQL ailleurs — bien plus léger.
+    $precise = input()->getOption('precise') ? ' --precise' : '';
+
+    // stdin fermé : sur erreur fatale, WP-CLI propose de relancer la commande et
+    // attend une réponse. Sans cela, la tâche resterait bloquée sur cette question.
     foreach ($steps as [, $search, $replace]) {
         $commands[] = sprintf(
-            '%s search-replace %s %s --all-tables --precise --skip-columns=guid'
-                . ' --report-changed-only --skip-plugins --skip-themes%s',
+            '%s search-replace %s %s --all-tables --skip-columns=guid'
+                . ' --report-changed-only --skip-plugins --skip-themes%s%s < /dev/null',
             $bin,
             escapeshellarg($search),
             escapeshellarg($replace),
             $skipTables === '' ? '' : ' --skip-tables=' . escapeshellarg($skipTables),
+            $precise,
         );
     }
 
@@ -928,7 +939,22 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
             $search,
             $replace,
         ));
-        transferWpRun($env, $commands[$index], ['timeout' => 3600, 'real_time_output' => true]);
+
+        try {
+            transferWpRun($env, $commands[$index], ['timeout' => 3600, 'real_time_output' => true]);
+        } catch (\Throwable $exception) {
+            warning(sprintf(
+                'La passe %d a échoué : la base de « %s » est partiellement réécrite.',
+                $index + 1,
+                $label,
+            ));
+            info('   Relancer la même commande est sans risque : ce qui est déjà remplacé ne correspond plus.');
+            info('   En cas de saturation mémoire, deux leviers dans le deploy.php :');
+            info('     exclure la table fautive  <comment>set(\'transfer_search_replace_skip_tables\', \'*_wf*,*_gf_entry\')</comment>');
+            info('     relever la limite PHP     <comment>set(\'bin/wp_local\', \'php -d memory_limit=-1 /usr/local/bin/wp\')</comment>');
+
+            throw $exception;
+        }
     }
 
     info('✅ URLs réécrites.');

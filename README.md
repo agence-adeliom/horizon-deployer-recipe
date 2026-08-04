@@ -115,9 +115,10 @@ local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécrit
 ## Sûreté
 
 - **Un `pull` ne modifie jamais l'environnement distant**, hormis ses propres fichiers
-  temporaires. Toutes les commandes WP-CLI de lecture tournent avec `--skip-plugins
-  --skip-themes` : aucun code de plugin n'est chargé, donc aucune routine de mise à jour
-  ne peut se déclencher au passage.
+  temporaires. Toutes les commandes WP-CLI tournent avec `--skip-plugins --skip-themes`,
+  ce qui évite qu'une routine de mise à jour de plugin ne se déclenche au passage.
+  À savoir : **les mu-plugins échappent à `--skip-plugins`**, WordPress les chargeant
+  inconditionnellement. Leur code s'exécute donc malgré tout.
 - **Un `push` demande toujours confirmation** de la destination. Si l'hôte est protégé
   (`transfer_protected`, vrai par défaut dès que l'alias ou le stage contient `prod`), il
   faut saisir son alias en clair : un simple `[y/N]` est trop facile à valider par réflexe.
@@ -149,6 +150,30 @@ deux passes casserait la première.
 Les tables de logs et de caches de plugins sont exclues par défaut
 (`transfer_search_replace_skip_tables`, `*_wf*`) : Wordfence stocke des dizaines de
 milliers de chemins de fichiers que la passe « domaine nu » réécrirait inutilement.
+
+### Mémoire et grosses bases
+
+`--precise` n'est **pas** activé par défaut. Cette option force WP-CLI à traiter toutes les
+colonnes en PHP, ce qui sature la mémoire sur les grosses tables (`wp_gf_entry` et autres
+journaux de plugins). Sans elle, WP-CLI n'emploie PHP que pour les colonnes contenant du
+sérialisé — et corrige alors correctement les longueurs `s:NN` — et passe par un `REPLACE()`
+SQL ailleurs, exécuté par le moteur de base. Pour l'activer malgré tout :
+
+```bash
+dep db:pull production --precise
+```
+
+Si une passe échoue par saturation mémoire, la base est partiellement réécrite. Relancer la
+commande est sans risque : ce qui est déjà remplacé ne correspond plus. Deux leviers :
+
+```php
+// exclure la table fautive
+set('transfer_search_replace_skip_tables', '*_wf*,*_gf_entry');
+
+// relever la limite mémoire — WP-CLI étant un phar à shebang, WP_CLI_PHP_ARGS est ignoré,
+// il faut invoquer PHP explicitement
+set('bin/wp_local', 'php -d memory_limit=-1 /usr/local/bin/wp');
+```
 
 ## Pourquoi « 0 fichier transféré » ?
 
@@ -204,7 +229,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `bin/wp` | phar téléchargé à la demande | WP-CLI distant |
 | `transfer_local_prefix` | `ddev ` | Préfixe des commandes suggérées, tapées depuis l'hôte |
 
-Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`.
+Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`, `--precise`.
 
 Exemple d'inventaire retirant la protection d'un hôte de recette :
 
