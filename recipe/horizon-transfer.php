@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.0.3');
+define('HORIZON_TRANSFER_RECIPE', '1.1.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -821,6 +821,27 @@ function transferConfirm(string $question, bool $default): bool
 }
 
 /**
+ * Demande confirmation avant une écriture de travail volumineuse — une archive, un
+ * staging — dont le seul enjeu est l'espace disque : le site n'est pas touché et le
+ * fichier est supprimé en fin de tâche.
+ *
+ * Le mode non interactif ne vaut PAS refus ici, contrairement à transferConfirm() :
+ * bloquer rendrait les tâches inutilisables en scripté sans rien protéger de
+ * durable. Les écritures qui modifient réellement un environnement — import, rsync
+ * vers une destination — restent, elles, refusées en -n.
+ */
+function transferConfirmDiskUsage(string $question, string $size): bool
+{
+    if (!input()->isInteractive()) {
+        warning(sprintf('Mode non interactif : poursuite sans confirmation (%s à écrire).', $size));
+
+        return true;
+    }
+
+    return askConfirmation($question, true);
+}
+
+/**
  * Normalise le retour d'askChoice(), qui renvoie un tableau en sortie « quiet ».
  */
 function transferChoice(string $question, array $choices, ?string $default = null): string
@@ -1356,11 +1377,25 @@ task('uploads:pull', static function (): void {
 
     info('🔎 Analyse du dossier uploads distant (lecture seule)...');
     $fileCount = trim(transferRun($from, sprintf('find %s -type f | wc -l', escapeshellarg($remoteUploads))));
+    // Mesuré une seule fois : `du -hs` parcourt tout l'arbre, ce n'est pas gratuit.
+    $uploadsSize = transferSize($from, $remoteUploads, true);
+    info(sprintf('   <comment>%s</comment> fichiers, <comment>%s</comment> à archiver.', $fileCount, $uploadsSize));
+
+    // Demandé AVANT transferWorkdir(), qui crée déjà un répertoire sur le serveur :
+    // un refus ne doit rien y laisser. On annonce le volume, le disque du serveur
+    // n'ayant aucune raison d'être saturé à l'insu de qui lance la tâche.
     info(sprintf(
-        '   <comment>%s</comment> fichiers, <comment>%s</comment> à archiver.',
-        $fileCount,
-        transferSize($from, $remoteUploads, true),
+        '⚠️  L\'archive sera écrite sur le serveur, dans <comment>%s</comment>,',
+        transferResolvePath($from, '{{transfer_tmp_dir}}'),
     ));
+    info(sprintf('   où elle occupera jusqu\'à <comment>%s</comment> le temps du transfert.', $uploadsSize));
+
+    if (!transferConfirmDiskUsage(sprintf('Créer l\'archive sur « %s » ?', $label), $uploadsSize)) {
+        info('Abandon : rien n\'a été écrit sur le serveur.');
+        invoke('transfer:cleanup');
+
+        return;
+    }
 
     $archive = transferWorkdir($from) . '/uploads.tar.gz';
     $localName = sprintf('uploads-%s-%s.tar.gz', $label, date('Ymd-His'));
@@ -1468,11 +1503,13 @@ task('uploads:push', static function (): void {
     info('🔎 Analyse (lecture seule)...');
     $sourceCount = trim(transferRun($from, sprintf('find %s -type f | wc -l', escapeshellarg($sourcePath))));
     $targetCount = trim(transferRun($to, sprintf('find %s -type f | wc -l', escapeshellarg($targetPath))));
+    // Mesurée une seule fois : réutilisée pour annoncer le volume du staging local.
+    $sourceSize = transferSize($from, $sourcePath, true);
     info(sprintf(
         '   Source      <comment>%s</comment> : %s fichiers, %s',
         $sourcePath,
         $sourceCount,
-        transferSize($from, $sourcePath, true),
+        $sourceSize,
     ));
     info(sprintf(
         '   Destination <comment>%s</comment> : %s fichiers, %s',
@@ -1524,6 +1561,23 @@ task('uploads:push', static function (): void {
     }
 
     if ($from !== null && !transferSameServer($from, $to)) {
+        // rsync n'accepte qu'une extrémité distante : entre deux serveurs, le transit
+        // passe par la machine locale. C'est donc le disque de qui lance la tâche qui
+        // se remplit, ce qui n'a rien d'évident — d'où la confirmation, demandée avant
+        // transferWorkdir() pour qu'un refus ne laisse aucun répertoire derrière lui.
+        info(sprintf(
+            '⚠️  Serveurs distincts : le transit passe par cette machine, dans <comment>%s</comment>,',
+            get('transfer_local_tmp_dir'),
+        ));
+        info(sprintf('   qui recevra jusqu\'à <comment>%s</comment> le temps du transfert.', $sourceSize));
+
+        if (!transferConfirmDiskUsage('Copier les uploads en local pour le transit ?', $sourceSize)) {
+            info('Abandon : aucune modification, ni en local ni à la destination.');
+            invoke('transfer:cleanup');
+
+            return;
+        }
+
         $staging = transferWorkdir(null) . '/uploads/';
         info(sprintf('🚚 Serveurs distincts : <comment>%s</comment> → local...', transferEnvLabel($from)));
         runLocally('mkdir -p ' . escapeshellarg($staging));

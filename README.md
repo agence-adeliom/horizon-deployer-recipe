@@ -130,12 +130,21 @@ local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécrit
   faut saisir son alias en clair : un simple `[y/N]` est trop facile à valider par réflexe.
 - **La base de destination est dumpée avant tout import**, dans `{{transfer_backup_dir}}`.
   Ce dump est conservé : il survit au nettoyage.
+- **Toute écriture volumineuse liée aux uploads est confirmée**, en annonçant le volume :
+  la création de l'archive `tar.gz` sur le serveur (`uploads:pull`), et la copie de transit
+  sur la machine locale quand `uploads:push` relie deux serveurs distincts. Un refus
+  n'écrit rien, la question précédant la création du répertoire de travail. Les tâches de
+  base de données ne posent pas cette question : leurs dumps sont d'un autre ordre de
+  grandeur.
 - **Aucune trace en cas d'échec.** Les fichiers temporaires vivent dans un répertoire de
   travail unique par environnement, supprimé en fin de tâche et via `fail()`. Les
   répertoires orphelins d'une exécution interrompue brutalement sont purgés au démarrage
   suivant (au-delà de 24 h).
 - **En mode non interactif** (`-n`), aucune écriture n'est effectuée : les tâches `pull`
-  conservent le fichier téléchargé, les tâches `push` abandonnent.
+  conservent le fichier téléchargé, les tâches `push` abandonnent. Seule exception, les
+  confirmations d'espace disque ci-dessus : elles passent outre en annonçant le volume,
+  puisque bloquer y rendrait `uploads:pull` inutilisable en scripté sans rien protéger de
+  durable — l'archive est un fichier de travail, supprimé en fin de tâche.
 
 ## Réécriture d'URLs
 
