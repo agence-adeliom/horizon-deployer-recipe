@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.0.0');
+define('HORIZON_TRANSFER_RECIPE', '1.0.3');
 
 /*
 |--------------------------------------------------------------------------
@@ -71,11 +71,50 @@ set('transfer_backup_dir', '{{deploy_path}}/.dep/backups');
 set('uploads_path', 'web/app/uploads');
 
 // WP-CLI local. Les tâches s'exécutent dans le conteneur DDEV, où `wp` est dans le PATH.
-set('bin/wp_local', 'wp');
+//
+// Le PATH ne suffit pourtant pas à désigner un binaire utilisable : un projet qui
+// requiert « wp-cli/wp-cli » obtient le framework SANS aucune commande (ni `db`, ni
+// `search-replace`, ni `core` — elles vivent dans « wp-cli/wp-cli-bundle »), et
+// Composer en place un proxy dans vendor/bin, prioritaire dans le PATH, qui masque
+// le phar complet fourni par ddev. On retient donc le premier candidat qui connaît
+// réellement `wp db`, ce qui préfère naturellement ce phar sans coder son chemin en
+// dur — le recipe reste utilisable hors ddev.
+set('bin/wp_local', static function (): string {
+    $candidates = [];
+
+    foreach (explode("\n", (string) transferTryLocally('which -a wp 2>/dev/null || command -v wp 2>/dev/null')) as $line) {
+        if (($line = trim($line)) !== '' && !in_array($line, $candidates, true)) {
+            $candidates[] = $line;
+        }
+    }
+
+    foreach ($candidates as $index => $candidate) {
+        if (!transferWpHasCommand(null, 'db', $candidate)) {
+            continue;
+        }
+
+        if ($index > 0) {
+            warning(sprintf(
+                'WP-CLI local : %s ignoré (installé sans ses paquets de commandes), %s retenu.',
+                $candidates[0],
+                $candidate,
+            ));
+        }
+
+        return $candidate;
+    }
+
+    // Aucun candidat exploitable : on garde le comportement historique et on laisse
+    // l'erreur se produire là où elle sera diagnostiquée.
+    return 'wp';
+});
 
 // Préfixe utilisé uniquement dans les commandes suggérées à l'utilisateur, qui
-// seront tapées depuis l'hôte et non depuis le conteneur.
-set('transfer_local_prefix', 'ddev ');
+// seront tapées depuis l'hôte et non depuis le conteneur. `ddev exec` et non
+// `ddev` : le binaire retenu ci-dessus peut être un chemin absolu, que `ddev`
+// n'accepte pas comme sous-commande. Le stdin est transmis dans les deux cas, ce
+// qui laisse les pipes `gunzip -c … | …` fonctionner depuis l'hôte.
+set('transfer_local_prefix', 'ddev exec ');
 
 // Tables exclues du search-replace. Les tables de logs et de caches de plugins
 // (Wordfence en tête) stockent des chemins de fichiers et du trafic, jamais du
@@ -252,6 +291,86 @@ function transferWpBin(?Host $env): string
 }
 
 /**
+ * Vérifie qu'une installation WordPress est exploitable, en CONSERVANT ce que
+ * WP-CLI répond quand elle ne l'est pas.
+ *
+ * Le stderr est capturé au lieu d'être jeté dans /dev/null : sans lui, n'importe
+ * quelle défaillance se réduisait à un « WordPress n'est pas installé » trompeur,
+ * alors que WordPress est le plus souvent bel et bien installé. Les causes
+ * réellement rencontrées sont ailleurs — un `path` de wp-cli.yml qui ne désigne
+ * pas le cœur de WordPress (sous Bedrock « web/wp », pas « web »), une base
+ * injoignable depuis le CLI, ou un {{bin/wp}} incompatible.
+ *
+ * @return array{0: bool, 1: string} [installé, sortie de WP-CLI]
+ */
+function transferWpIsInstalled(?Host $env): array
+{
+    // --no-color : sinon le message d'erreur arrive truffé de codes ANSI.
+    $command = transferWpBin($env) . ' core is-installed --skip-plugins --skip-themes --no-color';
+
+    // On se fie à un marqueur et non au code de sortie : un exit non nul ferait
+    // lever run() par Deployer avant qu'on ait pu lire l'explication de WP-CLI.
+    $output = transferWpRun($env, "if $command 2>&1; then echo '+dep-installed'; fi");
+
+    return [
+        str_contains($output, '+dep-installed'),
+        trim(str_replace('+dep-installed', '', $output)),
+    ];
+}
+
+/**
+ * Vérifie qu'une commande WP-CLI est réellement enregistrée sur un environnement.
+ *
+ * Tester l'existence du binaire (`command -v wp`) ne dit rien de ses capacités :
+ * « wp-cli/wp-cli » installé seul ne connaît aucune commande. Pire, l'échec est
+ * silencieux quand la base est vide — WP-CLI charge WordPress pour chercher la
+ * commande ailleurs, `wp_not_installed()` déclenche une redirection, et le processus
+ * se termine avec le code de sortie 0. Autrement dit `wp db reset` rend la main sans
+ * rien faire ET sans erreur, juste avant un import.
+ *
+ * `cli cmd-dump` interroge le registre et ne dépend pas de l'état de la base.
+ */
+function transferWpHasCommand(?Host $env, string $command, ?string $bin = null): bool
+{
+    $bin ??= transferWpBin($env);
+
+    $count = trim(transferWpRun($env, sprintf(
+        '%s cli cmd-dump --skip-plugins --skip-themes 2>/dev/null | grep -c %s || true',
+        $bin,
+        escapeshellarg(sprintf('"name":"%s"', $command)),
+    )));
+
+    return (int) $count > 0;
+}
+
+/**
+ * Diagnostic exploitable quand WordPress n'est pas utilisable sur un environnement.
+ *
+ * C'est presque toujours la configuration du projet qui est en cause, pas le
+ * recipe : sans le message de WP-CLI, le binaire employé et le répertoire
+ * d'exécution, l'utilisateur n'a aucune prise sur l'erreur.
+ */
+function transferWpMissingDiagnosis(?Host $env, string $wpOutput): string
+{
+    $lines = [];
+
+    foreach (explode("\n", $wpOutput) as $line) {
+        if (trim($line) !== '') {
+            $lines[] = '   WP-CLI : ' . trim($line);
+        }
+    }
+
+    $lines[] = '   Binaire : ' . transferResolve($env, transferWpBin($env));
+    $lines[] = '   Exécuté depuis : ' . ($env === null
+        ? transferProjectRoot()
+        : transferResolvePath($env, '{{current_path}}'));
+    $lines[] = '   Piste la plus fréquente : le « path » du wp-cli.yml du projet doit désigner le';
+    $lines[] = '   cœur de WordPress — sous Bedrock « web/wp », et non « web ».';
+
+    return implode("\n", $lines);
+}
+
+/**
  * Résout les {{placeholders}} dans le contexte d'un environnement donné.
  *
  * Indispensable pour afficher une commande contenant {{bin/wp}} : hors du contexte
@@ -272,6 +391,36 @@ function transferResolve(?Host $env, string $value): string
     });
 
     return $resolved;
+}
+
+/**
+ * Comme transferResolve(), mais rend le chemin exploitable ENTRE QUOTES.
+ *
+ * Deployer tolère un `deploy_path` relatif au HOME (« ~/public_html ») parce qu'il
+ * ne quote pas ses `cd`. Ici, tout chemin passe par escapeshellarg() — et un « ~ »
+ * entre quotes simples n'est pas expansé par le shell. Sans cette résolution, le
+ * recipe crée un répertoire *littéralement* nommé « ~ », y range les sauvegardes
+ * tout en annonçant un autre emplacement, et ne trouve plus le dossier uploads.
+ *
+ * Le HOME est lu une fois par environnement. Les formes « ~utilisateur/… » ne sont
+ * pas traitées : Deployer ne les produit pas.
+ */
+function transferResolvePath(?Host $env, string $value): string
+{
+    $path = transferResolve($env, $value);
+
+    if ($path !== '~' && !str_starts_with($path, '~/')) {
+        return $path;
+    }
+
+    static $homes = [];
+    $key = transferEnvLabel($env);
+
+    if (!array_key_exists($key, $homes)) {
+        $homes[$key] = trim(transferRun($env, 'printf %s "$HOME"'));
+    }
+
+    return $homes[$key] === '' ? $path : $homes[$key] . substr($path, 1);
 }
 
 /**
@@ -601,7 +750,7 @@ function transferWorkdir(?Host $env): string
 
     $base = $env === null
         ? get('transfer_local_tmp_dir')
-        : transferResolve($env, '{{transfer_tmp_dir}}');
+        : transferResolvePath($env, '{{transfer_tmp_dir}}');
 
     $workdir = $base . '/' . date('Ymd-His') . '-' . substr(md5(uniqid('', true)), 0, 6);
 
@@ -969,8 +1118,14 @@ function transferDbExport(?Host $env, string $workdir): string
     $bin = transferWpBin($env);
     $dump = $workdir . '/db.sql';
 
-    if (!transferTest($env, "$bin core is-installed --skip-plugins --skip-themes 2>/dev/null")) {
-        throw new \RuntimeException("WordPress n'est pas installé sur « $label » : export impossible.");
+    [$installed, $wpOutput] = transferWpIsInstalled($env);
+
+    if (!$installed) {
+        throw new \RuntimeException(sprintf(
+            "WordPress est inutilisable sur « %s » : export impossible.\n%s",
+            $label,
+            transferWpMissingDiagnosis($env, $wpOutput),
+        ));
     }
 
     info("🔎 Lecture de la configuration de <comment>$label</comment> (lecture seule)...");
@@ -1002,13 +1157,16 @@ function transferDbBackup(Host $env): ?string
     $label = $env->getAlias();
     $bin = transferWpBin($env);
 
-    if (!transferTest($env, "$bin core is-installed --skip-plugins --skip-themes 2>/dev/null")) {
-        warning("Aucune installation WordPress détectée sur « $label » : pas de sauvegarde préalable.");
+    [$installed, $wpOutput] = transferWpIsInstalled($env);
+
+    if (!$installed) {
+        warning("WordPress est inutilisable sur « $label » : pas de sauvegarde préalable.");
+        writeln(transferWpMissingDiagnosis($env, $wpOutput));
 
         return null;
     }
 
-    $dir = transferResolve($env, '{{transfer_backup_dir}}');
+    $dir = transferResolvePath($env, '{{transfer_backup_dir}}');
     $sql = sprintf('%s/%s-%s.sql', $dir, $label, date('Ymd-His'));
 
     transferRun($env, 'mkdir -p ' . escapeshellarg($dir));
@@ -1031,18 +1189,44 @@ function transferDbBackup(Host $env): ?string
  *
  * On passe par un pipe gunzip → wp db import avec `set -o pipefail`, sans quoi un
  * gunzip en échec laisserait WP-CLI annoncer un import réussi sur un flux vide.
+ *
+ * `--skip-plugins --skip-themes` comme partout ailleurs, et pas seulement par
+ * principe : si WP-CLI doit charger WordPress ici — ce qui arrive quand il ne
+ * connaît pas la commande `db` et la cherche du côté des extensions — un thème qui
+ * démarre une session échoue en Fatal error, parce que la moindre notice émise par
+ * le projet a déjà rendu headers_sent() vrai. Sans le thème, ce code ne tourne pas.
  */
 function transferDbImport(?Host $env, string $dumpGz): void
 {
     $bin = transferWpBin($env);
+    $label = transferEnvLabel($env);
 
-    info(sprintf('🗑️  Suppression des tables de <comment>%s</comment>...', transferEnvLabel($env)));
-    transferWpRun($env, "$bin db reset --yes", ['timeout' => 600]);
+    // Vérifié AVANT le reset : sur une base vide, un WP-CLI amputé de ses commandes
+    // rend la main en code 0 sans rien faire, et la tâche enchaînerait sur l'import.
+    if (!transferWpHasCommand($env, 'db')) {
+        throw new \RuntimeException(sprintf(
+            "La commande « wp db » n'existe pas sur « %s » : rien n'a été modifié.\n"
+            . "   Binaire : %s\n"
+            . "   WP-CLI est installé sans ses paquets de commandes : « wp-cli/wp-cli » est le\n"
+            . "   framework seul. Installer « wp-cli/wp-cli-bundle », ou faire pointer %s vers\n"
+            . '   un phar complet.',
+            $label,
+            transferResolve($env, $bin),
+            $env === null ? '{{bin/wp_local}}' : '{{bin/wp}}',
+        ));
+    }
+
+    info(sprintf('🗑️  Suppression des tables de <comment>%s</comment>...', $label));
+    transferWpRun($env, "$bin db reset --yes --skip-plugins --skip-themes", ['timeout' => 600]);
 
     info('📥 Import du dump...');
     transferWpRun(
         $env,
-        sprintf('set -o pipefail; gunzip -c %s | %s db import -', escapeshellarg($dumpGz), $bin),
+        sprintf(
+            'set -o pipefail; gunzip -c %s | %s db import - --skip-plugins --skip-themes',
+            escapeshellarg($dumpGz),
+            $bin,
+        ),
         ['timeout' => 7200, 'real_time_output' => true],
     );
 
@@ -1067,7 +1251,7 @@ function transferUploadsPath(?Host $env): string
 {
     $path = $env === null
         ? transferProjectRoot() . '/' . get('uploads_path')
-        : transferResolve($env, '{{current_path}}/{{uploads_path}}');
+        : transferResolvePath($env, '{{current_path}}/{{uploads_path}}');
 
     if (!transferTest($env, sprintf('[ -d %s ]', escapeshellarg($path)))) {
         throw new \RuntimeException(sprintf('Dossier uploads introuvable sur « %s » : %s', transferEnvLabel($env), $path));

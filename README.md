@@ -219,6 +219,44 @@ Le nombre de fichiers annoncé pour la source et la destination peut légitimeme
 en fusion, les fichiers présents uniquement à la destination sont conservés. Le mode miroir
 les supprime, et la simulation en donne le compte avant confirmation.
 
+## Pourquoi « WordPress est inutilisable » ?
+
+Avant tout export, le recipe vérifie que WP-CLI parvient à charger WordPress. En cas
+d'échec, il rapporte ce que WP-CLI a répondu, le binaire employé et le répertoire depuis
+lequel la commande a tourné :
+
+```
+WordPress est inutilisable sur « production » : export impossible.
+   WP-CLI : Error: This does not seem to be a WordPress installation.
+   WP-CLI : Pass --path=`path/to/wordpress` or run `wp core download`.
+   Binaire : wp
+   Exécuté depuis : ~/public_html/current
+   Piste la plus fréquente : le « path » du wp-cli.yml du projet doit désigner le
+   cœur de WordPress — sous Bedrock « web/wp », et non « web ».
+```
+
+**Le message ne signifie pas que WordPress est absent** : il signifie que WP-CLI n'a pas
+pu le charger. La cause la plus fréquente est un `wp-cli.yml` dont le `path` ne désigne pas
+le cœur de WordPress. Sous Bedrock, `wp-config.php` est dans `web/` mais `wp-load.php` est
+dans `web/wp` : c'est ce dernier que WP-CLI attend.
+
+```yaml
+# wp-cli.yml, à la racine du projet
+path: web/wp
+```
+
+Ce fichier étant versionné et déployé avec le code, le corriger suppose un déploiement
+pour que les tâches distantes en bénéficient. Pour vérifier sans rien déployer :
+
+```bash
+dep run 'cd {{current_path}} && {{bin/wp}} core is-installed --no-color; echo "exit=$?"' production
+```
+
+Les autres causes possibles, dans l'ordre de fréquence : base de données injoignable depuis
+le CLI (identifiants ou socket différents de ceux du web), et `{{bin/wp}}` tournant sous un
+PHP incompatible — la ligne « Binaire » indique lequel a été retenu, un `wp` système pouvant
+être bien plus ancien que le `bin/php` de l'inventaire.
+
 ## Configuration
 
 Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
@@ -231,9 +269,9 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_backup_dir` | `{{deploy_path}}/.dep/backups` | Sauvegardes conservées |
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |
-| `bin/wp_local` | `wp` | WP-CLI local |
+| `bin/wp_local` | premier `wp` du PATH connaissant `wp db` | WP-CLI local. Un projet qui requiert `wp-cli/wp-cli` (le framework seul, sans les commandes) obtient un proxy dans `vendor/bin` prioritaire dans le PATH : il est écarté au profit d'un phar complet |
 | `bin/wp` | phar téléchargé à la demande | WP-CLI distant |
-| `transfer_local_prefix` | `ddev ` | Préfixe des commandes suggérées, tapées depuis l'hôte |
+| `transfer_local_prefix` | `ddev exec ` | Préfixe des commandes suggérées, tapées depuis l'hôte. `ddev exec` accepte un chemin absolu de binaire, ce que `ddev` refuse |
 
 Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`, `--precise`.
 
@@ -260,6 +298,11 @@ hosts:
 - **Symlinks.** Côté distant, `current` pointe vers la release et `uploads` (shared dir)
   vers `shared/`. `find` et `du` ne descendent pas dans un symlink passé en point de
   départ et renverraient 0 : le chemin réel est résolu explicitement.
+- **`deploy_path` en `~/…`.** Deployer accepte un chemin relatif au HOME parce qu'il ne
+  quote pas ses `cd`. Le recipe, lui, protège tous ses chemins par `escapeshellarg()`, et
+  un `~` entre quotes simples n'est pas expansé par le shell : il est donc résolu contre le
+  `$HOME` de l'hôte, une fois par environnement. Sans cela, le recipe créerait un
+  répertoire littéralement nommé `~` et ne trouverait pas le dossier uploads.
 - **Codes de sortie.** Les commandes longues tournent en tâche de fond avec propagation
   via `wait`, et les pipes utilisent `set -o pipefail` — sans quoi un `gunzip` en échec
   laisserait WP-CLI annoncer un import réussi sur un flux vide.
