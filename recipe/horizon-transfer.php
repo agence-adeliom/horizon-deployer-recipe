@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.2.0');
+define('HORIZON_TRANSFER_RECIPE', '1.2.1');
 
 /*
 |--------------------------------------------------------------------------
@@ -1334,51 +1334,72 @@ function transferPullFavicon(Host $from, string $remoteUploads, string $uploads)
         return;
     }
 
-    info(sprintf('🎨 Favicon trouvé dans la base <comment>%s</comment> :', $source));
+    info(sprintf('🎨 Favicon référencé par la base <comment>%s</comment> :', $source));
 
     foreach ($files as $file) {
         info("   <comment>$file</comment>");
     }
 
-    if (!transferConfirm(sprintf('Écrire ces %d fichier(s) dans ./%s ?', count($files), $uploads), true)) {
+    // Toutes les déclinaisons partagent le dossier de l'original.
+    $directory = dirname($files[0]);
+    $suffix = $directory === '.' ? '' : $directory . '/';
+    $remoteDirectory = rtrim($remoteUploads, '/') . '/' . $suffix;
+
+    // Ce que la base RÉFÉRENCE n'est pas forcément ce que l'hôte CONTIENT : un
+    // identifiant de média ne désigne pas le même fichier d'un site à l'autre. Le
+    // contrôle porte donc sur la source, seul endroit où la réponse est fiable —
+    // vérifier la présence en local confondrait un fichier fraîchement rapatrié avec
+    // le reliquat d'un pull précédent, et le compte de rsync vaut zéro aussi bien
+    // quand la source est vide que quand la copie locale est déjà à jour.
+    $listed = transferRun($from, sprintf(
+        'ls -1 %s 2>/dev/null || true',
+        implode(' ', array_map(
+            static fn(string $file): string => escapeshellarg($remoteDirectory . basename($file)),
+            $files,
+        )),
+    ));
+    $lines = array_filter(array_map('trim', explode("\n", $listed)));
+    $available = array_values(array_filter(
+        $files,
+        static fn(string $file): bool => in_array($remoteDirectory . basename($file), $lines, true),
+    ));
+
+    if ($available === []) {
+        warning(sprintf('Le favicon référencé en base est introuvable sur « %s ».', $from->getAlias()));
+        info(sprintf('   Aucun de ces fichiers n\'existe dans <comment>%s</comment>.', $remoteDirectory));
+        info('   La cause habituelle est une base locale importée depuis un AUTRE environnement');
+        info('   que l\'hôte ciblé : un identifiant de média n\'y désigne pas le même fichier.');
+        info(sprintf('   Cibler l\'hôte dont provient la base, ou lancer db:pull %s au préalable.', $from->getAlias()));
+
+        return;
+    }
+
+    if (count($available) < count($files)) {
+        warning(sprintf(
+            '%d des %d fichiers attendus sont absents de « %s » et seront ignorés.',
+            count($files) - count($available),
+            count($files),
+            $from->getAlias(),
+        ));
+    }
+
+    if (!transferConfirm(sprintf('Écrire ces %d fichier(s) dans ./%s ?', count($available), $uploads), true)) {
         info('   Rien n\'a été écrit.');
 
         return;
     }
 
-    // Toutes les déclinaisons partagent le dossier de l'original : un seul rsync
-    // suffit, restreint à ces fichiers par --include suivi d'un --exclude global.
-    $directory = dirname($files[0]);
-    $suffix = $directory === '.' ? '' : $directory . '/';
-    $options = array_map(static fn(string $file): string => '--include=' . basename($file), $files);
+    // Un seul rsync, restreint à ces fichiers par --include suivi d'un --exclude global.
+    $options = array_map(static fn(string $file): string => '--include=' . basename($file), $available);
     $options[] = '--exclude=*';
 
-    $localUploads = rtrim(transferProjectRoot() . '/' . $uploads, '/');
-    $localDirectory = $localUploads . '/' . $suffix;
+    $localDirectory = rtrim(transferProjectRoot() . '/' . $uploads, '/') . '/' . $suffix;
     runLocally('mkdir -p ' . escapeshellarg($localDirectory));
-    transferRsync($from, rtrim($remoteUploads, '/') . '/' . $suffix, null, $localDirectory, $options);
-
-    // rsync ne considère pas comme une erreur un filtre qui ne retient rien : sans
-    // ce contrôle, la tâche annoncerait un succès en n'ayant rien rapatrié.
-    $written = count(array_filter(
-        $files,
-        static fn(string $file): bool => is_file($localUploads . '/' . $file),
-    ));
-
-    if ($written === 0) {
-        warning(sprintf(
-            'Aucun fichier récupéré : le favicon référencé en base est introuvable sur « %s ».',
-            $from->getAlias(),
-        ));
-        info('   La cause habituelle est une base locale importée depuis un AUTRE environnement');
-        info('   que l\'hôte ciblé : un identifiant de média n\'y désigne pas le même fichier.');
-
-        return;
-    }
+    transferRsync($from, $remoteDirectory, null, $localDirectory, $options);
 
     info(sprintf(
         '✅ Favicon récupéré : <comment>%d</comment> fichier(s) dans <comment>./%s/%s</comment>',
-        $written,
+        count($available),
         trim($uploads, '/'),
         $suffix,
     ));
