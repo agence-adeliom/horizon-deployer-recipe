@@ -87,7 +87,7 @@ Ajoutez à votre `.gitignore` :
 | Tâche | Sens | Effet |
 |---|---|---|
 | `dep db:pull <hôte>` | distant → local | Dump `.sql.gz` à la racine du projet, puis propose l'import local et la réécriture d'URLs |
-| `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction |
+| `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction. `--favicon-only` ne récupère que le favicon |
 | `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 
@@ -97,6 +97,9 @@ Un « environnement » est soit `local`, soit l'alias d'un hôte Deployer.
 # Rapatrier la production en local
 dep db:pull production
 dep uploads:pull production
+
+# Juste le favicon, pour que les onglets du navigateur ressemblent au site
+dep uploads:pull production --favicon-only
 
 # Rafraîchir la préproduction depuis la production
 dep db:push --from=production --to=staging
@@ -228,6 +231,42 @@ Le nombre de fichiers annoncé pour la source et la destination peut légitimeme
 en fusion, les fichiers présents uniquement à la destination sont conservés. Le mode miroir
 les supprime, et la simulation en donne le compte avant confirmation.
 
+## Récupérer le seul favicon
+
+Un dossier uploads pèse couramment plusieurs gigaoctets, alors que rendre un onglet de
+navigateur conforme au site en réclame quelques dizaines de kilo-octets :
+
+```bash
+dep uploads:pull production --favicon-only
+```
+
+L'option lit l'attachment désigné par `site_icon` et récupère l'original **avec ses
+déclinaisons** — 32×32 pour l'onglet, 180×180 pour Apple, 192×192 pour Android. Ce sont
+elles que le navigateur demande, pas l'original : ne rapatrier que ce dernier laisserait
+l'onglet vide.
+
+```
+🎨 Favicon trouvé dans la base locale :
+   2022/06/cropped-favicon.png
+   2022/06/cropped-favicon-32x32.png
+   2022/06/cropped-favicon-180x180.png
+   …
+Écrire ces 7 fichier(s) dans ./web/app/uploads ? [Y/n]
+```
+
+L'option `site_icon` est lue **dans la base locale d'abord**, avec repli sur la base
+distante : c'est la base locale qui sert le site, donc c'est elle qui détermine le fichier
+réclamé par le navigateur. Le repli permet d'utiliser l'option avant tout `db:pull`.
+
+Aucune archive n'est créée sur le serveur et le dossier uploads distant n'est pas parcouru.
+Un favicon posé hors médiathèque — `favicon.ico` à la racine, option de thème — n'est pas
+concerné : il ne vit pas dans les uploads.
+
+⚠️ **Ciblez l'hôte dont provient votre base.** Un identifiant de média ne désigne pas le
+même fichier d'un site à l'autre : avec une base importée de `production` et un
+`uploads:pull staging --favicon-only`, le fichier attendu n'existe pas à la destination.
+Le cas est détecté et signalé plutôt qu'annoncé comme un succès.
+
 ## Pourquoi « WordPress est inutilisable » ?
 
 Avant tout export, le recipe vérifie que WP-CLI parvient à charger WordPress. En cas
@@ -282,7 +321,8 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `bin/wp` | phar téléchargé à la demande | WP-CLI distant |
 | `transfer_local_prefix` | `ddev exec ` | Préfixe des commandes suggérées, tapées depuis l'hôte. `ddev exec` accepte un chemin absolu de binaire, ce que `ddev` refuse |
 
-Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`, `--precise`.
+Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`, `--precise`,
+`--favicon-only`.
 
 Exemple d'inventaire retirant la protection d'un hôte de recette :
 

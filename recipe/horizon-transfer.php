@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.1.0');
+define('HORIZON_TRANSFER_RECIPE', '1.2.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -147,6 +147,7 @@ set('bin/wp', function () {
     return '{{bin/php}} {{deploy_path}}/.dep/wp-cli.phar';
 });
 
+option('favicon-only', null, InputOption::VALUE_NONE, 'uploads:pull : ne récupère que le favicon du site (site_icon) au lieu de tous les uploads');
 option('from', null, InputOption::VALUE_REQUIRED, 'Environnement source : local ou alias d\'hôte');
 option('to', null, InputOption::VALUE_REQUIRED, 'Environnement de destination : alias d\'hôte');
 option('strategy', null, InputOption::VALUE_REQUIRED, 'uploads:push : merge (fusion) ou mirror (miroir, supprime à la destination)');
@@ -1261,6 +1262,129 @@ function transferDbImport(?Host $env, string $dumpGz): void
 */
 
 /**
+ * Fichiers composant le favicon du site (option `site_icon`), en chemins relatifs
+ * au dossier uploads.
+ *
+ * Le navigateur ne réclame pas l'original mais ses déclinaisons — 32x32 pour
+ * l'onglet, 180 pour Apple, 192 pour Android. La liste est donc lue dans
+ * `_wp_attachment_metadata` plutôt que devinée par un motif « nom* », qui
+ * ramasserait les médias voisins sans garantir les tailles réellement servies.
+ *
+ * @return string[] vide si aucun favicon n'est défini
+ */
+function transferFaviconFiles(?Host $env): array
+{
+    $bin = transferWpBin($env);
+
+    // `|| true` : une option ou une méta absente sort en code 1, ce qui n'est pas
+    // une erreur ici — c'est une réponse.
+    $read = static fn(string $command): string => trim(transferWpRun(
+        $env,
+        sprintf('%s %s --skip-plugins --skip-themes 2>/dev/null || true', $bin, $command),
+    ));
+
+    $id = $read('option get site_icon');
+
+    if (!ctype_digit($id) || (int) $id === 0) {
+        return [];
+    }
+
+    $file = $read("post meta get $id _wp_attached_file");
+
+    if ($file === '') {
+        return [];
+    }
+
+    $files = [$file];
+    $directory = dirname($file);
+    $prefix = $directory === '.' ? '' : $directory . '/';
+    $meta = json_decode($read("post meta get $id _wp_attachment_metadata --format=json"), true);
+
+    foreach ($meta['sizes'] ?? [] as $size) {
+        if (is_array($size) && is_string($size['file'] ?? null) && $size['file'] !== '') {
+            $files[] = $prefix . $size['file'];
+        }
+    }
+
+    return array_values(array_unique($files));
+}
+
+/**
+ * Récupère le seul favicon plutôt que la totalité des uploads, qui peuvent peser
+ * plusieurs gigaoctets pour quelques kilo-octets réellement utiles à l'affichage
+ * d'un onglet.
+ */
+function transferPullFavicon(Host $from, string $remoteUploads, string $uploads): void
+{
+    // La base LOCALE d'abord : c'est elle qui sert le site local, donc c'est son
+    // site_icon qui désigne le fichier que le navigateur va réclamer. Repli sur la
+    // distante pour que l'option reste utilisable avant tout db:pull.
+    $source = 'locale';
+    $files = transferFaviconFiles(null);
+
+    if ($files === []) {
+        $source = sprintf('de « %s »', $from->getAlias());
+        $files = transferFaviconFiles($from);
+    }
+
+    if ($files === []) {
+        warning('Aucun favicon défini : l\'option « site_icon » est vide des deux côtés.');
+        info('   Il se définit dans Réglages → Général → Icône du site.');
+
+        return;
+    }
+
+    info(sprintf('🎨 Favicon trouvé dans la base <comment>%s</comment> :', $source));
+
+    foreach ($files as $file) {
+        info("   <comment>$file</comment>");
+    }
+
+    if (!transferConfirm(sprintf('Écrire ces %d fichier(s) dans ./%s ?', count($files), $uploads), true)) {
+        info('   Rien n\'a été écrit.');
+
+        return;
+    }
+
+    // Toutes les déclinaisons partagent le dossier de l'original : un seul rsync
+    // suffit, restreint à ces fichiers par --include suivi d'un --exclude global.
+    $directory = dirname($files[0]);
+    $suffix = $directory === '.' ? '' : $directory . '/';
+    $options = array_map(static fn(string $file): string => '--include=' . basename($file), $files);
+    $options[] = '--exclude=*';
+
+    $localUploads = rtrim(transferProjectRoot() . '/' . $uploads, '/');
+    $localDirectory = $localUploads . '/' . $suffix;
+    runLocally('mkdir -p ' . escapeshellarg($localDirectory));
+    transferRsync($from, rtrim($remoteUploads, '/') . '/' . $suffix, null, $localDirectory, $options);
+
+    // rsync ne considère pas comme une erreur un filtre qui ne retient rien : sans
+    // ce contrôle, la tâche annoncerait un succès en n'ayant rien rapatrié.
+    $written = count(array_filter(
+        $files,
+        static fn(string $file): bool => is_file($localUploads . '/' . $file),
+    ));
+
+    if ($written === 0) {
+        warning(sprintf(
+            'Aucun fichier récupéré : le favicon référencé en base est introuvable sur « %s ».',
+            $from->getAlias(),
+        ));
+        info('   La cause habituelle est une base locale importée depuis un AUTRE environnement');
+        info('   que l\'hôte ciblé : un identifiant de média n\'y désigne pas le même fichier.');
+
+        return;
+    }
+
+    info(sprintf(
+        '✅ Favicon récupéré : <comment>%d</comment> fichier(s) dans <comment>./%s/%s</comment>',
+        $written,
+        trim($uploads, '/'),
+        $suffix,
+    ));
+}
+
+/**
  * Chemin réel du dossier uploads d'un environnement.
  *
  * Côté distant il y a deux symlinks à traverser : `current` vers la release, et
@@ -1363,7 +1487,7 @@ task('db:pull', static function (): void {
     transferSearchReplace(null, $remoteUrl, transferSiteUrl(null));
 });
 
-desc('Archive les uploads distants, les télécharge, puis propose l\'extraction dans le dossier uploads local');
+desc('Archive les uploads distants, les télécharge, puis propose l\'extraction dans le dossier uploads local (--favicon-only pour ne récupérer que le favicon)');
 task('uploads:pull', static function (): void {
     transferResetState();
     $from = currentHost();
@@ -1374,6 +1498,14 @@ task('uploads:pull', static function (): void {
 
     $remoteUploads = transferUploadsPath($from);
     info("   Uploads distants : <comment>$remoteUploads</comment>");
+
+    // Court-circuit avant toute analyse : inutile de parcourir des milliers de
+    // fichiers pour n'en récupérer qu'une poignée.
+    if (input()->getOption('favicon-only')) {
+        transferPullFavicon($from, $remoteUploads, $uploads);
+
+        return;
+    }
 
     info('🔎 Analyse du dossier uploads distant (lecture seule)...');
     $fileCount = trim(transferRun($from, sprintf('find %s -type f | wc -l', escapeshellarg($remoteUploads))));
