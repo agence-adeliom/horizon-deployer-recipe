@@ -133,6 +133,9 @@ local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécrit
   faut saisir son alias en clair : un simple `[y/N]` est trop facile à valider par réflexe.
 - **La base de destination est dumpée avant tout import**, dans `{{transfer_backup_dir}}`.
   Ce dump est conservé : il survit au nettoyage.
+- **Rien n'est vidé tant que l'import n'est pas jouable.** Avant le `db reset`, le recipe
+  vérifie que la commande `wp db` existe et que les collations du dump sont acceptées par
+  la destination. Sans ces contrôles, l'échec survient sur une base déjà vide.
 - **Toute écriture volumineuse liée aux uploads est confirmée**, en annonçant le volume :
   la création de l'archive `tar.gz` sur le serveur (`uploads:pull`), et la copie de transit
   sur la machine locale quand `uploads:push` relie deux serveurs distincts. Un refus
@@ -231,6 +234,45 @@ Le nombre de fichiers annoncé pour la source et la destination peut légitimeme
 en fusion, les fichiers présents uniquement à la destination sont conservés. Le mode miroir
 les supprime, et la simulation en donne le compte avant confirmation.
 
+## « Unknown collation » à l'import
+
+Avant de vider quoi que ce soit, le recipe compare les collations du dump à celles que
+la destination accepte. S'il en manque, il refuse et n'a **rien supprimé** :
+
+```
+🔎 Contrôle des collations du dump...
+Le dump utilise des collations absentes de « local » : utf8mb4_0900_ai_ci.
+   Rien n'a été supprimé : l'import aurait échoué en cours de route, sur une
+   base déjà vidée. Une collation « utf8mb4_0900_* » vient de MySQL 8, que
+   MariaDB n'implémente dans aucune version.
+```
+
+Le cas type est une production sous MySQL 8 et un local sous MariaDB — le moteur par
+défaut de DDEV. Aucune version de MariaDB n'acceptera ces collations : mettre le local à
+jour ne change rien. Deux issues.
+
+**Réécrire les collations à la volée**, quand la table concernée ne porte pas de contenu
+éditorial (un cache de plugin, typiquement) :
+
+```bash
+dep db:pull production --fix-collations
+```
+
+La substitution se fait dans le tube, à charset identique — `utf8mb4_0900_ai_ci` devient
+`utf8mb4_unicode_ci` : le fichier de dump n'est pas modifié et reste réimportable ailleurs.
+Chaque réécriture est annoncée. À savoir : le filtre porte sur tout le flux, donc une
+occurrence du nom de la collation à l'intérieur d'une donnée serait réécrite elle aussi.
+
+**Aligner le moteur local sur la production**, la solution de fond, qui règle aussi les
+écarts de `sql_mode` et de fonctions JSON :
+
+```bash
+ddev config --database=mysql:8.0 && ddev restart
+```
+
+`.ddev/config.yaml` étant versionné, ce choix engage l'équipe : chacun devra recréer sa
+base locale.
+
 ## Récupérer le seul favicon
 
 Un dossier uploads pèse couramment plusieurs gigaoctets, alors que rendre un onglet de
@@ -322,7 +364,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_local_prefix` | `ddev exec ` | Préfixe des commandes suggérées, tapées depuis l'hôte. `ddev exec` accepte un chemin absolu de binaire, ce que `ddev` refuse |
 
 Options de ligne de commande : `--from`, `--to`, `--strategy=merge|mirror`, `--checksum`, `--precise`,
-`--favicon-only`.
+`--favicon-only`, `--fix-collations`.
 
 Exemple d'inventaire retirant la protection d'un hôte de recette :
 

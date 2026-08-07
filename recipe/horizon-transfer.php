@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.2.1');
+define('HORIZON_TRANSFER_RECIPE', '1.3.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -148,6 +148,7 @@ set('bin/wp', function () {
 });
 
 option('favicon-only', null, InputOption::VALUE_NONE, 'uploads:pull : ne récupère que le favicon du site (site_icon) au lieu de tous les uploads');
+option('fix-collations', null, InputOption::VALUE_NONE, 'db:pull / db:push : réécrit les collations du dump absentes de la destination au lieu d\'échouer');
 option('from', null, InputOption::VALUE_REQUIRED, 'Environnement source : local ou alias d\'hôte');
 option('to', null, InputOption::VALUE_REQUIRED, 'Environnement de destination : alias d\'hôte');
 option('strategy', null, InputOption::VALUE_REQUIRED, 'uploads:push : merge (fusion) ou mirror (miroir, supprime à la destination)');
@@ -1207,6 +1208,73 @@ function transferDbBackup(Host $env): ?string
 }
 
 /**
+ * Collations que le serveur de base d'un environnement sait manipuler.
+ *
+ * @return string[]
+ */
+function transferSupportedCollations(?Host $env): array
+{
+    $output = transferWpRun($env, sprintf(
+        '%s db query "SHOW COLLATION" --skip-column-names --skip-plugins --skip-themes 2>/dev/null || true',
+        transferWpBin($env),
+    ));
+
+    $collations = [];
+
+    foreach (explode("\n", $output) as $line) {
+        $name = preg_split('/\s+/', trim($line))[0] ?? '';
+
+        if ($name !== '') {
+            $collations[] = $name;
+        }
+    }
+
+    return $collations;
+}
+
+/**
+ * Collations référencées par un dump gzippé.
+ *
+ * Le dump est lu en entier, ce qui coûte quelques secondes — sans commune mesure
+ * avec le temps d'un import, et surtout avec la perte d'une base vidée pour un
+ * import qui ne pouvait pas aboutir.
+ *
+ * @return string[]
+ */
+function transferDumpCollations(?Host $env, string $dumpGz): array
+{
+    // Guillemets simples côté shell : les backticks entourant parfois le nom de la
+    // collation seraient sinon pris pour une substitution de commande.
+    $script = strtr(
+        <<<'SH'
+        gunzip -c :DUMP: | grep -oiE 'COLLATE[= ]+`?[a-zA-Z0-9_]+' | sed -E 's/.*[= ]`?//' | sort -u || true
+        SH,
+        [':DUMP:' => escapeshellarg($dumpGz)],
+    );
+
+    $collations = array_filter(array_map('trim', explode("\n", transferRun($env, $script, ['timeout' => 1800]))));
+
+    return array_values(array_unique($collations));
+}
+
+/**
+ * Substitut à donner à une collation absente de la destination : la déclinaison la
+ * plus proche parmi celles qu'elle accepte, à charset identique.
+ */
+function transferCollationFallback(string $collation, array $supported): ?string
+{
+    $charset = strtok($collation, '_');
+
+    foreach ([$charset . '_unicode_ci', $charset . '_general_ci', $charset . '_bin'] as $candidate) {
+        if (in_array($candidate, $supported, true)) {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+/**
  * Vide la base d'un environnement puis y importe un dump gzippé.
  *
  * On passe par un pipe gunzip → wp db import avec `set -o pipefail`, sans quoi un
@@ -1238,15 +1306,80 @@ function transferDbImport(?Host $env, string $dumpGz): void
         ));
     }
 
+    // Vérifié AVANT le reset lui aussi : une collation inconnue fait échouer l'import
+    // en plein milieu, sur une base déjà vidée. Le cas courant est un dump MySQL 8
+    // (utf8mb4_0900_ai_ci) importé dans MariaDB, qui n'a jamais implémenté ces
+    // collations — aucune version de MariaDB ne les acceptera.
+    info('🔎 Contrôle des collations du dump...');
+    $supported = transferSupportedCollations($env);
+    $missing = $supported === []
+        ? []
+        : array_values(array_diff(transferDumpCollations($env, $dumpGz), $supported));
+
+    $rewrites = [];
+
+    foreach ($missing as $collation) {
+        $fallback = transferCollationFallback($collation, $supported);
+
+        if ($fallback !== null) {
+            $rewrites[$collation] = $fallback;
+        }
+    }
+
+    if ($missing !== []) {
+        if (!input()->getOption('fix-collations')) {
+            throw new \RuntimeException(sprintf(
+                "Le dump utilise des collations absentes de « %s » : %s.\n"
+                . "   Rien n'a été supprimé : l'import aurait échoué en cours de route, sur une\n"
+                . "   base déjà vidée. Une collation « utf8mb4_0900_* » vient de MySQL 8, que\n"
+                . "   MariaDB n'implémente dans aucune version.\n"
+                . "   Deux issues :\n"
+                . "     — relancer avec --fix-collations pour les réécrire à la volée (%s) ;\n"
+                . '     — aligner le moteur de « %s » sur celui de la source.',
+                $label,
+                implode(', ', $missing),
+                $rewrites === []
+                    ? 'aucun substitut trouvé pour ce charset'
+                    : implode(', ', array_map(
+                        static fn(string $from, string $to): string => "$from → $to",
+                        array_keys($rewrites),
+                        $rewrites,
+                    )),
+                $label,
+            ));
+        }
+
+        foreach ($missing as $collation) {
+            if (!isset($rewrites[$collation])) {
+                throw new \RuntimeException(sprintf(
+                    'Aucun substitut disponible sur « %s » pour la collation « %s » : import impossible.',
+                    $label,
+                    $collation,
+                ));
+            }
+
+            warning(sprintf('Collation réécrite : %s → %s', $collation, $rewrites[$collation]));
+        }
+    }
+
     info(sprintf('🗑️  Suppression des tables de <comment>%s</comment>...', $label));
     transferWpRun($env, "$bin db reset --yes --skip-plugins --skip-themes", ['timeout' => 600]);
+
+    // La réécriture s'insère dans le pipe : le dump n'est jamais modifié sur disque,
+    // il reste donc réimportable tel quel ailleurs.
+    $filter = '';
+
+    foreach ($rewrites as $from => $to) {
+        $filter .= ' -e ' . escapeshellarg(sprintf('s/%s/%s/g', $from, $to));
+    }
 
     info('📥 Import du dump...');
     transferWpRun(
         $env,
         sprintf(
-            'set -o pipefail; gunzip -c %s | %s db import - --skip-plugins --skip-themes',
+            'set -o pipefail; gunzip -c %s |%s %s db import - --skip-plugins --skip-themes',
             escapeshellarg($dumpGz),
+            $filter === '' ? '' : " sed$filter |",
             $bin,
         ),
         ['timeout' => 7200, 'real_time_output' => true],
