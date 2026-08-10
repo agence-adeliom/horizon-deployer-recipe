@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.3.0');
+define('HORIZON_TRANSFER_RECIPE', '1.3.1');
 
 /*
 |--------------------------------------------------------------------------
@@ -574,8 +574,11 @@ function transferRsyncPreview(
 ): array {
     // -ii (double) et non -i : avec -i simple, rsync n'émet AUCUNE ligne pour les
     // fichiers inchangés, il n'y aurait donc rien à compter pour jauger l'avancement.
-    // Doublé, il sort une ligne par fichier examiné : « .f » inchangé, « > » à
-    // recevoir, « *deleting » à supprimer.
+    // Doublé, il sort une ligne par fichier examiné : « .f » inchangé, « *deleting » à
+    // supprimer, et pour un transfert le premier caractère donne le SENS, relativement
+    // à la machine qui exécute rsync : « > » reçu (pull), « < » envoyé (push). Compter
+    // « > » seul rendait donc 0 sur tout push, et uploads:push concluait « rien à
+    // faire » avant même de synchroniser quoi que ce soit.
     $options = array_merge(
         ['-a', '--dry-run', '-ii'],
         transferRsyncLineBuffered(transferRsyncRunHost($from, $to)),
@@ -601,7 +604,7 @@ function transferRsyncPreview(
             while IFS= read -r dep_line; do
                 dep_n=$((dep_n + 1))
                 case $dep_line in
-                    '>'*) dep_t=$((dep_t + 1)) ;;
+                    '<'*|'>'*) dep_t=$((dep_t + 1)) ;;
                     '*deleting'*) dep_d=$((dep_d + 1)) ;;
                 esac
                 if [ "$dep_n" -ge "$dep_next" ]; then
