@@ -1261,16 +1261,47 @@ function transferDumpCollations(?Host $env, string $dumpGz): array
 }
 
 /**
+ * Charsets équivalents à essayer pour un charset donné, dans l'ordre de préférence.
+ *
+ * MariaDB 10.6 a renommé le charset « utf8 » en « utf8mb3 » : SHOW COLLATION n'y
+ * annonce plus une seule collation « utf8_* », alors que le DDL les accepte encore
+ * et les convertit silencieusement. Sans cette équivalence, un dump produit par une
+ * version antérieure — ce que fait DDEV — voit toutes ses collations « utf8_* »
+ * déclarées absentes de la destination, et --fix-collations ne leur trouve aucun
+ * substitut alors que l'import serait passé sans rien changer.
+ */
+function transferCollationCharsets(string $charset): array
+{
+    return match ($charset) {
+        'utf8' => ['utf8', 'utf8mb3'],
+        'utf8mb3' => ['utf8mb3', 'utf8'],
+        default => [$charset],
+    };
+}
+
+/**
  * Substitut à donner à une collation absente de la destination : la déclinaison la
- * plus proche parmi celles qu'elle accepte, à charset identique.
+ * plus proche parmi celles qu'elle accepte, à charset identique ou équivalent.
  */
 function transferCollationFallback(string $collation, array $supported): ?string
 {
     $charset = strtok($collation, '_');
+    $suffix = substr($collation, strlen($charset));
 
-    foreach ([$charset . '_unicode_ci', $charset . '_general_ci', $charset . '_bin'] as $candidate) {
-        if (in_array($candidate, $supported, true)) {
-            return $candidate;
+    foreach (transferCollationCharsets($charset) as $candidateCharset) {
+        // Le suffixe d'origine d'abord : « utf8_bin » mérite « utf8mb3_bin » plutôt
+        // que le « _unicode_ci » générique, qui changerait l'ordre de tri.
+        $candidates = [
+            $candidateCharset . $suffix,
+            $candidateCharset . '_unicode_ci',
+            $candidateCharset . '_general_ci',
+            $candidateCharset . '_bin',
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (in_array($candidate, $supported, true)) {
+                return $candidate;
+            }
         }
     }
 
