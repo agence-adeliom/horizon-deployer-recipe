@@ -91,6 +91,8 @@ Les heredocs et commandes assemblés dans le code obéissent à quatre règles, 
 
 - `curl -fsS` et jamais `curl -o` seul : sans `-f`, curl écrit la page d'erreur HTTP dans le fichier de destination et rend 0. Le `test -f {{deploy_path}}/.dep/wp-cli.phar` de la closure `bin/wp` accepterait alors définitivement un phar de 14 octets contenant « 404: Not Found ».
 
+- `gzip -t` avant de réutiliser un dump ou une archive déjà présent en local (`transferReuseLocalArchive()`) : un transfert interrompu laisse un `.gz` tronqué, que le `db reset` précédant l'import rendrait catastrophique — base vidée, puis import en échec.
+
 Les chemins passent toujours par `escapeshellarg()`.
 
 ### Sûreté fonctionnelle

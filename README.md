@@ -91,8 +91,8 @@ Ajoutez à votre `.gitignore` :
 
 | Tâche | Sens | Effet |
 |---|---|---|
-| `dep db:pull <hôte>` | distant → local | Dump `.sql.gz` à la racine du projet, puis propose l'import local et la réécriture d'URLs |
-| `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction. `--favicon-only` ne récupère que le favicon |
+| `dep db:pull <hôte>` | distant → local | Dump `.sql.gz` à la racine du projet, puis propose l'import local et la réécriture d'URLs. Propose de réutiliser un dump récent au lieu d'en refaire un |
+| `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction. `--favicon-only` ne récupère que le favicon. Propose de réutiliser une archive récente |
 | `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 | `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
@@ -126,6 +126,34 @@ dep db:push staging --from=production
 
 La destination d'un push est toujours un environnement distant. Pour rapatrier vers le
 local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécriture d'URLs.
+
+### Réutiliser un dump ou une archive récente
+
+Avant de produire un nouveau dump, `db:pull` regarde s'il en existe déjà un pour cet hôte à
+la racine du projet, daté de moins d'une heure, et propose de le réutiliser :
+
+```
+♻️  Un dump de « production » datant de 23 min est déjà là : ./db-production-20260910-104217.sql.gz (412M)
+ Réutiliser ce fichier au lieu d'en produire un nouveau ? [y/N]
+```
+
+La réponse par défaut est « non » : un nouveau dump est produit, comme avant. Un « oui »
+saute l'export **et** le transfert, et reprend directement à la proposition d'import.
+
+`uploads:pull` fait de même avec ses `uploads-<hôte>-*.tar.gz`. La question y est plus rare :
+la tâche supprime son archive après une extraction réussie, donc il n'en subsiste une que si
+l'extraction a été refusée ou si la tâche a été interrompue. C'est précisément pourquoi le
+fichier retenu est **vérifié** avant d'être réutilisé (`gzip -t`) : une archive tronquée par
+un transfert interrompu est écartée avec un avertissement, et un nouveau transfert est lancé.
+Sans ce contrôle, un dump tronqué serait importé sur une base qu'on vient de vider.
+
+La question porte sur un fichier local, et n'exige donc aucune lecture du serveur : elle est
+posée avant toute connexion utile, ce qui permet de réextraire une archive déjà téléchargée
+même si le serveur est injoignable.
+
+Le fichier retenu est le plus récent par date de modification, et non par l'horodatage de son
+nom, qui ne survit pas à une copie. `set('transfer_reuse_window', 0)` désactive la
+proposition ; toute autre valeur est une durée en secondes.
 
 ### Mise à jour du schéma après déploiement
 
@@ -430,6 +458,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_local_tmp_dir` | `<racine projet>/.dep/transfer` | Répertoire de travail local |
 | `transfer_backup_dir` | `{{deploy_path}}/.dep/backups` | Sauvegardes conservées |
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
+| `transfer_reuse_window` | `3600` | Fenêtre, en secondes, pendant laquelle un dump ou une archive déjà présent à la racine est proposé à la réutilisation. `0` pour ne jamais le proposer |
 | `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |
 | `bin/wp_local` | premier `wp` du PATH connaissant `wp db` | WP-CLI local. Un projet qui requiert `wp-cli/wp-cli` (le framework seul, sans les commandes) obtient un proxy dans `vendor/bin` prioritaire dans le PATH : il est écarté au profit d'un phar complet |

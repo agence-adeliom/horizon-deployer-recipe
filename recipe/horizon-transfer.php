@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.4.0');
+define('HORIZON_TRANSFER_RECIPE', '1.4.1');
 
 /*
 |--------------------------------------------------------------------------
@@ -128,6 +128,10 @@ set('transfer_search_replace_skip_tables', '*_wf*');
 set('transfer_protected', static function (): bool {
     return str_contains(currentHost()->getAlias(), 'prod') || str_contains((string) get('stage', ''), 'prod');
 });
+
+// Fenêtre pendant laquelle un dump ou une archive déjà présent à la racine est
+// proposé à la réutilisation, en secondes. 0 pour ne jamais le proposer.
+set('transfer_reuse_window', 3600);
 
 // Branche « wp:update-db » sur la fin du déploiement. À passer à false pour un
 // projet qui gère lui-même les migrations de schéma ; la tâche reste lançable à la
@@ -858,6 +862,74 @@ function transferConfirmDiskUsage(string $question, string $size): bool
     }
 
     return askConfirmation($question, true);
+}
+
+/**
+ * Propose de réutiliser une archive déjà présente à la racine du projet plutôt que
+ * d'en produire une nouvelle.
+ *
+ * Le tri porte sur la date de MODIFICATION et non sur l'horodatage du nom, qui ne
+ * survit pas à une copie. La réponse par défaut est « non » : produire une archive
+ * neuve est le comportement historique, et le seul qui ne dépende pas d'un fichier
+ * dont on ignore la provenance.
+ *
+ * @return ?string Chemin à réutiliser, ou null pour en produire une nouvelle.
+ */
+function transferReuseLocalArchive(string $pattern, string $subject): ?string
+{
+    $window = (int) get('transfer_reuse_window');
+
+    if ($window <= 0 || !input()->isInteractive()) {
+        return null;
+    }
+
+    $candidates = glob(transferProjectRoot() . '/' . $pattern) ?: [];
+
+    if ($candidates === []) {
+        return null;
+    }
+
+    // Le plus récent suffit : si lui est hors fenêtre, les autres le sont aussi.
+    usort($candidates, static fn(string $a, string $b): int => filemtime($b) <=> filemtime($a));
+    $path = $candidates[0];
+    $age = time() - filemtime($path);
+
+    if ($age > $window) {
+        return null;
+    }
+
+    // $subject est un groupe nominal complet — « Un dump de « production » » — et la
+    // question reste neutre : « ce fichier » s'accorde avec un dump comme une archive.
+    info(sprintf(
+        '♻️  %s datant de %s est déjà là : <comment>./%s</comment> (%s)',
+        $subject,
+        $age < 3600
+            ? sprintf('%d min', max(1, (int) round($age / 60)))
+            : sprintf('%dh%02d', intdiv($age, 3600), intdiv($age % 3600, 60)),
+        basename($path),
+        transferSize(null, $path),
+    ));
+
+    if (!askConfirmation('Réutiliser ce fichier au lieu d\'en produire un nouveau ?', false)) {
+        return null;
+    }
+
+    // `gzip -t` décompresse sans rien écrire et détecte la troncature, le trailer CRC
+    // manquant. Un transfert interrompu laisse précisément un fichier de ce genre, qui
+    // viderait la base locale avant de faire échouer l'import. Vaut aussi pour un
+    // .tar.gz : c'est la couche gzip qui est testée.
+    $intact = trim(runLocally(
+        sprintf('if gzip -t %s 2>/dev/null; then echo +intact; fi', escapeshellarg($path)),
+        ['timeout' => 1800],
+    )) === '+intact';
+
+    if (!$intact) {
+        warning('Ce fichier est incomplet ou corrompu : il est ignoré, un nouveau va être produit.');
+
+        return null;
+    }
+
+    return $path;
 }
 
 /**
@@ -1655,19 +1727,35 @@ task('db:pull', static function (): void {
 
     info("🌍 Source : <comment>$label</comment> — {{deploy_path}}");
 
+    // Posé avant transferWorkdir() : réutiliser ne doit rien créer sur le serveur.
+    $reused = transferReuseLocalArchive(
+        sprintf('db-%s-*.sql.gz', $label),
+        sprintf('Un dump de « %s »', $label),
+    );
     $remoteUrl = transferSiteUrl($from);
-    $dumpGz = transferDbExport($from, transferWorkdir($from));
 
-    $localName = sprintf('db-%s-%s.sql.gz', $label, date('Ymd-His'));
-    $localPath = transferProjectRoot() . '/' . $localName;
+    if ($reused !== null) {
+        $localPath = $reused;
+        $localName = basename($localPath);
+    } else {
+        $dumpGz = transferDbExport($from, transferWorkdir($from));
 
-    info("⬇️  Téléchargement vers <comment>./$localName</comment>...");
-    transferRsync($from, $dumpGz, null, $localPath);
+        $localName = sprintf('db-%s-%s.sql.gz', $label, date('Ymd-His'));
+        $localPath = transferProjectRoot() . '/' . $localName;
 
-    // Le serveur est libéré tout de suite : plus rien n'en dépend à partir d'ici.
-    invoke('transfer:cleanup');
+        info("⬇️  Téléchargement vers <comment>./$localName</comment>...");
+        transferRsync($from, $dumpGz, null, $localPath);
 
-    info(sprintf('✅ Dump récupéré : <comment>./%s</comment> (%s)', $localName, transferSize(null, $localPath)));
+        // Le serveur est libéré tout de suite : plus rien n'en dépend à partir d'ici.
+        invoke('transfer:cleanup');
+    }
+
+    info(sprintf(
+        '✅ Dump %s : <comment>./%s</comment> (%s)',
+        $reused !== null ? 'réutilisé' : 'récupéré',
+        $localName,
+        transferSize(null, $localPath),
+    ));
 
     $manual = sprintf('gunzip -c %s | {{transfer_local_prefix}}{{bin/wp_local}} db import -', $localName);
 
@@ -1698,58 +1786,79 @@ task('uploads:pull', static function (): void {
 
     info("🌍 Source : <comment>$label</comment> — {{deploy_path}}");
 
-    $remoteUploads = transferUploadsPath($from);
-    info("   Uploads distants : <comment>$remoteUploads</comment>");
-
     // Court-circuit avant toute analyse : inutile de parcourir des milliers de
     // fichiers pour n'en récupérer qu'une poignée.
     if (input()->getOption('favicon-only')) {
+        $remoteUploads = transferUploadsPath($from);
+        info("   Uploads distants : <comment>$remoteUploads</comment>");
         transferPullFavicon($from, $remoteUploads, $uploads);
 
         return;
     }
 
-    info('🔎 Analyse du dossier uploads distant (lecture seule)...');
-    $fileCount = trim(transferRun($from, sprintf('find %s -type f | wc -l', escapeshellarg($remoteUploads))));
-    // Mesuré une seule fois : `du -hs` parcourt tout l'arbre, ce n'est pas gratuit.
-    $uploadsSize = transferSize($from, $remoteUploads, true);
-    info(sprintf('   <comment>%s</comment> fichiers, <comment>%s</comment> à archiver.', $fileCount, $uploadsSize));
+    // Posée avant toute lecture distante, et pas seulement avant l'analyse qui
+    // parcourt tout l'arbre : réutiliser un fichier local ne doit dépendre en rien de
+    // l'état du serveur, sans quoi un dossier uploads introuvable — ou un serveur
+    // injoignable — interdirait de réextraire une archive déjà téléchargée.
+    $reused = transferReuseLocalArchive(
+        sprintf('uploads-%s-*.tar.gz', $label),
+        sprintf('Une archive des uploads de « %s »', $label),
+    );
 
-    // Demandé AVANT transferWorkdir(), qui crée déjà un répertoire sur le serveur :
-    // un refus ne doit rien y laisser. On annonce le volume, le disque du serveur
-    // n'ayant aucune raison d'être saturé à l'insu de qui lance la tâche.
-    info(sprintf(
-        '⚠️  L\'archive sera écrite sur le serveur, dans <comment>%s</comment>,',
-        transferResolvePath($from, '{{transfer_tmp_dir}}'),
-    ));
-    info(sprintf('   où elle occupera jusqu\'à <comment>%s</comment> le temps du transfert.', $uploadsSize));
+    if ($reused !== null) {
+        $localPath = $reused;
+        $localName = basename($localPath);
+    } else {
+        $remoteUploads = transferUploadsPath($from);
+        info("   Uploads distants : <comment>$remoteUploads</comment>");
 
-    if (!transferConfirmDiskUsage(sprintf('Créer l\'archive sur « %s » ?', $label), $uploadsSize)) {
-        info('Abandon : rien n\'a été écrit sur le serveur.');
+        info('🔎 Analyse du dossier uploads distant (lecture seule)...');
+        $fileCount = trim(transferRun($from, sprintf('find %s -type f | wc -l', escapeshellarg($remoteUploads))));
+        // Mesuré une seule fois : `du -hs` parcourt tout l'arbre, ce n'est pas gratuit.
+        $uploadsSize = transferSize($from, $remoteUploads, true);
+        info(sprintf('   <comment>%s</comment> fichiers, <comment>%s</comment> à archiver.', $fileCount, $uploadsSize));
+
+        // Demandé AVANT transferWorkdir(), qui crée déjà un répertoire sur le serveur :
+        // un refus ne doit rien y laisser. On annonce le volume, le disque du serveur
+        // n'ayant aucune raison d'être saturé à l'insu de qui lance la tâche.
+        info(sprintf(
+            '⚠️  L\'archive sera écrite sur le serveur, dans <comment>%s</comment>,',
+            transferResolvePath($from, '{{transfer_tmp_dir}}'),
+        ));
+        info(sprintf('   où elle occupera jusqu\'à <comment>%s</comment> le temps du transfert.', $uploadsSize));
+
+        if (!transferConfirmDiskUsage(sprintf('Créer l\'archive sur « %s » ?', $label), $uploadsSize)) {
+            info('Abandon : rien n\'a été écrit sur le serveur.');
+            invoke('transfer:cleanup');
+
+            return;
+        }
+
+        $archive = transferWorkdir($from) . '/uploads.tar.gz';
+        $localName = sprintf('uploads-%s-%s.tar.gz', $label, date('Ymd-His'));
+        $localPath = transferProjectRoot() . '/' . $localName;
+
+        info('🗜️  Création de l\'archive sur le serveur (progression toutes les 5s)...');
+        transferRunWatched(
+            $from,
+            sprintf('tar -czf %s -C %s .', escapeshellarg($archive), escapeshellarg($remoteUploads)),
+            $archive,
+            'archive :',
+        );
+        info('   Archive créée : <comment>' . transferSize($from, $archive) . '</comment>');
+
+        info("⬇️  Téléchargement vers <comment>./$localName</comment>...");
+        transferRsync($from, $archive, null, $localPath);
+
         invoke('transfer:cleanup');
-
-        return;
     }
 
-    $archive = transferWorkdir($from) . '/uploads.tar.gz';
-    $localName = sprintf('uploads-%s-%s.tar.gz', $label, date('Ymd-His'));
-    $localPath = transferProjectRoot() . '/' . $localName;
-
-    info('🗜️  Création de l\'archive sur le serveur (progression toutes les 5s)...');
-    transferRunWatched(
-        $from,
-        sprintf('tar -czf %s -C %s .', escapeshellarg($archive), escapeshellarg($remoteUploads)),
-        $archive,
-        'archive :',
-    );
-    info('   Archive créée : <comment>' . transferSize($from, $archive) . '</comment>');
-
-    info("⬇️  Téléchargement vers <comment>./$localName</comment>...");
-    transferRsync($from, $archive, null, $localPath);
-
-    invoke('transfer:cleanup');
-
-    info(sprintf('✅ Archive récupérée : <comment>./%s</comment> (%s)', $localName, transferSize(null, $localPath)));
+    info(sprintf(
+        '✅ Archive %s : <comment>./%s</comment> (%s)',
+        $reused !== null ? 'réutilisée' : 'récupérée',
+        $localName,
+        transferSize(null, $localPath),
+    ));
 
     $localUploads = transferProjectRoot() . '/' . $uploads;
     $question = sprintf(
