@@ -69,11 +69,13 @@ Chaque tâche commence par `transferResetState()` et se termine par `invoke('tra
 
 ### Robustesse des scripts shell générés
 
-Les heredocs assemblés dans le code obéissent à trois règles, chacune corrigeant un faux succès observé :
+Les heredocs et commandes assemblés dans le code obéissent à quatre règles, chacune corrigeant un faux succès observé :
 
 - `set -o pipefail` sur tout pipe (`gunzip -c … | wp db import -` annoncerait sinon un import réussi sur un flux vide) ;
 - `set -e` dans la simulation `rsync`, sans quoi un `rsync` en échec renvoie « 0 fichier à transférer » ;
 - tâche de fond + `wait $pid` dans `transferRunWatched()`, pour propager le code de sortie d'une commande longue dont on surveille la taille du fichier de sortie.
+
+- `curl -fsS` et jamais `curl -o` seul : sans `-f`, curl écrit la page d'erreur HTTP dans le fichier de destination et rend 0. Le `test -f {{deploy_path}}/.dep/wp-cli.phar` de la closure `bin/wp` accepterait alors définitivement un phar de 14 octets contenant « 404: Not Found ».
 
 Les chemins passent toujours par `escapeshellarg()`.
 

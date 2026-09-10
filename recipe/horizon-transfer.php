@@ -142,7 +142,12 @@ set('bin/wp', function () {
     }
 
     warning('WP-CLI introuvable. Installation dans "{{deploy_path}}/.dep/wp-cli.phar".');
-    run('curl -o {{deploy_path}}/.dep/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar');
+
+    // -fsS et non -o seul : sans -f, curl écrit la page d'erreur HTTP DANS le fichier
+    // et rend malgré tout 0. Le `test -f` de la première branche accepterait alors
+    // pour toujours un wp-cli.phar de quelques octets contenant « 404: Not Found », et
+    // tout appel WP-CLI casserait sur une erreur PHP — y compris ceux de db:pull.
+    run('curl -fsS -o {{deploy_path}}/.dep/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar');
 
     return '{{bin/php}} {{deploy_path}}/.dep/wp-cli.phar';
 });
