@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Nature du dépôt
 
-Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements.
+Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus `wp:update-db`, accrochée à `deploy:success`.
 
 Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de suite de tests, pas de linter configuré.
 
@@ -58,7 +58,21 @@ Toutes les fonctions de plomberie prennent un `?Host` et se comportent de façon
 
 Deployer exécute chaque tâche dans un **processus distinct**. Une tâche enregistrée via `fail()` ne voit donc aucune variable statique de la tâche qui a échoué. La liste des répertoires de travail à supprimer est pour cette raison écrite dans `<racine projet>/.dep/transfer-state.json` (`transferRegisterWorkdir` / `transferReadState` / `transferResetState`), ce qui permet aussi de nettoyer un hôte source absent du sélecteur.
 
-Chaque tâche commence par `transferResetState()` et se termine par `invoke('transfer:cleanup')`, plus un `fail('<tâche>', 'transfer:cleanup')` en fin de fichier. Toute nouvelle tâche créant un répertoire de travail doit suivre ce triptyque.
+Chaque tâche commence par `transferResetState()` et se termine par `invoke('transfer:cleanup')`, plus un `fail('<tâche>', 'transfer:cleanup')` en fin de fichier. Toute nouvelle tâche créant un répertoire de travail doit suivre ce triptyque. `wp:update-db` n'en crée aucun et n'y est donc volontairement pas soumise.
+
+### Le seul point d'accroche dans le flux de déploiement
+
+`after('deploy:success', 'wp:update-db')` est la seule chose que ce fichier modifie au comportement de `dep deploy` — d'où le garde-fou `set('transfer_update_db', true)` et le test d'existence de la tâche avant de poser le hook.
+
+Le point d'accroche n'est pas interchangeable. `deploy:symlink` et `deploy:success` voient tous deux le symlink déjà basculé, mais la tâche pose une question : accrochée avant `deploy:unlock`, elle ferait attendre le verrou de déploiement, et un `Ctrl-C` sur la question laisserait le projet verrouillé. `deploy:unlock` lui-même est exclu pour une autre raison — c'est la commande qu'on lance à la main pour débloquer un déploiement interrompu, et une question sur la base y serait hors de propos. `deploy:success` clôt `deploy:publish`, est `->hidden()`, et n'est jamais atteinte par un déploiement en échec — celui-ci sort par `fail('deploy', 'deploy:failed')`, branche qui ne traverse pas `deploy:success`. Ne pas justifier cela par « `deploy:failed` est une tâche vide » : c'est vrai du `recipe/common.php` nu, mais la plupart des projets Horizon y accrochent `deploy:unlock` et de vraies actions de récupération — raison pour laquelle un échec de `wp:update-db` est rattrapé par un `try/catch` plutôt que propagé.
+
+### Le défaut d'une question qui écrit ne peut pas être l'écriture
+
+`input()->isInteractive()` ne vaut faux qu'avec `-n` ou `-q`. Un `dep deploy` lancé sans TTY mais **sans** `-n` — cron, runner CI, `ssh serveur 'dep deploy'` — pose donc bel et bien la question, puis Symfony rencontre un EOF sur stdin et retombe **silencieusement** sur la réponse par défaut (`QuestionHelper::ask()`, `catch MissingInputException`).
+
+Le rattraper après la question est impossible : les tâches tournent dans un worker, les questions sont proxifiées vers le master (`Deployer::proxyCallToMaster`), et c'est l'entrée du *master* que Symfony bascule en non interactive — dans un autre processus. Un `input()->isInteractive()` posé après la question voit toujours « vrai » côté worker.
+
+C'est la raison de fond du `false` par défaut de `transferConfirm()` et `transferConfirmDestination()`, et la raison pour laquelle `wp:update-db` pose deux questions `askConfirmation` à défauts sûrs au lieu d'un `askChoice` dont le défaut aurait été la mise à jour.
 
 ### Contraintes `rsync` encodées dans le code
 

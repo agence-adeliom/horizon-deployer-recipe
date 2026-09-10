@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.3.1');
+define('HORIZON_TRANSFER_RECIPE', '1.4.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -128,6 +128,11 @@ set('transfer_search_replace_skip_tables', '*_wf*');
 set('transfer_protected', static function (): bool {
     return str_contains(currentHost()->getAlias(), 'prod') || str_contains((string) get('stage', ''), 'prod');
 });
+
+// Branche « wp:update-db » sur la fin du déploiement. À passer à false pour un
+// projet qui gère lui-même les migrations de schéma ; la tâche reste lançable à la
+// main : `dep wp:update-db production`.
+set('transfer_update_db', true);
 
 // WP-CLI distant, installé à la demande s'il n'est pas disponible. Défini ici pour
 // que le recipe soit autonome ; un projet qui définit son propre `bin/wp` après le
@@ -1923,6 +1928,167 @@ task('uploads:push', static function (): void {
         transferSize($to, $targetPath, true),
     ));
 })->once();
+
+/*
+|--------------------------------------------------------------------------
+| Mise à jour du schéma de base après déploiement
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Version du schéma enregistrée dans la base d'un environnement, et version qu'exige
+ * le cœur de WordPress qui vient d'y être déployé.
+ *
+ * On compare des entiers plutôt que d'interpréter `core update-db --dry-run`, dont la
+ * seule différence entre « à jour » et « à mettre à jour » est le libellé anglais du
+ * message de succès. Comme transferWpIsInstalled(), on se fie à un marqueur : une
+ * défaillance de WP-CLI ressort en [null, sortie brute] au lieu de lever.
+ *
+ * @return array{0: ?array{current: int, required: int, multisite: bool}, 1: string}
+ */
+function transferDbSchemaVersions(?Host $env): array
+{
+    $command = sprintf(
+        '%s eval %s --skip-plugins --skip-themes --no-color',
+        transferWpBin($env),
+        escapeshellarg(
+            'global $wp_db_version;'
+            . ' echo "+dep-dbv:", (int) get_option("db_version"), ":", (int) $wp_db_version,'
+            . ' ":", is_multisite() ? 1 : 0;'
+        ),
+    );
+
+    $output = trim(transferWpRun($env, "if $command 2>&1; then echo; fi"));
+
+    // Une version requise à 0 trahit un $wp_db_version illisible, pas un schéma à
+    // remettre à zéro : le marqueur est là mais ne veut rien dire. Une version
+    // COURANTE à 0 reste exploitable — une base sans option « db_version » existe.
+    if (preg_match('/\+dep-dbv:(\d+):(\d+):([01])/', $output, $matches) !== 1
+        || (int) $matches[2] === 0) {
+        return [null, $output];
+    }
+
+    return [
+        [
+            'current' => (int) $matches[1],
+            'required' => (int) $matches[2],
+            'multisite' => $matches[3] === '1',
+        ],
+        $output,
+    ];
+}
+
+desc('Met à jour le schéma de base WordPress si le cœur déployé l\'exige. Branchée sur la fin du déploiement, également lançable à la main : dep wp:update-db production');
+task('wp:update-db', static function (): void {
+    if (!get('transfer_update_db')) {
+        return;
+    }
+
+    // Ni source ni destination ici, contrairement aux tâches de transfert :
+    // l'environnement est l'hôte sur lequel le déploiement vient de passer.
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // La lecture résout {{bin/wp}}, qui peut télécharger wp-cli.phar sur l'hôte. Rien
+    // dans cette tâche ne doit faire échouer un déploiement par ailleurs réussi, et le
+    // marqueur ne couvre que WP-CLI — pas le curl ni le `cd` qui l'entourent.
+    try {
+        [$versions, $wpOutput] = transferDbSchemaVersions($env);
+    } catch (\Throwable $e) {
+        warning("Schéma de base non vérifié sur « $label » : la lecture a échoué.");
+        writeln('   ' . $e->getMessage());
+
+        return;
+    }
+
+    if ($versions === null) {
+        warning("Version du schéma de base illisible sur « $label » : mise à jour non vérifiée.");
+        writeln(transferWpMissingDiagnosis($env, $wpOutput));
+
+        return;
+    }
+
+    if ($versions['current'] === $versions['required']) {
+        info(sprintf(
+            '   Schéma de base à jour sur « %s » (version <comment>%d</comment>).',
+            $label,
+            $versions['current'],
+        ));
+
+        return;
+    }
+
+    warning(sprintf(
+        'Le schéma de base de « %s » doit passer de la version %d à %d.',
+        $label,
+        $versions['current'],
+        $versions['required'],
+    ));
+
+    // Ne rien faire est sûr : wp-admin déclenche cette mise à jour de lui-même. La
+    // tâche est un confort, pas une condition de correction.
+    if (!input()->isInteractive()) {
+        warning(sprintf(
+            'Mode non interactif : aucune écriture. Pour la lancer : dep wp:update-db %s',
+            $label,
+        ));
+
+        return;
+    }
+
+    // Deux questions à défauts sûrs, et non un askChoice dont le défaut écrirait : sans
+    // TTY et sans -n, Symfony retombe silencieusement sur la réponse par défaut, et le
+    // rattraper après coup est impossible. Voir CLAUDE.md, « Le défaut d'une question
+    // qui écrit ne peut pas être l'écriture ».
+    if (!askConfirmation(sprintf('Mettre à jour le schéma de base de « %s » ?', $label), false)) {
+        info('   Schéma inchangé. wp-admin proposera la mise à jour dès la première connexion d\'un·e utilisateur·rice.');
+
+        return;
+    }
+
+    // Défaut « oui » sans danger : on n'arrive ici qu'après un « oui » explicite, qu'un
+    // EOF ne peut pas produire.
+    $backup = askConfirmation('Sauvegarder la base avant la mise à jour ?', true);
+
+    // Un échec n'échoue pas le déploiement : la release est publiée, le verrou relâché,
+    // et la chaîne `deploy:failed` des projets lance de vraies actions de récupération.
+    // La mise à jour reste rattrapable à la main, et par wp-admin de toute façon.
+    try {
+        // Sauvegarde demandée mais impossible : on n'écrit pas. transferDbBackup() se
+        // contente d'un avertissement et rend null quand WordPress est inutilisable.
+        if ($backup && transferDbBackup($env) === null) {
+            warning("Sauvegarde impossible : le schéma de « $label » est laissé inchangé.");
+
+            return;
+        }
+
+        info(sprintf('🔄 Mise à jour du schéma de base de <comment>%s</comment>...', $label));
+
+        // --skip-plugins --skip-themes : wp_upgrade() est une routine du cœur. Charger
+        // les plugins réveillerait leurs propres routines de mise à jour au passage.
+        $result = trim(transferWpRun($env, sprintf(
+            '%s core update-db --skip-plugins --skip-themes --no-color%s',
+            transferWpBin($env),
+            $versions['multisite'] ? ' --network' : '',
+        )));
+    } catch (\Throwable $e) {
+        warning("Échec de la mise à jour du schéma sur « $label ». Le déploiement reste valide, le site est en ligne.");
+        writeln('   ' . $e->getMessage());
+        warning("À relancer une fois la cause levée : dep wp:update-db $label");
+
+        return;
+    }
+
+    info('✅ ' . ($result !== '' ? $result : "Schéma de base de « $label » mis à jour."));
+});
+
+// deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
+// verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
+// deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la
+// main pour débloquer un déploiement. Voir CLAUDE.md pour le détail.
+if (Deployer::get()->tasks->has('deploy:success')) {
+    after('deploy:success', 'wp:update-db');
+}
 
 // En cas d'échec, on supprime les répertoires temporaires de tous les environnements.
 fail('db:pull', 'transfer:cleanup');

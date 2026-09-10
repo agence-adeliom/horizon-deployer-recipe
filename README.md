@@ -74,6 +74,11 @@ Le recipe fournit un défaut pour `bin/wp` (WP-CLI distant, téléchargé à la 
 `{{deploy_path}}/.dep/wp-cli.phar`). Pour le surcharger, redéfinissez-le **après** le
 `require_once`.
 
+Le recipe accroche également `wp:update-db` à la fin du déploiement (voir
+[Mise à jour du schéma après déploiement](#mise-à-jour-du-schéma-après-déploiement)). C'est
+le seul endroit où il modifie le comportement de `dep deploy` ; `set('transfer_update_db',
+false)` le désarme.
+
 Ajoutez à votre `.gitignore` :
 
 ```gitignore
@@ -90,6 +95,7 @@ Ajoutez à votre `.gitignore` :
 | `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction. `--favicon-only` ne récupère que le favicon |
 | `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
+| `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
 
 Un « environnement » est soit `local`, soit l'alias d'un hôte Deployer.
 
@@ -121,6 +127,60 @@ dep db:push staging --from=production
 La destination d'un push est toujours un environnement distant. Pour rapatrier vers le
 local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécriture d'URLs.
 
+### Mise à jour du schéma après déploiement
+
+`wp:update-db` compare la version de schéma enregistrée en base à celle qu'exige le cœur de
+WordPress qui vient d'être déployé, et propose la mise à jour quand elles diffèrent — en
+pratique au premier déploiement suivant un bump du core.
+
+Elle est accrochée à `deploy:success` par le recipe : rien à ajouter dans `deploy.php`. Un
+déploiement où le schéma est déjà à jour affiche une ligne et coûte trois commandes
+distantes (deux pour résoudre `bin/wp`, une pour la lecture). Sinon, deux questions :
+
+```
+ warning Le schéma de base de « production » doit passer de la version 57155 à 58975.
+ Mettre à jour le schéma de base de « production » ? [y/N] y
+ Sauvegarder la base avant la mise à jour ? [Y/n]
+ info 🛟 Sauvegarde de la base de production avant écrasement...
+ info ✅ Success: WordPress database upgraded successfully from db version 57155 to 58975.
+```
+
+La sauvegarde va dans `{{transfer_backup_dir}}` et n'est jamais supprimée automatiquement,
+comme celles des tâches `push`. Si elle est demandée mais impossible — WordPress inutilisable
+sur l'hôte — le schéma est laissé inchangé plutôt que mis à jour sans filet.
+
+**Aucune écriture ne peut avoir lieu sans réponse explicite.** En `-n` la question n'est pas
+posée du tout. Et si elle est posée sans que personne ne puisse y répondre — `dep deploy`
+lancé par un cron ou un runner CI, sans TTY mais sans `-n` — Symfony retombe sur la réponse
+par défaut, qui est « non » précisément pour cette raison. Ne rien faire est sûr : WordPress
+déclenche lui-même cette mise à jour à la première visite de wp-admin. La tâche est un
+confort, pas une condition de correction, et reste lançable seule :
+
+```bash
+dep wp:update-db production
+```
+
+Pour la même raison, un échec de la mise à jour **n'échoue pas le déploiement** : la release
+est publiée et le site en ligne. Un avertissement rappelle la commande à relancer.
+
+Pour la désarmer sur un projet qui gère ses propres migrations : `set('transfer_update_db',
+false)`, **après** le `require_once` comme toute surcharge. La clé se surcharge aussi par
+hôte depuis l'inventaire (`transfer_update_db: false`).
+
+Deux limites à connaître :
+
+- **Elle fait résoudre `bin/wp` à chaque déploiement.** Un projet qui n'utilisait le recipe
+  que pour `db:pull` verra donc son `dep deploy` chercher WP-CLI sur le serveur — et, avec le
+  défaut du recipe, **télécharger `wp-cli.phar`** dans `{{deploy_path}}/.dep/` s'il n'y en a
+  ni de global ni de déjà téléchargé. C'est la seule écriture distante que la tâche provoque
+  hors mise à jour de schéma ; définir `bin/wp` sur un binaire existant l'évite, comme
+  `set('transfer_update_db', false)`.
+- **Un déploiement multi-hôtes pose la question par hôte**, et lancerait autant de
+  `core update-db` concurrents si les nœuds partagent une base. La tâche n'est
+  volontairement pas `once()` — des hôtes de stages distincts ont bien des bases distinctes,
+  et Deployer ne sait pas exprimer « une fois par base ». Sur un cluster de nœuds web
+  partageant une base, désarmez la clé et lancez `dep wp:update-db <un seul hôte>`.
+
 ## Sûreté
 
 - **Un `pull` ne modifie jamais l'environnement distant**, hormis ses propres fichiers
@@ -142,6 +202,9 @@ local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécrit
   n'écrit rien, la question précédant la création du répertoire de travail. Les tâches de
   base de données ne posent pas cette question : leurs dumps sont d'un autre ordre de
   grandeur.
+- **`wp:update-db` n'écrit qu'après une réponse explicite**, et la sauvegarde préalable
+  demandée conditionne la mise à jour : si elle échoue, le schéma est laissé inchangé. Un
+  échec de la mise à jour n'échoue pas le déploiement, la release étant déjà publiée.
 - **Aucune trace en cas d'échec.** Les fichiers temporaires vivent dans un répertoire de
   travail unique par environnement, supprimé en fin de tâche et via `fail()`. Les
   répertoires orphelins d'une exécution interrompue brutalement sont purgés au démarrage
@@ -151,6 +214,13 @@ local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécrit
   confirmations d'espace disque ci-dessus : elles passent outre en annonçant le volume,
   puisque bloquer y rendrait `uploads:pull` inutilisable en scripté sans rien protéger de
   durable — l'archive est un fichier de travail, supprimé en fin de tâche.
+- **La réponse par défaut d'une question qui écrit est toujours celle qui n'écrit pas.**
+  Ce n'est pas une politesse : `-n` n'est pas le seul cas où personne ne peut répondre. Sans
+  TTY et sans `-n` — cron, runner CI, `ssh serveur 'dep deploy'` — la question *est* posée,
+  Symfony rencontre un EOF sur stdin et retombe silencieusement sur la réponse par défaut.
+  C'est pourquoi `transferConfirm()` et `transferConfirmDestination()` refusent par défaut,
+  et pourquoi `wp:update-db` pose deux questions à défauts sûrs plutôt qu'un choix unique
+  dont le défaut serait la mise à jour.
 
 ## Réécriture d'URLs
 
@@ -358,6 +428,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_local_tmp_dir` | `<racine projet>/.dep/transfer` | Répertoire de travail local |
 | `transfer_backup_dir` | `{{deploy_path}}/.dep/backups` | Sauvegardes conservées |
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
+| `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |
 | `bin/wp_local` | premier `wp` du PATH connaissant `wp db` | WP-CLI local. Un projet qui requiert `wp-cli/wp-cli` (le framework seul, sans les commandes) obtient un proxy dans `vendor/bin` prioritaire dans le PATH : il est écarté au profit d'un phar complet |
 | `bin/wp` | phar téléchargé à la demande | WP-CLI distant |
@@ -397,6 +468,16 @@ hosts:
 - **Codes de sortie.** Les commandes longues tournent en tâche de fond avec propagation
   via `wait`, et les pipes utilisent `set -o pipefail` — sans quoi un `gunzip` en échec
   laisserait WP-CLI annoncer un import réussi sur un flux vide.
+- **Point d'accroche de `wp:update-db`.** `deploy:success` et non `deploy:symlink`, bien que
+  les deux voient le même symlink déjà basculé : la question ne doit pas être posée tant que
+  le verrou de déploiement est tenu, sinon un `Ctrl-C` dessus laisse le projet verrouillé.
+  `deploy:success` clôt `deploy:publish`, après `deploy:unlock`. C'est aussi une tâche cachée
+  que personne ne lance à la main, contrairement à `deploy:unlock` qu'on invoque justement
+  pour débloquer un déploiement interrompu. Un déploiement en échec n'y passe pas non plus :
+  il sort par `fail('deploy', 'deploy:failed')`, une branche qui ne traverse jamais
+  `deploy:success`. Attention en revanche à ne pas s'appuyer sur l'idée que `deploy:failed`
+  serait vide — c'est vrai du `recipe/common.php` nu, mais la plupart des projets y
+  accrochent `deploy:unlock` et des actions de récupération.
 - **État du nettoyage.** Deployer exécute chaque tâche dans un processus distinct : une
   tâche `fail()` ne voit pas les variables statiques de la tâche qui a échoué. La liste des
   répertoires à nettoyer est donc persistée dans `<racine projet>/.dep/transfer-state.json`.
