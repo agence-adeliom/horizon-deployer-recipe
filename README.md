@@ -218,9 +218,11 @@ Deux limites à connaître :
   Ce n'est pas une politesse : `-n` n'est pas le seul cas où personne ne peut répondre. Sans
   TTY et sans `-n` — cron, runner CI, `ssh serveur 'dep deploy'` — la question *est* posée,
   Symfony rencontre un EOF sur stdin et retombe silencieusement sur la réponse par défaut.
-  C'est pourquoi `transferConfirm()` et `transferConfirmDestination()` refusent par défaut,
-  et pourquoi `wp:update-db` pose deux questions à défauts sûrs plutôt qu'un choix unique
-  dont le défaut serait la mise à jour.
+  Tous les appelants de `transferConfirm()` passent donc « non » en défaut, comme
+  `transferConfirmDestination()`, et `wp:update-db` pose deux questions à défauts sûrs
+  plutôt qu'un choix unique dont le défaut serait la mise à jour. **Conséquence pratique :
+  Entrée ne déclenche jamais une écriture.** Importer un dump dans la base locale, extraire
+  une archive d'uploads, écrire un favicon ou réécrire des URLs demandent un « y » explicite.
 
 ## Réécriture d'URLs
 

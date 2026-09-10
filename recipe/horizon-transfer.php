@@ -823,6 +823,10 @@ task('transfer:cleanup', static function (): void {
  * On se fie uniquement à Deployer pour détecter l'interactivité : `ddev php`
  * n'alloue pas de TTY, donc tester stream_isatty(STDIN) ferait sauter la question
  * alors qu'on est bien en interactif. Pour sauter l'étape : `dep ... -n`.
+ *
+ * $default vaut toujours false chez les appelants : sans TTY et sans -n, Symfony
+ * retombe silencieusement sur la réponse par défaut, et un true ferait donc écrire
+ * sans décision. Voir CLAUDE.md, « Le défaut d'une question qui écrit ».
  */
 function transferConfirm(string $question, bool $default): bool
 {
@@ -1097,7 +1101,7 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
 
     $question = sprintf('Réécrire les URLs de « %s » vers %s maintenant (%d passes) ?', $label, $toUrl, count($steps));
 
-    if (!transferConfirm($question, true)) {
+    if (!transferConfirm($question, false)) {
         info(sprintf('   URLs laissées en place. À lancer sur « %s », dans cet ordre :', $label));
 
         // Les commandes sont résolues dans le contexte de leur environnement, sinon
@@ -1560,7 +1564,7 @@ function transferPullFavicon(Host $from, string $remoteUploads, string $uploads)
         ));
     }
 
-    if (!transferConfirm(sprintf('Écrire ces %d fichier(s) dans ./%s ?', count($available), $uploads), true)) {
+    if (!transferConfirm(sprintf('Écrire ces %d fichier(s) dans ./%s ?', count($available), $uploads), false)) {
         info('   Rien n\'a été écrit.');
 
         return;
@@ -1674,7 +1678,7 @@ task('db:pull', static function (): void {
         return;
     }
 
-    if (!transferConfirm('Vider la base de données LOCALE et y importer ce dump maintenant ?', true)) {
+    if (!transferConfirm('Vider la base de données LOCALE et y importer ce dump maintenant ?', false)) {
         info('   Dump conservé, la base locale n\'a pas été touchée.');
         info("   Import manuel : <comment>$manual</comment>");
 
@@ -1753,7 +1757,7 @@ task('uploads:pull', static function (): void {
         $uploads,
     );
 
-    if (!transferConfirm($question, true)) {
+    if (!transferConfirm($question, false)) {
         info("   Archive conservée, ./$uploads n'a pas été touché.");
         info(sprintf(
             '   Extraction manuelle : <comment>mkdir -p %s && tar -xzf %s -C %s</comment>',

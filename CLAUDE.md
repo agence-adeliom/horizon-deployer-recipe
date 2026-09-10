@@ -72,7 +72,7 @@ Le point d'accroche n'est pas interchangeable. `deploy:symlink` et `deploy:succe
 
 Le rattraper après la question est impossible : les tâches tournent dans un worker, les questions sont proxifiées vers le master (`Deployer::proxyCallToMaster`), et c'est l'entrée du *master* que Symfony bascule en non interactive — dans un autre processus. Un `input()->isInteractive()` posé après la question voit toujours « vrai » côté worker.
 
-C'est la raison de fond du `false` par défaut de `transferConfirm()` et `transferConfirmDestination()`, et la raison pour laquelle `wp:update-db` pose deux questions `askConfirmation` à défauts sûrs au lieu d'un `askChoice` dont le défaut aurait été la mise à jour.
+C'est la raison de fond du `false` exigé de **tous** les appelants de `transferConfirm()`, et du `false` de `transferConfirmDestination()`, et la raison pour laquelle `wp:update-db` pose deux questions `askConfirmation` à défauts sûrs au lieu d'un `askChoice` dont le défaut aurait été la mise à jour.
 
 ### Contraintes `rsync` encodées dans le code
 
