@@ -340,7 +340,7 @@ occurrence du nom de la collation à l'intérieur d'une donnée serait réécrit
 ddev config --database=mysql:8.0 && ddev restart
 ```
 
-`.ddev/config.yaml` étant versionné, ce choix engage l'équipe : chacun devra recréer sa
+`.ddev/config.yaml` étant versionné, ce choix engage l'équipe : chacun·e devra recréer sa
 base locale.
 
 ## Récupérer le seul favicon

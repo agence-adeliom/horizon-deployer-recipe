@@ -109,7 +109,7 @@ set('bin/wp_local', static function (): string {
     return 'wp';
 });
 
-// Préfixe utilisé uniquement dans les commandes suggérées à l'utilisateur, qui
+// Préfixe utilisé uniquement dans les commandes suggérées à l'utilisateur·rice, qui
 // seront tapées depuis l'hôte et non depuis le conteneur. `ddev exec` et non
 // `ddev` : le binaire retenu ci-dessus peut être un chemin absolu, que `ddev`
 // n'accepte pas comme sous-commande. Le stdin est transmis dans les deux cas, ce
@@ -360,7 +360,7 @@ function transferWpHasCommand(?Host $env, string $command, ?string $bin = null):
  *
  * C'est presque toujours la configuration du projet qui est en cause, pas le
  * recipe : sans le message de WP-CLI, le binaire employé et le répertoire
- * d'exécution, l'utilisateur n'a aucune prise sur l'erreur.
+ * d'exécution, l'utilisateur·rice n'a aucune prise sur l'erreur.
  */
 function transferWpMissingDiagnosis(?Host $env, string $wpOutput): string
 {
