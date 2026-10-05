@@ -272,6 +272,14 @@ Les tables de logs et de caches de plugins sont exclues par défaut
 (`transfer_search_replace_skip_tables`, `*_wf*`) : Wordfence stocke des dizaines de
 milliers de chemins de fichiers que la passe « domaine nu » réécrirait inutilement.
 
+Les URLs sont lues par WP-CLI (`config get WP_HOME`, puis `option get home`), et seule la
+dernière ligne de la réponse est retenue, à condition d'être une URL `http(s)://`. Avec
+`display_errors` actif — le cas sous DDEV — PHP écrit ses avertissements sur stdout : sous
+PHP 8.4, la réponse arrive précédée de lignes `Deprecated: …` qu'il ne faut surtout pas
+prendre pour l'URL, sans quoi elles seraient écrites devant chaque URL de la base. Si
+aucune URL valide n'est trouvée, la réécriture est ignorée avec un avertissement et la
+commande à lancer à la main.
+
 ### Mémoire et grosses bases
 
 `--precise` n'est **pas** activé par défaut. Cette option force WP-CLI à traiter toutes les

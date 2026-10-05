@@ -46,7 +46,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.4.1');
+define('HORIZON_TRANSFER_RECIPE', '1.4.2');
 
 /*
 |--------------------------------------------------------------------------
@@ -304,6 +304,23 @@ function transferTest(?Host $env, string $command): bool
 function transferWpBin(?Host $env): string
 {
     return $env === null ? '{{bin/wp_local}}' : '{{bin/wp}}';
+}
+
+/**
+ * Réponse d'une commande WP-CLI de lecture mono-ligne : la dernière ligne non vide.
+ *
+ * PHP écrit ses avertissements sur stdout dès que display_errors est actif — c'est le
+ * cas sous DDEV — et WP-CLI ne les en sépare pas. Sous PHP 8.4, la moindre lecture
+ * arrive donc précédée de lignes « Deprecated: … » émises par WP-CLI lui-même ou par
+ * le code du projet. Un trim() les garde : c'est ainsi qu'un db:pull a pris tout ce
+ * bloc pour l'URL locale et l'a écrit devant chaque URL de la base. Le code de sortie
+ * ne protège de rien, les dépréciations n'en changent pas.
+ */
+function transferWpLastLine(string $output): string
+{
+    $lines = array_filter(array_map('trim', preg_split('/\R/', $output)), 'strlen');
+
+    return $lines === [] ? '' : end($lines);
 }
 
 /**
@@ -1091,9 +1108,11 @@ function transferSiteUrl(?Host $env): ?string
 
     foreach (["$bin config get WP_HOME", "$bin option get home --skip-plugins --skip-themes"] as $command) {
         try {
-            $value = trim(transferWpRun($env, $command));
+            $value = transferWpLastLine(transferWpRun($env, $command));
 
-            if ($value !== '' && str_contains($value, '://')) {
+            // Forme stricte et non un simple « contient :// » : cette valeur devient le
+            // remplacement du search-replace, un texte parasite y serait écrit partout.
+            if (preg_match('~^https?://\S+$~', $value)) {
                 return $value;
             }
         } catch (\Throwable) {
@@ -1134,7 +1153,20 @@ function transferSearchReplaceSteps(string $fromUrl, string $toUrl): array
  */
 function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): void
 {
-    if (!$fromUrl || !$toUrl || rtrim($fromUrl, '/') === rtrim($toUrl, '/')) {
+    // Une URL illisible n'est pas un cas « rien à faire » : la base garderait les URLs
+    // de la source sans que personne ne le sache.
+    if (!$fromUrl || !$toUrl) {
+        warning(sprintf(
+            'URL %s introuvable : réécriture des URLs ignorée sur « %s ».',
+            $fromUrl ? 'de destination' : 'de la source',
+            transferEnvLabel($env),
+        ));
+        info('   À lancer à la main : <comment>wp search-replace ANCIENNE_URL NOUVELLE_URL --all-tables --skip-columns=guid</comment>');
+
+        return;
+    }
+
+    if (rtrim($fromUrl, '/') === rtrim($toUrl, '/')) {
         return;
     }
 
@@ -1531,7 +1563,7 @@ function transferFaviconFiles(?Host $env): array
 
     // `|| true` : une option ou une méta absente sort en code 1, ce qui n'est pas
     // une erreur ici — c'est une réponse.
-    $read = static fn(string $command): string => trim(transferWpRun(
+    $read = static fn(string $command): string => transferWpLastLine(transferWpRun(
         $env,
         sprintf('%s %s --skip-plugins --skip-themes 2>/dev/null || true', $bin, $command),
     ));
