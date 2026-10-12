@@ -21,7 +21,7 @@ Ajouter `-n` pour le mode non interactif (aucune écriture n'est alors effectué
 
 ## Versionnage
 
-Composer résout ce paquet **par tags git** (dépôt privé, hors Packagist). Toute modification publiée implique donc :
+Composer résout ce paquet **par tags git** (dépôt public, mais hors Packagist). Toute modification publiée implique donc :
 
 1. bumper `HORIZON_TRANSFER_RECIPE` (`recipe/horizon-transfer.php`), qui sert de marqueur de version testable depuis un `deploy.php` ;
 2. créer le tag git correspondant.
