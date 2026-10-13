@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.7.0');
+define('HORIZON_TRANSFER_RECIPE', '1.6.1');
 
 /*
 |--------------------------------------------------------------------------
