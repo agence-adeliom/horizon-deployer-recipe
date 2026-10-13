@@ -30,6 +30,8 @@
 |    défaut si l'alias ou le stage contient « prod ») ;
 |  - avant tout import, la base de la destination est dumpée et CONSERVÉE dans
 |    {{transfer_backup_dir}} ;
+|  - chaque `dep deploy` vérifie d'abord que le code local, d'où sont buildés les
+|    assets, est exactement le commit déployé (build:check) ;
 |  - chaque `dep deploy` dumpe la base juste avant la bascule du symlink, dans le
 |    même dossier, en ne gardant que les {{transfer_backup_keep}} derniers dumps de
 |    déploiement (`dep db:backup <hôte>` pour en faire un à la main) ;
@@ -145,6 +147,16 @@ set('transfer_update_db', true);
 // Dump de la base à chaque déploiement, juste avant la bascule du symlink. À passer à
 // false pour s'en passer ; `dep db:backup <hôte>` reste lançable à la main.
 set('transfer_backup_on_deploy', true);
+
+// Garde-fou du build local (build:check, avant `deploy`) : les assets étant buildés sur
+// la machine qui déploie puis envoyés, le code local doit être le commit déployé. À
+// passer à false pour un projet qui builde sur le serveur.
+set('build_check', true);
+
+// Dossiers qui ne doivent contenir aucune modification non commitée au moment du
+// déploiement : ceux d'où sont buildés les assets. Le thème par défaut, si `theme` est
+// défini ; liste vide pour ne vérifier que le commit.
+set('build_check_paths', static fn(): array => has('theme') ? ['web/app/themes/{{theme}}'] : []);
 
 // Nombre de dumps db:backup conservés par hôte, les plus anciens étant supprimés après
 // chaque nouveau dump. 0 pour ne jamais en supprimer.
@@ -2231,6 +2243,88 @@ function transferDbSchemaVersions(?Host $env): array
     ];
 }
 
+/**
+ * Commit que le serveur va cloner pour la cible du déploiement ({{target}} : branche,
+ * --tag ou --revision), lu sur le dépôt distant et non sur une référence locale qui
+ * pourrait être en retard. Null si la cible est introuvable.
+ */
+function buildCheckRemoteCommit(string $target): ?string
+{
+    // Une révision explicite est déjà un commit.
+    if (preg_match('/^[0-9a-f]{7,40}$/i', $target)) {
+        return strtolower($target);
+    }
+
+    $refs = $target === 'HEAD'
+        ? ['HEAD']
+        : ["refs/heads/$target", "refs/tags/$target", "refs/tags/$target^{}"];
+
+    $listing = runLocally(sprintf(
+        'git ls-remote %s %s',
+        escapeshellarg(get('repository')),
+        implode(' ', array_map('escapeshellarg', $refs)),
+    ));
+
+    $commits = [];
+
+    foreach (preg_split('/\R/', trim($listing)) as $line) {
+        if (preg_match('/^([0-9a-f]{40})\s+(\S+)$/', $line, $matches)) {
+            $commits[$matches[2]] = $matches[1];
+        }
+    }
+
+    // Un tag annoté pointe sur un objet tag : c'est sa forme « déréférencée » (^{}) qui
+    // donne le commit.
+    foreach (array_merge(["refs/tags/$target^{}"], $refs) as $ref) {
+        if (isset($commits[$ref])) {
+            return $commits[$ref];
+        }
+    }
+
+    return null;
+}
+
+desc('Vérifie que le code local, d\'où sont buildés les assets, est exactement le commit déployé et sans modification non commitée dans {{build_check_paths}}');
+task('build:check', static function (): void {
+    if (!get('build_check')) {
+        return;
+    }
+
+    $target = get('target');
+    $local = runLocally('git rev-parse HEAD');
+    $remote = buildCheckRemoteCommit($target);
+
+    if ($remote === null) {
+        throw error("Cible « $target » introuvable sur le dépôt distant : la pousser avant de déployer.");
+    }
+
+    if (!str_starts_with($local, $remote) && !str_starts_with($remote, $local)) {
+        throw error(sprintf(
+            "Le code local (%s) n'est pas celui qui va être déployé (« %s » = %s) : les assets ne correspondraient pas à la release. Se placer sur « %s » à jour (checkout, pull, push) avant de déployer.",
+            substr($local, 0, 8),
+            $target,
+            substr($remote, 0, 8),
+            $target,
+        ));
+    }
+
+    $paths = array_map(static fn(string $path): string => parse($path), (array) get('build_check_paths'));
+
+    if ($paths !== []) {
+        $dirty = runLocally('git status --porcelain -- ' . implode(' ', array_map('escapeshellarg', $paths)));
+
+        if ($dirty !== '') {
+            throw error(sprintf(
+                "Modifications non commitées dans %s : les committer ou les remiser avant de déployer.\n%s",
+                implode(', ', $paths),
+                $dirty,
+            ));
+        }
+    }
+
+    info(sprintf('   Code local = « %s » (%s) : les assets buildés correspondront à la release.', $target, substr($remote, 0, 8)));
+});
+
 desc('Dumpe la base de l\'hôte dans {{transfer_backup_dir}}, nommée d\'après sa release, et ne garde que les {{transfer_backup_keep}} derniers dumps : dep db:backup production');
 task('db:backup', static function (): void {
     transferBackupWithRelease(currentHost());
@@ -2356,6 +2450,12 @@ task('wp:update-db', static function (): void {
 // main pour débloquer un déploiement. Voir CLAUDE.md pour le détail.
 if (Deployer::get()->tasks->has('deploy:success')) {
     after('deploy:success', 'wp:update-db');
+}
+
+// Avant tout le reste : inutile de verrouiller ou de cloner si le build local ne
+// correspondrait pas à la release.
+if (Deployer::get()->tasks->has('deploy')) {
+    before('deploy', 'build:check');
 }
 
 // Juste avant deploy:symlink : la base est encore celle de la release en ligne, et ni les

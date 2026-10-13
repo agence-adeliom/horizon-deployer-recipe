@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Nature du dépôt
 
-Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus `db:backup`, accrochée avant `deploy:symlink`, et `wp:update-db`, accrochée à `deploy:success`.
+Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus trois tâches greffées sur `dep deploy` : `build:check` avant `deploy`, `db:backup` avant `deploy:symlink` et `wp:update-db` à `deploy:success`.
 
 Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de suite de tests, pas de linter configuré.
 
@@ -60,10 +60,11 @@ Deployer exécute chaque tâche dans un **processus distinct**. Une tâche enreg
 
 Chaque tâche commence par `transferResetState()` et se termine par `invoke('transfer:cleanup')`, plus un `fail('<tâche>', 'transfer:cleanup')` en fin de fichier. Toute nouvelle tâche créant un répertoire de travail doit suivre ce triptyque. `wp:update-db` n'en crée aucun et n'y est donc volontairement pas soumise.
 
-### Les deux points d'accroche dans le flux de déploiement
+### Les points d'accroche dans le flux de déploiement
 
-Ce fichier modifie `dep deploy` à deux endroits seulement, chacun avec son garde-fou (`set(…, true)`) et un test d'existence de la tâche cible avant de poser le hook :
+Ce fichier modifie `dep deploy` à trois endroits seulement, chacun avec son garde-fou (`set(…, true)`) et un test d'existence de la tâche cible avant de poser le hook :
 
+- `before('deploy', 'build:check')` (`build_check`) : les assets sont buildés sur la machine qui déploie, donc le commit local (`git rev-parse HEAD`) doit être celui que le serveur clonera pour `{{target}}`, lu sur le dépôt distant (`git ls-remote {{repository}}`, tag annoté déréférencé via `^{}`), et `{{build_check_paths}}` doit être propre. Comparer des commits et non des noms de branche couvre les commits non poussés, les branches locales en retard et les têtes détachées de CI. Seuls les chemins listés sont vérifiés, pour tolérer une modification temporaire de l'inventaire.
 - `before('deploy:symlink', 'deploy:db-backup')` (`transfer_backup_on_deploy`) : dump de la base nommé d'après la release (`<alias>-avant-release-<N>-<date>.sql.gz`), puis rotation à `transfer_backup_keep` dumps. Dernier moment où la base est celle de la release en ligne ; aucune question n'est posée, donc tenir le verrou ne pose pas de problème. Un échec d'export **doit** faire échouer le déploiement (avant la bascule, donc sans dommage) ; un échec de rotation non. Le numéro vient du lien `{{deploy_path}}/release` lu sur le serveur, pas de `{{release_name}}` (qui, réévalué hors de `deploy:release`, donnerait la release suivante). `deploy:db-backup` est la variante cachée qui lit le réglage ; `db:backup` l'ignore, pour rester lançable à la main.
 - `after('deploy:success', 'wp:update-db')` (`transfer_update_db`), détaillé ci-dessous.
 

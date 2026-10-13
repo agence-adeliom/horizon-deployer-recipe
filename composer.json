@@ -1,6 +1,6 @@
 {
     "name": "agence-adeliom/horizon-deployer-recipe",
-    "description": "Recipes Deployer pour les projets WordPress Horizon : transfert de base de données et d'uploads entre environnements",
+    "description": "Recipes Deployer pour les projets WordPress Horizon : transfert de base de données et d'uploads entre environnements, garde-fou du build local et sauvegarde de la base à chaque déploiement",
     "type": "library",
     "license": "MIT",
     "keywords": [

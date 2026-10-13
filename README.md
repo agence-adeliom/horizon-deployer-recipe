@@ -52,8 +52,11 @@ Le recipe fournit un défaut pour `bin/wp` (WP-CLI distant, téléchargé à la 
 `{{deploy_path}}/.dep/wp-cli.phar`). Pour le surcharger, redéfinissez-le **après** le
 `require_once`.
 
-Le recipe modifie le comportement de `dep deploy` à deux endroits, chacun désarmable :
+Le recipe modifie le comportement de `dep deploy` à trois endroits, chacun désarmable :
 
+- il **vérifie avant tout que le code local est exactement le commit déployé**, les assets
+  étant buildés en local (voir [Garde-fou du build local](#garde-fou-du-build-local)) ;
+  `set('build_check', false)` le désarme ;
 - il **dumpe la base juste avant la bascule du symlink** et ne garde que les 10 derniers
   dumps (voir [Sauvegarde de la base à chaque déploiement](#sauvegarde-de-la-base-à-chaque-déploiement)) ;
   `set('transfer_backup_on_deploy', false)` le désarme ;
@@ -78,6 +81,7 @@ Ajoutez à votre `.gitignore` :
 | `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 | `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
+| `dep build:check <hôte>` | — | Vérifie que le commit local est celui que le serveur va cloner, sans modification non commitée dans `{{build_check_paths}}`. Lancée d'elle-même avant `deploy` |
 | `dep db:backup <hôte>` | — | Dumpe la base de l'hôte dans `{{transfer_backup_dir}}`, nommée d'après sa release, et ne garde que les `{{transfer_backup_keep}}` derniers dumps. Lancée d'elle-même juste avant `deploy:symlink` |
 
 Un « environnement » est soit `local`, soit l'alias d'un hôte Deployer.
@@ -137,6 +141,29 @@ même si le serveur est injoignable.
 Le fichier retenu est le plus récent par date de modification, et non par l'horodatage de son
 nom, qui ne survit pas à une copie. `set('transfer_reuse_window', 0)` désactive la
 proposition ; toute autre valeur est une durée en secondes.
+
+### Garde-fou du build local
+
+Les projets Horizon buildent leurs assets **sur la machine qui déploie**, puis les envoient
+dans la release. Si le code local n'est pas celui que le serveur clone, la release part avec
+des assets d'un autre code. `build:check`, lancée avant `deploy`, l'empêche :
+
+- le commit local (`git rev-parse HEAD`) doit être celui de la cible du déploiement
+  (`{{target}}` : la branche de l'inventaire, ou `--branch`, `--tag`, `--revision`), **lu sur
+  le dépôt distant** avec `git ls-remote`. Une branche locale en retard, des commits non
+  poussés ou un checkout sur la mauvaise branche bloquent donc le déploiement ;
+- les dossiers de `{{build_check_paths}}` (le thème `web/app/themes/{{theme}}` par défaut, si
+  `theme` est défini) ne doivent contenir aucune modification non commitée. Le reste du dépôt
+  n'est pas vérifié : on peut, par exemple, modifier temporairement l'inventaire.
+
+Le contrôle porte sur des commits et non sur des noms de branche : il fonctionne aussi en CI,
+où la tête git est détachée.
+
+```php
+// deploy.php, après le require_once
+set('build_check_paths', ['web/app/themes/{{theme}}', 'resources/assets']);
+set('build_check', false);  // projet qui builde sur le serveur
+```
 
 ### Sauvegarde de la base à chaque déploiement
 
@@ -492,6 +519,8 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_tmp_dir` | `{{deploy_path}}/.dep/transfer` | Répertoires de travail distants |
 | `transfer_local_tmp_dir` | `<racine projet>/.dep/transfer` | Répertoire de travail local |
 | `transfer_backup_dir` | `{{deploy_path}}/.dep/backups` | Sauvegardes conservées |
+| `build_check` | `true` | Lance `build:check` avant `deploy`. À `false`, la tâche ne fait rien, même lancée à la main |
+| `build_check_paths` | `['web/app/themes/{{theme}}']` si `theme` est défini, sinon `[]` | Dossiers sans modification non commitée exigée au déploiement |
 | `transfer_backup_on_deploy` | `true` | Dumpe la base juste avant `deploy:symlink`. À `false`, `dep db:backup` reste utilisable à la main |
 | `transfer_backup_keep` | `10` | Nombre de dumps `db:backup` conservés par hôte, les plus anciens étant supprimés. `0` pour ne jamais en supprimer |
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
