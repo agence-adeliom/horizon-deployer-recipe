@@ -526,6 +526,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
 | `transfer_reuse_window` | `3600` | Fenêtre, en secondes, pendant laquelle un dump ou une archive déjà présent à la racine est proposé à la réutilisation. `0` pour ne jamais le proposer |
 | `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
+| `transfer_wp_php_args` | `-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'` | Options PHP du `wp-cli.phar` installé par le recipe : masque par défaut les notices de dépréciation qu'une bibliothèque ancienne émet à chaque appel WP-CLI sous PHP 8+. `''` pour garder la configuration PHP du serveur. Sans effet quand `wp` est trouvé dans le PATH |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |
 | `bin/wp_local` | premier `wp` du PATH connaissant `wp db` | WP-CLI local. Un projet qui requiert `wp-cli/wp-cli` (le framework seul, sans les commandes) obtient un proxy dans `vendor/bin` prioritaire dans le PATH : il est écarté au profit d'un phar complet |
 | `bin/wp` | phar téléchargé à la demande | WP-CLI distant |

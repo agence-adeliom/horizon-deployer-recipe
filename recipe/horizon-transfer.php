@@ -162,12 +162,19 @@ set('build_check_paths', static fn(): array => has('theme') ? ['web/app/themes/{
 // chaque nouveau dump. 0 pour ne jamais en supprimer.
 set('transfer_backup_keep', 10);
 
+// Options PHP passées au wp-cli.phar installé par le recipe. Par défaut, masque les
+// notices de dépréciation : sous PHP 8+, une bibliothèque ancienne du projet en émet à
+// chaque appel WP-CLI, avant même que WordPress ne règle error_reporting, et noie la
+// sortie du déploiement sans rien demander de faire à ce moment-là. Les erreurs et
+// avertissements restent affichés. '' pour garder la configuration PHP du serveur.
+set('transfer_wp_php_args', "-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'");
+
 // WP-CLI distant, installé à la demande s'il n'est pas disponible. Défini ici pour
 // que le recipe soit autonome ; un projet qui définit son propre `bin/wp` après le
 // require de ce fichier garde la main.
 set('bin/wp', function () {
     if (test('[ -f {{deploy_path}}/.dep/wp-cli.phar ]')) {
-        return '{{bin/php}} {{deploy_path}}/.dep/wp-cli.phar';
+        return '{{bin/php}} {{transfer_wp_php_args}} {{deploy_path}}/.dep/wp-cli.phar';
     }
 
     if (commandExist('wp')) {
@@ -182,7 +189,7 @@ set('bin/wp', function () {
     // tout appel WP-CLI casserait sur une erreur PHP — y compris ceux de db:pull.
     run('curl -fsS -o {{deploy_path}}/.dep/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar');
 
-    return '{{bin/php}} {{deploy_path}}/.dep/wp-cli.phar';
+    return '{{bin/php}} {{transfer_wp_php_args}} {{deploy_path}}/.dep/wp-cli.phar';
 });
 
 option('favicon-only', null, InputOption::VALUE_NONE, 'uploads:pull : ne récupère que le favicon du site (site_icon) au lieu de tous les uploads');
