@@ -52,10 +52,14 @@ Le recipe fournit un défaut pour `bin/wp` (WP-CLI distant, téléchargé à la 
 `{{deploy_path}}/.dep/wp-cli.phar`). Pour le surcharger, redéfinissez-le **après** le
 `require_once`.
 
-Le recipe accroche également `wp:update-db` à la fin du déploiement (voir
-[Mise à jour du schéma après déploiement](#mise-à-jour-du-schéma-après-déploiement)). C'est
-le seul endroit où il modifie le comportement de `dep deploy` ; `set('transfer_update_db',
-false)` le désarme.
+Le recipe modifie le comportement de `dep deploy` à deux endroits, chacun désarmable :
+
+- il **dumpe la base juste avant la bascule du symlink** et ne garde que les 10 derniers
+  dumps (voir [Sauvegarde de la base à chaque déploiement](#sauvegarde-de-la-base-à-chaque-déploiement)) ;
+  `set('transfer_backup_on_deploy', false)` le désarme ;
+- il accroche `wp:update-db` à la fin du déploiement (voir
+  [Mise à jour du schéma après déploiement](#mise-à-jour-du-schéma-après-déploiement)) ;
+  `set('transfer_update_db', false)` le désarme.
 
 Ajoutez à votre `.gitignore` :
 
@@ -74,6 +78,7 @@ Ajoutez à votre `.gitignore` :
 | `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 | `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
+| `dep db:backup <hôte>` | — | Dumpe la base de l'hôte dans `{{transfer_backup_dir}}`, nommée d'après sa release, et ne garde que les `{{transfer_backup_keep}}` derniers dumps. Lancée d'elle-même juste avant `deploy:symlink` |
 
 Un « environnement » est soit `local`, soit l'alias d'un hôte Deployer.
 
@@ -132,6 +137,50 @@ même si le serveur est injoignable.
 Le fichier retenu est le plus récent par date de modification, et non par l'horodatage de son
 nom, qui ne survit pas à une copie. `set('transfer_reuse_window', 0)` désactive la
 proposition ; toute autre valeur est une durée en secondes.
+
+### Sauvegarde de la base à chaque déploiement
+
+Juste avant `deploy:symlink`, le recipe dumpe la base de l'hôte, la compresse et la range
+dans `{{transfer_backup_dir}}` (`{{deploy_path}}/.dep/backups` par défaut) :
+
+```
+production-avant-release-48-20261013-101500.sql.gz   ← dump d'un dep deploy
+production-release-47-20261013-093000.sql.gz         ← dump d'un dep db:backup manuel
+```
+
+- **`avant-release-48`** : la base telle qu'elle était juste avant la mise en ligne de la
+  release 48, donc celle que sert la release 47. C'est le dump à restaurer après un
+  `dep rollback` vers la 47.
+- **`release-47`** : un `dep db:backup` lancé à la main, hors déploiement, porte le numéro
+  de la release en ligne.
+
+À ce moment-là, la base est encore celle de la release en ligne : ni les routines de mise
+à jour des plugins (qui tournent au premier chargement de la nouvelle release) ni
+`wp:update-db` ne sont passées. **Si l'export échoue, le déploiement s'arrête avant la
+bascule**, sans conséquence pour le site en ligne. Au tout premier déploiement, sans
+WordPress en ligne à dumper, un avertissement est affiché et le déploiement continue.
+
+Après chaque dump, seuls les `{{transfer_backup_keep}}` plus récents (10 par défaut) sont
+gardés. La rotation ne concerne que ces dumps nommés d'après une release : les sauvegardes
+faites avant un `db:push` ou un `wp:update-db` ne sont jamais supprimées.
+
+```php
+// deploy.php, après le require_once
+set('transfer_backup_keep', 20);          // 0 : ne jamais supprimer
+set('transfer_backup_on_deploy', false);  // ne plus dumper à chaque déploiement
+```
+
+Les deux clés se règlent aussi par hôte dans l'inventaire. `dep db:backup <hôte>` reste
+utilisable à la main même avec `transfer_backup_on_deploy` à `false`.
+
+Pour restaurer un dump :
+
+```bash
+ssh <hôte>
+cd <deploy_path>/current
+# wp, ou php <deploy_path>/.dep/wp-cli.phar si WP-CLI a été installé par le recipe
+gunzip -c ../.dep/backups/production-avant-release-48-20261013-101500.sql.gz | wp db import -
+```
 
 ### Mise à jour du schéma après déploiement
 
@@ -443,6 +492,8 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_tmp_dir` | `{{deploy_path}}/.dep/transfer` | Répertoires de travail distants |
 | `transfer_local_tmp_dir` | `<racine projet>/.dep/transfer` | Répertoire de travail local |
 | `transfer_backup_dir` | `{{deploy_path}}/.dep/backups` | Sauvegardes conservées |
+| `transfer_backup_on_deploy` | `true` | Dumpe la base juste avant `deploy:symlink`. À `false`, `dep db:backup` reste utilisable à la main |
+| `transfer_backup_keep` | `10` | Nombre de dumps `db:backup` conservés par hôte, les plus anciens étant supprimés. `0` pour ne jamais en supprimer |
 | `transfer_protected` | alias ou stage contenant `prod` | Exige la saisie de l'alias pour écraser l'hôte |
 | `transfer_reuse_window` | `3600` | Fenêtre, en secondes, pendant laquelle un dump ou une archive déjà présent à la racine est proposé à la réutilisation. `0` pour ne jamais le proposer |
 | `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
@@ -485,6 +536,12 @@ hosts:
 - **Codes de sortie.** Les commandes longues tournent en tâche de fond avec propagation
   via `wait`, et les pipes utilisent `set -o pipefail` — sans quoi un `gunzip` en échec
   laisserait WP-CLI annoncer un import réussi sur un flux vide.
+- **Point d'accroche de `db:backup`.** `deploy:symlink` (avant), parce que c'est le dernier
+  moment où la base est celle de la release en ligne. La tâche ne pose aucune question, le
+  verrou tenu ne pose donc pas le problème de `wp:update-db`. Le numéro de release vient du
+  lien `{{deploy_path}}/release`, que `deploy:symlink` renomme ensuite en `current` : il
+  est lu sur le serveur plutôt que via `{{release_name}}`, dont la valeur hors de la tâche
+  `deploy:release` serait celle de la release suivante.
 - **Point d'accroche de `wp:update-db`.** `deploy:success` et non `deploy:symlink`, bien que
   les deux voient le même symlink déjà basculé : la question ne doit pas être posée tant que
   le verrou de déploiement est tenu, sinon un `Ctrl-C` dessus laisse le projet verrouillé.

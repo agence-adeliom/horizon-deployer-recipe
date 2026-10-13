@@ -30,6 +30,9 @@
 |    défaut si l'alias ou le stage contient « prod ») ;
 |  - avant tout import, la base de la destination est dumpée et CONSERVÉE dans
 |    {{transfer_backup_dir}} ;
+|  - chaque `dep deploy` dumpe la base juste avant la bascule du symlink, dans le
+|    même dossier, en ne gardant que les {{transfer_backup_keep}} derniers dumps de
+|    déploiement (`dep db:backup <hôte>` pour en faire un à la main) ;
 |  - tous les fichiers temporaires vivent dans un répertoire de travail unique par
 |    environnement, supprimé en fin de tâche et via fail() en cas d'échec.
 |
@@ -46,7 +49,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.4.2');
+define('HORIZON_TRANSFER_RECIPE', '1.5.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -62,7 +65,8 @@ define('HORIZON_TRANSFER_RECIPE', '1.4.2');
 set('transfer_tmp_dir', '{{deploy_path}}/.dep/transfer');
 set('transfer_local_tmp_dir', static fn(): string => transferProjectRoot() . '/.dep/transfer');
 
-// Sauvegardes de base conservées (jamais nettoyées automatiquement).
+// Sauvegardes de base conservées. Celles d'avant import (db:push, wp:update-db) ne sont
+// jamais nettoyées ; seules celles de db:backup sont tournées, cf. transfer_backup_keep.
 set('transfer_backup_dir', '{{deploy_path}}/.dep/backups');
 
 // Chemin du dossier uploads, relatif à la racine du projet comme à celle d'une
@@ -137,6 +141,14 @@ set('transfer_reuse_window', 3600);
 // projet qui gère lui-même les migrations de schéma ; la tâche reste lançable à la
 // main : `dep wp:update-db production`.
 set('transfer_update_db', true);
+
+// Dump de la base à chaque déploiement, juste avant la bascule du symlink. À passer à
+// false pour s'en passer ; `dep db:backup <hôte>` reste lançable à la main.
+set('transfer_backup_on_deploy', true);
+
+// Nombre de dumps db:backup conservés par hôte, les plus anciens étant supprimés après
+// chaque nouveau dump. 0 pour ne jamais en supprimer.
+set('transfer_backup_keep', 10);
 
 // WP-CLI distant, installé à la demande s'il n'est pas disponible. Défini ici pour
 // que le recipe soit autonome ; un projet qui définit son propre `bin/wp` après le
@@ -1296,7 +1308,7 @@ function transferDbExport(?Host $env, string $workdir): string
  * Dump de sécurité de la base de destination, CONSERVÉ hors du répertoire de
  * travail pour survivre au nettoyage.
  */
-function transferDbBackup(Host $env): ?string
+function transferDbBackup(Host $env, ?string $name = null): ?string
 {
     $label = $env->getAlias();
     $bin = transferWpBin($env);
@@ -1311,7 +1323,7 @@ function transferDbBackup(Host $env): ?string
     }
 
     $dir = transferResolvePath($env, '{{transfer_backup_dir}}');
-    $sql = sprintf('%s/%s-%s.sql', $dir, $label, date('Ymd-His'));
+    $sql = sprintf('%s/%s.sql', $dir, $name ?? sprintf('%s-%s', $label, date('Ymd-His')));
 
     transferRun($env, 'mkdir -p ' . escapeshellarg($dir));
     info("🛟 Sauvegarde de la base de <comment>$label</comment> avant écrasement...");
@@ -1326,6 +1338,102 @@ function transferDbBackup(Host $env): ?string
     info(sprintf('   Conservée : <comment>%s.gz</comment> (%s)', $sql, transferSize($env, "$sql.gz")));
 
     return $sql . '.gz';
+}
+
+/**
+ * Numéro de la release concernée par une sauvegarde db:backup, ou null si aucune.
+ *
+ * Pendant `dep deploy`, le lien {{deploy_path}}/release désigne la release en cours de
+ * publication (deploy:symlink le renomme ensuite en `current`) : on la retient, avec
+ * $upcoming à true. Hors déploiement, c'est la release en ligne, pointée par current.
+ *
+ * @return array{0: ?string, 1: bool} [numéro, release à venir]
+ */
+function transferBackupRelease(Host $env): array
+{
+    $output = trim(transferRun($env, implode(' ', [
+        'if [ -L {{deploy_path}}/release ]; then echo "upcoming $(basename "$(readlink {{deploy_path}}/release)")";',
+        'elif [ -L {{deploy_path}}/current ]; then echo "current $(basename "$(readlink {{deploy_path}}/current)")";',
+        'fi',
+    ])));
+
+    if (!preg_match('/^(upcoming|current) (\S+)$/', $output, $matches)) {
+        return [null, false];
+    }
+
+    return [$matches[2], $matches[1] === 'upcoming'];
+}
+
+/**
+ * Ne garde que les $keep sauvegardes db:backup les plus récentes de l'hôte. Les dumps
+ * d'avant import (db:push, wp:update-db), nommés sans « release », ne sont pas touchés.
+ *
+ * @return string[] chemins supprimés
+ */
+function transferRotateBackups(Host $env, int $keep): array
+{
+    $dir = transferResolvePath($env, '{{transfer_backup_dir}}');
+    $pattern = sprintf('%s/%s-*release-*.sql.gz', $dir, $env->getAlias());
+
+    // ls -1t : du plus récent au plus ancien, sur la date de modification.
+    $listing = trim(transferRun($env, sprintf('ls -1t %s 2>/dev/null || true', $pattern)));
+    $files = $listing === '' ? [] : preg_split('/\R/', $listing);
+    $obsolete = array_slice($files, $keep);
+
+    foreach ($obsolete as $file) {
+        transferRun($env, 'rm -f ' . escapeshellarg($file));
+    }
+
+    return $obsolete;
+}
+
+/**
+ * Dump de la base de l'hôte courant nommé d'après sa release, puis rotation. Une
+ * erreur d'export remonte : branchée sur le déploiement, elle l'interrompt AVANT la
+ * bascule du symlink, donc sans conséquence pour le site en ligne.
+ */
+function transferBackupWithRelease(Host $env): void
+{
+    $label = $env->getAlias();
+    [$release, $upcoming] = transferBackupRelease($env);
+
+    $name = sprintf(
+        '%s-%s-%s-%s',
+        $label,
+        $upcoming ? 'avant-release' : 'release',
+        $release ?? 'inconnue',
+        date('Ymd-His'),
+    );
+
+    if (transferDbBackup($env, $name) === null) {
+        // Premier déploiement : pas encore de WordPress en ligne, donc rien à sauvegarder.
+        warning("Pas de sauvegarde de « $label » : aucun WordPress utilisable à dumper.");
+
+        return;
+    }
+
+    $keep = (int) get('transfer_backup_keep');
+
+    if ($keep <= 0) {
+        return;
+    }
+
+    // La rotation est un confort : son échec ne doit pas faire échouer le déploiement.
+    try {
+        $deleted = transferRotateBackups($env, $keep);
+    } catch (\Throwable $e) {
+        warning("Rotation des sauvegardes de « $label » impossible : " . $e->getMessage());
+
+        return;
+    }
+
+    if ($deleted !== []) {
+        info(sprintf(
+            '   %d sauvegarde(s) ancienne(s) supprimée(s), %d conservée(s) au plus.',
+            count($deleted),
+            $keep,
+        ));
+    }
 }
 
 /**
@@ -2123,6 +2231,21 @@ function transferDbSchemaVersions(?Host $env): array
     ];
 }
 
+desc('Dumpe la base de l\'hôte dans {{transfer_backup_dir}}, nommée d\'après sa release, et ne garde que les {{transfer_backup_keep}} derniers dumps : dep db:backup production');
+task('db:backup', static function (): void {
+    transferBackupWithRelease(currentHost());
+});
+
+// Variante branchée sur le déploiement : seule celle-ci tient compte du réglage, pour que
+// `dep db:backup` fonctionne toujours à la main.
+task('deploy:db-backup', static function (): void {
+    if (!get('transfer_backup_on_deploy')) {
+        return;
+    }
+
+    transferBackupWithRelease(currentHost());
+})->hidden();
+
 desc('Met à jour le schéma de base WordPress si le cœur déployé l\'exige. Branchée sur la fin du déploiement, également lançable à la main : dep wp:update-db production');
 task('wp:update-db', static function (): void {
     if (!get('transfer_update_db')) {
@@ -2233,6 +2356,14 @@ task('wp:update-db', static function (): void {
 // main pour débloquer un déploiement. Voir CLAUDE.md pour le détail.
 if (Deployer::get()->tasks->has('deploy:success')) {
     after('deploy:success', 'wp:update-db');
+}
+
+// Juste avant deploy:symlink : la base est encore celle de la release en ligne, et ni les
+// routines de mise à jour des plugins (au premier chargement de la nouvelle release) ni
+// wp:update-db n'ont tourné. Aucune question n'est posée, le verrou tenu ne pose donc pas
+// de problème ; un échec d'export interrompt le déploiement avant la bascule.
+if (Deployer::get()->tasks->has('deploy:symlink')) {
+    before('deploy:symlink', 'deploy:db-backup');
 }
 
 // En cas d'échec, on supprime les répertoires temporaires de tous les environnements.
