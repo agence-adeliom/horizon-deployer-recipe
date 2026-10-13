@@ -8,9 +8,9 @@ nettoyage systématique des fichiers temporaires.
 
 ## Prérequis
 
-PHP >= 8.0 et Deployer ^7.4. Testé en exécution réelle sur PHP 8.0, 8.1 et 8.2 — un projet
-encore en 8.0 ou 8.1 peut donc l'utiliser. PHP 7.4 n'est pas supporté : le code s'appuie sur
-`catch` sans variable, les arguments nommés, l'opérateur `?->` et `str_contains`.
+PHP >= 7.4 et Deployer ^7.4. Testé en exécution réelle sur PHP 8.0, 8.1 et 8.2 ; la
+compatibilité PHP 7.4 (version 1.6.0) n'est à ce jour vérifiée que par analyse syntaxique
+(`php -l` sous PHP 7.4).
 
 ## Installation
 
