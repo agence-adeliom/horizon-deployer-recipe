@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.5.0');
+define('HORIZON_TRANSFER_RECIPE', '1.6.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -132,7 +132,7 @@ set('transfer_search_replace_skip_tables', '*_wf*');
 // Un hôte protégé exige la saisie de son alias pour être écrasé. Surchargeable
 // par hôte dans l'inventaire : `transfer_protected: false`.
 set('transfer_protected', static function (): bool {
-    return str_contains(currentHost()->getAlias(), 'prod') || str_contains((string) get('stage', ''), 'prod');
+    return strpos(currentHost()->getAlias(), 'prod') !== false || strpos((string) get('stage', ''), 'prod') !== false;
 });
 
 // Fenêtre pendant laquelle un dump ou une archive déjà présent à la racine est
@@ -377,7 +377,7 @@ function transferWpIsInstalled(?Host $env): array
     $output = transferWpRun($env, "if $command 2>&1; then echo '+dep-installed'; fi");
 
     return [
-        str_contains($output, '+dep-installed'),
+        strpos($output, '+dep-installed') !== false,
         trim(str_replace('+dep-installed', '', $output)),
     ];
 }
@@ -473,7 +473,7 @@ function transferResolvePath(?Host $env, string $value): string
 {
     $path = transferResolve($env, $value);
 
-    if ($path !== '~' && !str_starts_with($path, '~/')) {
+    if ($path !== '~' && strpos($path, '~/') !== 0) {
         return $path;
     }
 
@@ -502,7 +502,7 @@ function transferTryLocally(string $command): ?string
 {
     try {
         return trim(runLocally($command)) ?: null;
-    } catch (\Throwable) {
+    } catch (\Throwable $e) {
         return null;
     }
 }
@@ -632,7 +632,7 @@ function transferRsyncPreview(
     ?Host $to,
     string $toPath,
     array $extraOptions = [],
-    int $totalFiles = 0,
+    int $totalFiles = 0
 ): array {
     // -ii (double) et non -i : avec -i simple, rsync n'émet AUCUNE ligne pour les
     // fichiers inchangés, il n'y aurait donc rien à compter pour jauger l'avancement.
@@ -790,7 +790,7 @@ function transferResetState(): void
 function transferRegisterWorkdir(?Host $env, string $workdir): void
 {
     $entries = transferReadState();
-    $entries[] = ['env' => $env?->getAlias(), 'workdir' => $workdir];
+    $entries[] = ['env' => ($env !== null ? $env->getAlias() : null), 'workdir' => $workdir];
 
     $file = transferStateFile();
 
@@ -810,7 +810,7 @@ function transferRegisterWorkdir(?Host $env, string $workdir): void
 function transferWorkdir(?Host $env): string
 {
     foreach (transferReadState() as $entry) {
-        if ($entry['env'] === $env?->getAlias()) {
+        if ($entry['env'] === ($env !== null ? $env->getAlias() : null)) {
             return $entry['workdir'];
         }
     }
@@ -1146,7 +1146,7 @@ function transferSiteUrl(?Host $env): ?string
             if (preg_match('~^https?://\S+$~', $value)) {
                 return $value;
             }
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
             continue;
         }
     }
@@ -1517,11 +1517,12 @@ function transferDumpCollations(?Host $env, string $dumpGz): array
  */
 function transferCollationCharsets(string $charset): array
 {
-    return match ($charset) {
+    $equivalents = [
         'utf8' => ['utf8', 'utf8mb3'],
         'utf8mb3' => ['utf8mb3', 'utf8'],
-        default => [$charset],
-    };
+    ];
+
+    return $equivalents[$charset] ?? [$charset];
 }
 
 /**
@@ -2039,7 +2040,7 @@ task('uploads:pull', static function (): void {
 
     info("📦 Extraction dans <comment>./$uploads</comment>...");
     runLocally('mkdir -p ' . escapeshellarg($localUploads));
-    runLocally(sprintf('tar -xzf %s -C %s', escapeshellarg($localPath), escapeshellarg($localUploads)), timeout: 3600);
+    runLocally(sprintf('tar -xzf %s -C %s', escapeshellarg($localPath), escapeshellarg($localUploads)), ['timeout' => 3600]);
 
     $extracted = trim(runLocally(sprintf('find %s -type f | wc -l', escapeshellarg($localUploads))));
     info(sprintf('   <comment>%s</comment> fichiers présents en local après extraction.', $extracted));
@@ -2305,7 +2306,7 @@ task('build:check', static function (): void {
         throw error("Cible « $target » introuvable sur le dépôt distant : la pousser avant de déployer.");
     }
 
-    if (!str_starts_with($local, $remote) && !str_starts_with($remote, $local)) {
+    if (strncmp($local, $remote, strlen($remote)) !== 0 && strncmp($remote, $local, strlen($local)) !== 0) {
         throw error(sprintf(
             "Le code local (%s) n'est pas celui qui va être déployé (« %s » = %s) : les assets ne correspondraient pas à la release. Se placer sur « %s » à jour (checkout, pull, push) avant de déployer.",
             substr($local, 0, 8),
