@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.6.0');
+define('HORIZON_TRANSFER_RECIPE', '1.7.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -1179,11 +1179,463 @@ function transferSearchReplaceSteps(string $fromUrl, string $toUrl): array
     return $steps;
 }
 
+/*
+|--------------------------------------------------------------------------
+| Multisite : un domaine par site, pas une URL par environnement
+|--------------------------------------------------------------------------
+|
+| Sur un réseau, WP_HOME ne désigne qu'UN site — souvent un sous-site — et le
+| couple WP_HOME source → WP_HOME destination réécrit ce seul domaine… vers celui
+| du site principal de la destination, en laissant tous les autres sur la source.
+| Chaque domaine du réseau reçoit donc ici sa propre correspondance.
+*/
+
+/**
+ * Lignes d'une requête SQL de lecture, chacune préfixée par « +dep| » côté SQL pour
+ * l'isoler du bruit que PHP écrit sur stdout (voir transferWpLastLine()). Une
+ * requête en échec — table absente, base vide — rend un tableau vide.
+ *
+ * @return array<int, array<int, string>>
+ */
+function transferDbRows(?Host $env, string $sql): array
+{
+    $command = sprintf(
+        '%s db query %s --skip-column-names --skip-plugins --skip-themes 2>/dev/null || true',
+        transferWpBin($env),
+        escapeshellarg($sql),
+    );
+
+    try {
+        $output = transferWpRun($env, $command);
+    } catch (\Throwable $e) {
+        return [];
+    }
+
+    $rows = [];
+
+    foreach (preg_split('/\R/', $output) as $line) {
+        $line = trim($line);
+
+        if (strpos($line, '+dep|') === 0) {
+            $rows[] = explode('|', substr($line, 5));
+        }
+    }
+
+    return $rows;
+}
+
+/**
+ * Domaines d'un réseau multisite, lus en SQL dans la base de l'environnement.
+ *
+ * SQL et non `wp site list` : WordPress refuse de démarrer tant que le domaine du
+ * réseau en base diffère de DOMAIN_CURRENT_SITE (« Site … not found ») — c'est
+ * précisément l'état d'une base fraîchement importée, et celui d'une base locale
+ * restée sur les domaines de la source. `wp db query` ne charge pas WordPress.
+ *
+ * Les domaines mappés par Mercator ({prefix}domain_mapping) sont inclus.
+ *
+ * @return ?array{base: string, blogs: array<int, string>, mapped: array<int, array{0: int, 1: string}>}
+ *         null si l'environnement n'est pas un multisite, ou si sa base est illisible.
+ */
+function transferMultisiteSites(?Host $env): ?array
+{
+    $prefix = '';
+
+    try {
+        $prefix = transferWpLastLine(transferWpRun($env, sprintf(
+            '%s config get table_prefix --skip-plugins --skip-themes 2>/dev/null || true',
+            transferWpBin($env),
+        )));
+    } catch (\Throwable $e) {
+        // Préfixe par défaut ci-dessous.
+    }
+
+    // Le préfixe est interpolé dans du SQL : rien d'autre qu'un identifiant.
+    if (preg_match('/^\w+$/', $prefix) !== 1) {
+        $prefix = 'wp_';
+    }
+
+    $rows = transferDbRows($env, sprintf(
+        "SELECT CONCAT_WS('|', '+dep', 'site', id, domain) FROM %1\$ssite"
+            . " UNION ALL SELECT CONCAT_WS('|', '+dep', 'blog', blog_id, domain) FROM %1\$sblogs",
+        $prefix,
+    ));
+
+    $sites = ['base' => '', 'blogs' => [], 'mapped' => []];
+    $baseId = null;
+
+    foreach ($rows as $row) {
+        if (count($row) !== 3) {
+            continue;
+        }
+
+        [$type, $id, $domain] = [$row[0], (int) $row[1], strtolower($row[2])];
+
+        if ($type === 'site' && ($baseId === null || $id < $baseId)) {
+            [$baseId, $sites['base']] = [$id, $domain];
+        } elseif ($type === 'blog') {
+            $sites['blogs'][$id] = $domain;
+        }
+    }
+
+    if ($sites['base'] === '' || $sites['blogs'] === []) {
+        return null;
+    }
+
+    $mapped = transferDbRows($env, sprintf(
+        "SELECT CONCAT_WS('|', '+dep', blog_id, domain) FROM %sdomain_mapping WHERE active = 1",
+        $prefix,
+    ));
+
+    foreach ($mapped as $row) {
+        if (count($row) === 2) {
+            $sites['mapped'][] = [(int) $row[0], strtolower($row[1])];
+        }
+    }
+
+    return $sites;
+}
+
+/**
+ * Domaine du réseau sur un environnement : DOMAIN_CURRENT_SITE, qui fait autorité
+ * puisque c'est lui que WordPress compare à la base pour démarrer. Lu dans la
+ * configuration, il survit à l'écrasement de la base. À défaut, l'hôte de l'URL.
+ */
+function transferMultisiteBase(?Host $env, ?string $siteUrl): ?string
+{
+    try {
+        $domain = strtolower(transferWpLastLine(transferWpRun($env, sprintf(
+            '%s config get DOMAIN_CURRENT_SITE --skip-plugins --skip-themes 2>/dev/null || true',
+            transferWpBin($env),
+        ))));
+
+        if (transferIsDomain($domain)) {
+            return $domain;
+        }
+    } catch (\Throwable $e) {
+        // Repli sur l'URL ci-dessous.
+    }
+
+    $host = $siteUrl ? parse_url($siteUrl, PHP_URL_HOST) : null;
+
+    return $host ? strtolower($host) : null;
+}
+
+function transferIsDomain(string $value): bool
+{
+    return preg_match('/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i', $value) === 1;
+}
+
+/**
+ * Noms d'hôte que DDEV route vers le projet (primaire, additional_hostnames et
+ * additional_fqdns), lus dans le conteneur. Vide hors DDEV : le recipe s'y exécute
+ * normalement, la corrélation par hostname est simplement sautée.
+ *
+ * @return array<int, string>
+ */
+function transferDdevHostnames(): array
+{
+    return array_values(array_filter(
+        array_map('trim', explode(',', strtolower((string) getenv('DDEV_HOSTNAME')))),
+        'strlen',
+    ));
+}
+
+/**
+ * Un domaine est-il routé par DDEV ? Les hostnames joker (« *.projet ») couvrent
+ * tous leurs sous-domaines.
+ */
+function transferDdevRoutes(string $domain, array $hostnames): bool
+{
+    foreach ($hostnames as $hostname) {
+        if ($hostname === $domain
+            || (strpos($hostname, '*.') === 0 && substr($domain, -strlen($hostname) + 1) === substr($hostname, 1))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Le domaine cible d'un site source, avec la règle qui l'a désigné.
+ *
+ * Par ordre de confiance :
+ *  1. le domaine du réseau, et ses sous-domaines (installation en sous-domaines) :
+ *     « atrya.<réseau source> » devient « atrya.<réseau destination> » ;
+ *  2. le domaine qu'avait le même blog_id sur la destination avant l'import —
+ *     sauf s'il s'agit d'un domaine de la source : la base écrasée était alors une
+ *     copie jamais réécrite, ce qui est justement le cas à corriger ;
+ *  3. en local, l'unique hostname DDEV dont le premier libellé figure dans le
+ *     domaine source (« www.newsandco.fr » → « newsandco.webzoom.ddev.site ») ;
+ *  4. la réponse de l'utilisateur·rice.
+ *
+ * @param array<int, string> $sourceDomains tous les domaines de la source
+ * @param array<int, string> $taken         cibles déjà attribuées
+ * @return array{0: ?string, 1: string} [domaine cible ou null pour ignorer, règle]
+ */
+function transferMultisiteTarget(
+    ?Host $env,
+    string $domain,
+    ?int $blogId,
+    string $fromBase,
+    string $toBase,
+    ?array $before,
+    array $sourceDomains,
+    array $hostnames,
+    array $taken
+): array {
+    if ($domain === $fromBase) {
+        return [$toBase, 'domaine du réseau'];
+    }
+
+    $suffix = '.' . $fromBase;
+
+    if (substr($domain, -strlen($suffix)) === $suffix) {
+        return [substr($domain, 0, -strlen($suffix)) . '.' . $toBase, 'sous-domaine du réseau'];
+    }
+
+    $previous = $blogId !== null ? ($before['blogs'][$blogId] ?? null) : null;
+
+    if ($previous !== null && !in_array($previous, $sourceDomains, true)) {
+        return [$previous, sprintf('blog %d avant import', $blogId)];
+    }
+
+    $labels = explode('.', $domain);
+    array_pop($labels);
+    $labels = array_diff($labels, ['www']);
+    $candidates = [];
+
+    foreach ($hostnames as $hostname) {
+        if (strpos($hostname, '*') === false
+            && !in_array($hostname, $taken, true)
+            && in_array(explode('.', $hostname)[0], $labels, true)) {
+            $candidates[] = $hostname;
+        }
+    }
+
+    if (count($candidates) === 1) {
+        return [$candidates[0], 'hostname DDEV'];
+    }
+
+    if (!input()->isInteractive()) {
+        return [null, 'aucune correspondance (-n)'];
+    }
+
+    $skip = '(laisser tel quel)';
+    $choices = array_values(array_diff($candidates ?: $hostnames, $taken));
+
+    if ($env === null && $choices !== []) {
+        $answer = transferChoice(
+            sprintf('Domaine local pour « %s »%s ?', $domain, $blogId !== null ? " (blog $blogId)" : ''),
+            array_merge([$skip], $choices),
+            $skip,
+        );
+
+        return $answer === $skip ? [null, 'ignoré'] : [$answer, 'choisi'];
+    }
+
+    $answer = strtolower(trim((string) ask(sprintf(
+        'Domaine sur « %s » pour « %s »%s ? (vide = laisser tel quel)',
+        transferEnvLabel($env),
+        $domain,
+        $blogId !== null ? " (blog $blogId)" : '',
+    ), '')));
+
+    if ($answer === '') {
+        return [null, 'ignoré'];
+    }
+
+    if (!transferIsDomain($answer)) {
+        warning("« $answer » n'est pas un domaine : « $domain » est laissé tel quel.");
+
+        return [null, 'ignoré'];
+    }
+
+    return [$answer, 'saisi'];
+}
+
+/**
+ * Étapes de search-replace d'un réseau multisite, ou null si la réécriture ne peut
+ * pas être faite sans risque.
+ *
+ * Chaque domaine reçoit une passe « domaine nu », précédée d'une passe « URL
+ * complète » quand le protocole change. Les sous-domaines du réseau sont couverts
+ * par la passe du domaine du réseau, qui les contient : leurs passes sont omises.
+ * Les passes vont du domaine le plus long au plus court, pour qu'un domaine ne soit
+ * pas entamé par la passe d'un domaine qu'il contient.
+ *
+ * @param ?array $imported sites de la base importée (transferMultisiteSites())
+ * @param ?array $before   sites de la destination avant import, s'ils étaient lisibles
+ * @return ?array<int, array{0: string, 1: string, 2: string}>
+ */
+function transferMultisiteSearchReplaceSteps(
+    ?Host $env,
+    array $imported,
+    ?array $before,
+    ?string $fromUrl,
+    ?string $toUrl
+): ?array {
+    $label = transferEnvLabel($env);
+    $fromBase = $imported['base'];
+    $toBase = transferMultisiteBase($env, $toUrl);
+
+    if ($toBase === null) {
+        warning(sprintf('DOMAIN_CURRENT_SITE introuvable sur « %s » : réécriture des domaines ignorée.', $label));
+
+        return null;
+    }
+
+    // Domaine source => blog_id (null pour le seul domaine du réseau ou un mapping).
+    $sources = [$fromBase => null];
+
+    foreach ($imported['blogs'] as $blogId => $domain) {
+        $sources[$domain] = $sources[$domain] ?? $blogId;
+    }
+
+    foreach ($imported['mapped'] as [$blogId, $domain]) {
+        $sources += [$domain => $blogId];
+    }
+
+    $hostnames = $env === null ? transferDdevHostnames() : [];
+    $pairs = [];
+
+    info(sprintf(
+        '🌐 Multisite : réseau <comment>%s</comment> → <comment>%s</comment>, %d domaine(s) à faire correspondre.',
+        $fromBase,
+        $toBase,
+        count($sources),
+    ));
+
+    foreach ($sources as $domain => $blogId) {
+        [$target, $rule] = transferMultisiteTarget(
+            $env,
+            (string) $domain,
+            $blogId,
+            $fromBase,
+            $toBase,
+            $before,
+            array_keys($sources),
+            $hostnames,
+            array_values($pairs),
+        );
+
+        info(sprintf(
+            '   %-8s %s → %s <comment>(%s)</comment>',
+            $blogId !== null ? "blog $blogId" : 'réseau',
+            $domain,
+            $target ?? '<comment>inchangé</comment>',
+            $rule,
+        ));
+
+        if ($target !== null && $target !== $domain) {
+            $pairs[(string) $domain] = $target;
+        }
+    }
+
+    // En local, un domaine que DDEV ne route pas donnera une erreur réseau, pas une
+    // erreur WordPress : autant le dire ici.
+    if ($hostnames !== []) {
+        $tld = '.' . strtolower((string) getenv('DDEV_TLD') ?: 'ddev.site');
+
+        foreach (array_unique(array_merge([$toBase], array_values($pairs))) as $target) {
+            if (transferDdevRoutes($target, $hostnames)) {
+                continue;
+            }
+
+            warning(sprintf('« %s » n\'est pas routé par DDEV.', $target));
+            info(substr($target, -strlen($tld)) === $tld
+                ? sprintf('   .ddev/config.yaml : ajouter <comment>%s</comment> à additional_hostnames, puis ddev restart.', substr($target, 0, -strlen($tld)))
+                : sprintf('   .ddev/config.yaml : ajouter <comment>%s</comment> à additional_fqdns, puis ddev restart.', $target));
+        }
+    }
+
+    // Sous-domaines couverts par la passe du réseau.
+    if (($pairs[$fromBase] ?? null) === $toBase) {
+        foreach ($pairs as $search => $replace) {
+            $suffix = '.' . $fromBase;
+
+            if ($search !== $fromBase
+                && substr($search, -strlen($suffix)) === $suffix
+                && $replace === substr($search, 0, -strlen($suffix)) . '.' . $toBase) {
+                unset($pairs[$search]);
+            }
+        }
+    }
+
+    uksort($pairs, static fn(string $a, string $b): int => strlen($b) <=> strlen($a) ?: strcmp($a, $b));
+
+    // Une passe ne doit pas réécrire le résultat d'une passe précédente : la base
+    // finirait sur un domaine que personne n'a choisi.
+    $searches = array_keys($pairs);
+
+    foreach ($searches as $i => $search) {
+        foreach (array_slice($searches, $i + 1) as $later) {
+            if (strpos($pairs[$search], $later) !== false) {
+                warning(sprintf(
+                    'Correspondances incompatibles : « %s » devient « %s », que la passe de « %s » réécrirait ensuite.',
+                    $search,
+                    $pairs[$search],
+                    $later,
+                ));
+
+                return null;
+            }
+        }
+    }
+
+    $fromScheme = $fromUrl ? (string) parse_url($fromUrl, PHP_URL_SCHEME) : '';
+    $toScheme = $toUrl ? (string) parse_url($toUrl, PHP_URL_SCHEME) : '';
+    $steps = [];
+
+    foreach ($pairs as $search => $replace) {
+        if ($fromScheme !== '' && $toScheme !== '' && $fromScheme !== $toScheme) {
+            $steps[] = ['URL complète', "$fromScheme://$search", "$toScheme://$replace"];
+        }
+
+        $steps[] = ['domaine nu', (string) $search, $replace];
+    }
+
+    return $steps;
+}
+
 /**
  * Propose puis applique la réécriture d'URLs sur un environnement.
+ *
+ * $before : sites multisite de la destination lus AVANT l'import (transferMultisiteSites()),
+ * qui servent à retrouver le domaine d'un blog_id. Les sites de la source, eux, sont
+ * lus dans la base qui vient d'être importée : c'est exactement ce qu'il faut réécrire,
+ * dump réutilisé compris.
  */
-function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): void
+function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl, ?array $before = null): void
 {
+    $imported = transferMultisiteSites($env);
+
+    if ($imported !== null) {
+        $steps = transferMultisiteSearchReplaceSteps($env, $imported, $before, $fromUrl, $toUrl);
+
+        if ($steps === null) {
+            info('   À lancer à la main, domaine par domaine, du plus long au plus court :');
+            info('   <comment>wp search-replace ANCIEN_DOMAINE NOUVEAU_DOMAINE --all-tables --skip-columns=guid</comment>');
+
+            return;
+        }
+
+        if ($steps === []) {
+            info('✅ Domaines du réseau déjà à jour.');
+
+            return;
+        }
+
+        transferSearchReplaceRun($env, $steps, sprintf(
+            'Réécrire les domaines du réseau sur « %s » maintenant (%d passes) ?',
+            transferEnvLabel($env),
+            count($steps),
+        ));
+
+        return;
+    }
+
     // Une URL illisible n'est pas un cas « rien à faire » : la base garderait les URLs
     // de la source sans que personne ne le sache.
     if (!$fromUrl || !$toUrl) {
@@ -1201,7 +1653,25 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
         return;
     }
 
+    $label = transferEnvLabel($env);
     $steps = transferSearchReplaceSteps($fromUrl, $toUrl);
+
+    info(sprintf('🔗 La base de <comment>%s</comment> pointe encore vers <comment>%s</comment>.', $label, $fromUrl));
+
+    transferSearchReplaceRun(
+        $env,
+        $steps,
+        sprintf('Réécrire les URLs de « %s » vers %s maintenant (%d passes) ?', $label, $toUrl, count($steps)),
+    );
+}
+
+/**
+ * Confirme puis exécute des passes de search-replace sur un environnement.
+ *
+ * @param array<int, array{0: string, 1: string, 2: string}> $steps [libellé, recherche, remplacement]
+ */
+function transferSearchReplaceRun(?Host $env, array $steps, string $question): void
+{
     $bin = transferWpBin($env);
     $label = transferEnvLabel($env);
     $commands = [];
@@ -1232,10 +1702,6 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
         );
     }
 
-    info(sprintf('🔗 La base de <comment>%s</comment> pointe encore vers <comment>%s</comment>.', $label, $fromUrl));
-
-    $question = sprintf('Réécrire les URLs de « %s » vers %s maintenant (%d passes) ?', $label, $toUrl, count($steps));
-
     if (!transferConfirm($question, false)) {
         info(sprintf('   URLs laissées en place. À lancer sur « %s », dans cet ordre :', $label));
 
@@ -1254,12 +1720,12 @@ function transferSearchReplace(?Host $env, ?string $fromUrl, ?string $toUrl): vo
         return;
     }
 
-    foreach ($steps as $index => [$label, $search, $replace]) {
+    foreach ($steps as $index => [$stepLabel, $search, $replace]) {
         info(sprintf(
             '   Passe %d/%d — %s : <comment>%s</comment> → <comment>%s</comment>',
             $index + 1,
             count($steps),
-            $label,
+            $stepLabel,
             $search,
             $replace,
         ));
@@ -1933,8 +2399,11 @@ task('db:pull', static function (): void {
         return;
     }
 
+    // Lus avant l'écrasement : retrouvent le domaine local d'un blog_id.
+    $localSites = transferMultisiteSites(null);
+
     transferDbImport(null, $localPath);
-    transferSearchReplace(null, $remoteUrl, transferSiteUrl(null));
+    transferSearchReplace(null, $remoteUrl, transferSiteUrl(null), $localSites);
 });
 
 desc('Archive les uploads distants, les télécharge, puis propose l\'extraction dans le dossier uploads local (--favicon-only pour ne récupérer que le favicon)');
@@ -2066,6 +2535,7 @@ task('db:push', static function (): void {
     // Lues avant tout écrasement : l'URL de destination sert au search-replace.
     $fromUrl = transferSiteUrl($from);
     $toUrl = transferSiteUrl($to);
+    $toSites = transferMultisiteSites($to);
 
     if ($fromUrl && $toUrl) {
         info("   URLs : <comment>$fromUrl</comment> → <comment>$toUrl</comment>");
@@ -2085,7 +2555,7 @@ task('db:push', static function (): void {
 
     // Exécuté SUR la destination : sans ça l'environnement receveur servirait les
     // URLs de la source.
-    transferSearchReplace($to, $fromUrl, $toUrl);
+    transferSearchReplace($to, $fromUrl, $toUrl, $toSites);
 })->once();
 
 desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');

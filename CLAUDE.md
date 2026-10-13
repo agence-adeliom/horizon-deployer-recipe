@@ -117,6 +117,15 @@ Ces invariants sont le contrat du recipe ; ne pas les affaiblir sans demande exp
 
 Le search-replace s'exécute **sur l'environnement qui a reçu la base**, distant compris.
 
+### Multisite : un domaine par site
+
+Sur un réseau, `WP_HOME` ne désigne qu'un site : `transferSearchReplace()` bascule donc sur `transferMultisiteSearchReplaceSteps()` dès que la base **reçue** est un multisite. Deux invariants :
+
+- **Les domaines se lisent en SQL** (`transferDbRows()` → `wp db query`, lignes marquées `+dep|`), jamais via `wp site list` : WordPress ne démarre pas tant que `{prefix}site.domain` diffère de `DOMAIN_CURRENT_SITE`, ce qui est l'état même d'une base fraîchement importée.
+- **Les sites de la source sont lus sur la destination après l'import**, pas sur la source : c'est la base à réécrire, dump réutilisé compris. Seuls les sites de la destination *avant* import (corrélation par `blog_id`) sont lus en amont par les tâches et passés en argument. Cette corrélation est écartée quand le domaine trouvé est un domaine de la source : la base écrasée était alors une copie jamais réécrite.
+
+En local, la corrélation et la vérification du routage s'appuient sur `DDEV_HOSTNAME`, disponible parce que `dep` tourne dans le conteneur ; hors DDEV, la variable est vide et ces étapes sont simplement sautées.
+
 ### Symlinks côté distant
 
 `find` et `du` ne descendent pas dans un symlink passé en point de départ et renverraient 0. Il y a deux symlinks à traverser (`current` → release, uploads shared_dir → `shared/`), donc `transferUploadsPath()` résout explicitement le chemin réel (`readlink -f`, repli `cd && pwd -P`).

@@ -334,6 +334,38 @@ prendre pour l'URL, sans quoi elles seraient écrites devant chaque URL de la ba
 aucune URL valide n'est trouvée, la réécriture est ignorée avec un avertissement et la
 commande à lancer à la main.
 
+### Multisite
+
+Sur un réseau, `WP_HOME` ne désigne qu'**un** site, souvent un sous-site. Le couple
+`WP_HOME` source → `WP_HOME` destination réécrirait donc ce seul domaine, vers celui du site
+principal de la destination, et laisserait tous les autres sur la source : WordPress refuse
+alors de démarrer (« Site … not found »).
+
+Dès que la base importée est un multisite, chaque domaine du réseau reçoit sa propre
+correspondance. Les domaines sont lus **en SQL** dans la base reçue (`{prefix}site`,
+`{prefix}blogs`, et `{prefix}domain_mapping` si Mercator est présent), parce que WordPress
+ne démarre pas tant qu'ils ne sont pas réécrits. Le domaine du réseau de destination est
+`DOMAIN_CURRENT_SITE`, lu dans sa configuration. Chaque domaine source est ensuite associé
+selon la première règle qui s'applique :
+
+| Règle | Exemple (production → DDEV) |
+|---|---|
+| domaine du réseau | `webzoom.atrya.net` → `webzoom.ddev.site` |
+| sous-domaine du réseau | `atrya.webzoom.atrya.net` → `atrya.webzoom.ddev.site` |
+| même `blog_id` sur la destination avant l'import (sauf si c'était un domaine de la source) | blog 5 → le domaine qu'il avait en préprod |
+| en local, l'unique hostname DDEV dont le premier libellé figure dans le domaine | `www.newsandco.fr` → `newsandco.webzoom.ddev.site` |
+| sinon, question (liste des hostnames DDEV en local, saisie libre en distant) ; ignoré en `-n` | |
+
+La table des correspondances est affichée avant la confirmation. Les passes vont du domaine
+le plus long au plus court, et celles des sous-domaines sont omises quand la passe du réseau
+les couvre déjà. Si une passe devait réécrire le résultat d'une autre, rien n'est fait et
+la réécriture est laissée à la main.
+
+En local, un domaine cible que DDEV ne route pas (absent de `DDEV_HOSTNAME`) est signalé
+avec la ligne à ajouter dans `.ddev/config.yaml` : `additional_hostnames` pour un domaine
+en `.ddev.site`, `additional_fqdns` sinon. Un sous-site `atrya` du réseau `webzoom`
+demande donc `atrya.webzoom` dans `additional_hostnames`.
+
 ### Mémoire et grosses bases
 
 `--precise` n'est **pas** activé par défaut. Cette option force WP-CLI à traiter toutes les
