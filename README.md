@@ -576,6 +576,20 @@ hosts:
     transfer_protected: false
 ```
 
+### Commandes avant / après import
+
+`db:pull` et `db:push` peuvent lancer des commandes WP-CLI du projet sur la destination, juste avant l'import et juste après la réécriture d'URLs :
+
+```php
+// deploy.php, après le require_once du recipe
+set('transfer_before_import', ['acorn encryption:snapshot']);
+set('transfer_after_import', ['acorn encryption:restore']);
+```
+
+Ces commandes tournent avec les plugins et le thème chargés (pas de `--skip-plugins` / `--skip-themes`). Avant l'import, un échec annule le transfert sans rien modifier ; après, c'est un simple avertissement. Les hooks « avant » sont ignorés si WordPress n'est pas encore installé sur la destination.
+
+Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec une clé différente par environnement (les valeurs locales sont conservées après un pull).
+
 ## Détails d'implémentation
 
 - **Détection du même serveur.** Quand la source et la destination partagent la même
