@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.6.1');
+define('HORIZON_TRANSFER_RECIPE', '1.7.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -143,6 +143,17 @@ set('transfer_reuse_window', 3600);
 // projet qui gère lui-même les migrations de schéma ; la tâche reste lançable à la
 // main : `dep wp:update-db production`.
 set('transfer_update_db', true);
+
+// Commandes WP-CLI lancées sur la DESTINATION d'un db:pull / db:push, juste avant
+// l'import et juste après la réécriture d'URLs. Arguments seuls, sans le binaire :
+//   set('transfer_before_import', ['acorn encryption:snapshot']);
+//   set('transfer_after_import', ['acorn encryption:restore']);
+// Contrairement aux autres appels du recipe, elles tournent SANS --skip-plugins ni
+// --skip-themes : elles servent justement à appeler le code du projet. Avant l'import,
+// un échec annule le transfert (rien n'a encore été modifié) ; après, il n'est
+// qu'un avertissement. Vides par défaut.
+set('transfer_before_import', []);
+set('transfer_after_import', []);
 
 // Dump de la base à chaque déploiement, juste avant la bascule du symlink. À passer à
 // false pour s'en passer ; `dep db:backup <hôte>` reste lançable à la main.
@@ -2021,6 +2032,63 @@ function transferCollationFallback(string $collation, array $supported): ?string
 }
 
 /**
+ * Exécute les commandes WP-CLI d'un hook d'import ({{transfer_before_import}} ou
+ * {{transfer_after_import}}) sur un environnement.
+ *
+ * Lues dans le contexte de l'hôte visé : un hôte peut surcharger la liste dans
+ * l'inventaire. Les hooks « avant » ne tournent que si WordPress est installé sur la
+ * destination — au tout premier pull, il n'y a rien à préserver.
+ */
+function transferImportHooks(?Host $env, string $name, bool $abortOnFailure): void
+{
+    $commands = array();
+
+    if ($env === null) {
+        $commands = get($name, array());
+    } else {
+        on($env, static function () use ($name, &$commands): void {
+            $commands = get($name, array());
+        });
+    }
+
+    if (!is_array($commands) || $commands === array()) {
+        return;
+    }
+
+    if ($abortOnFailure) {
+        list($installed) = transferWpIsInstalled($env);
+
+        if (!$installed) {
+            info(sprintf('   %s ignoré : WordPress n\'est pas installé sur « %s ».', $name, transferEnvLabel($env)));
+
+            return;
+        }
+    }
+
+    foreach ($commands as $command) {
+        $full = transferWpBin($env) . ' ' . $command;
+        info(sprintf('🪝 %s sur « %s » : <comment>%s</comment>', $name, transferEnvLabel($env), $command));
+
+        try {
+            writeln(transferWpRun($env, $full));
+        } catch (\Throwable $e) {
+            if ($abortOnFailure) {
+                throw new \RuntimeException(sprintf(
+                    "%s : « %s » a échoué sur « %s », import annulé — rien n'a été modifié.\n%s",
+                    $name,
+                    $command,
+                    transferEnvLabel($env),
+                    $e->getMessage()
+                ));
+            }
+
+            warning(sprintf('%s : « %s » a échoué sur « %s ». À relancer à la main.', $name, $command, transferEnvLabel($env)));
+            writeln('   ' . $e->getMessage());
+        }
+    }
+}
+
+/**
  * Vide la base d'un environnement puis y importe un dump gzippé.
  *
  * On passe par un pipe gunzip → wp db import avec `set -o pipefail`, sans quoi un
@@ -2402,8 +2470,10 @@ task('db:pull', static function (): void {
     // Lus avant l'écrasement : retrouvent le domaine local d'un blog_id.
     $localSites = transferMultisiteSites(null);
 
+    transferImportHooks(null, 'transfer_before_import', true);
     transferDbImport(null, $localPath);
     transferSearchReplace(null, $remoteUrl, transferSiteUrl(null), $localSites);
+    transferImportHooks(null, 'transfer_after_import', false);
 });
 
 desc('Archive les uploads distants, les télécharge, puis propose l\'extraction dans le dossier uploads local (--favicon-only pour ne récupérer que le favicon)');
@@ -2548,6 +2618,7 @@ task('db:push', static function (): void {
     }
 
     $dumpGz = transferDbExport($from, transferWorkdir($from));
+    transferImportHooks($to, 'transfer_before_import', true);
     transferDbBackup($to);
     transferDbImport($to, transferFile($from, $dumpGz, $to, 'db.sql.gz'));
 
@@ -2556,6 +2627,7 @@ task('db:push', static function (): void {
     // Exécuté SUR la destination : sans ça l'environnement receveur servirait les
     // URLs de la source.
     transferSearchReplace($to, $fromUrl, $toUrl, $toSites);
+    transferImportHooks($to, 'transfer_after_import', false);
 })->once();
 
 desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');
