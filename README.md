@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/horizon-deployer-recipe-horizontal-negatif.svg">
+    <img src="docs/logo/horizon-deployer-recipe-horizontal-couleur.svg" alt="Horizon Deployer Recipe" width="420">
+  </picture>
+</p>
+
 # horizon-deployer-recipe
 
 Recipes [Deployer](https://deployer.org) pour les projets WordPress Horizon (Bedrock + Sage + Acorn).
