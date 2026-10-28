@@ -15,9 +15,11 @@ nettoyage systématique des fichiers temporaires.
 
 ## Prérequis
 
-PHP >= 7.4 et Deployer ^7.4. Testé en exécution réelle sur PHP 8.0, 8.1 et 8.2 ; la
-compatibilité PHP 7.4 (version 1.6.0) n'est à ce jour vérifiée que par analyse syntaxique
-(`php -l` sous PHP 7.4).
+PHP >= 7.4 et Deployer ^7.4 ou ^8.0 (Deployer 8 exige lui-même PHP 8.3). Testé en exécution
+réelle sur PHP 8.0, 8.1 et 8.2 avec Deployer 7 ; la compatibilité PHP 7.4 (version 1.6.0)
+n'est à ce jour vérifiée que par analyse syntaxique (`php -l` sous PHP 7.4). La
+compatibilité Deployer 8 (version 1.8.0) a été vérifiée sur Deployer 8.0.5 avec un hôte
+`localhost()` : exécution des commandes, `build:check` et accroche des tâches à `deploy`.
 
 ## Installation
 
@@ -158,7 +160,10 @@ des assets d'un autre code. `build:check`, lancée avant `deploy`, l'empêche :
 - le commit local (`git rev-parse HEAD`) doit être celui de la cible du déploiement
   (`{{target}}` : la branche de l'inventaire, ou `--branch`, `--tag`, `--revision`), **lu sur
   le dépôt distant** avec `git ls-remote`. Une branche locale en retard, des commits non
-  poussés ou un checkout sur la mauvaise branche bloquent donc le déploiement ;
+  poussés ou un checkout sur la mauvaise branche bloquent donc le déploiement. Avec la
+  stratégie `update_code_strategy` à `local_archive` (Deployer 8), le serveur ne clone rien
+  et la release est prise dans le dépôt local : la cible y est alors lue, et n'a pas besoin
+  d'être poussée ;
 - les dossiers de `{{build_check_paths}}` (le thème `web/app/themes/{{theme}}` par défaut, si
   `theme` est défini) ne doivent contenir aucune modification non commitée. Le reste du dépôt
   n'est pas vérifié : on peut, par exemple, modifier temporairement l'inventaire.
