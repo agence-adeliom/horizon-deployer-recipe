@@ -99,7 +99,7 @@ Les heredocs et commandes assemblés dans le code obéissent à quatre règles, 
 
 - `curl -fsS` et jamais `curl -o` seul : sans `-f`, curl écrit la page d'erreur HTTP dans le fichier de destination et rend 0. Le `test -f {{deploy_path}}/.dep/wp-cli.phar` de la closure `bin/wp` accepterait alors définitivement un phar de 14 octets contenant « 404: Not Found ».
 
-- `gzip -t` avant de réutiliser un dump ou une archive déjà présent en local (`transferReuseLocalArchive()`) : un transfert interrompu laisse un `.gz` tronqué, que le `db reset` précédant l'import rendrait catastrophique — base vidée, puis import en échec.
+- `gzip -t` avant de réutiliser un dump ou une archive déjà présent en local (`transferReuseLocalArchive()`) : un transfert interrompu laisse un `.gz` tronqué, que la suppression des tables précédant l'import rendrait catastrophique — base vidée, puis import en échec.
 
 Les chemins passent toujours par `escapeshellarg()`.
 
@@ -111,6 +111,7 @@ Ces invariants sont le contrat du recipe ; ne pas les affaiblir sans demande exp
 - **Un `pull` ne modifie jamais le distant**, hormis ses propres fichiers temporaires.
 - **Un `push` exige une confirmation de la destination** (`transferConfirmDestination()`), et la saisie de l'alias en clair si l'hôte est protégé (`transfer_protected`, vrai par défaut dès que l'alias ou le stage contient `prod`).
 - **La base de destination est dumpée avant tout import** dans `{{transfer_backup_dir}}`, et cette sauvegarde survit au nettoyage.
+- **On ne supprime que les tables, jamais la base** : avant un import, `wp db clean` (tables du préfixe de la destination) et non `wp db reset`, dont le `DROP DATABASE` est refusé par les hébergements mutualisés (OVH) et emporterait les autres applications d'une base partagée.
 - **Mode non interactif (`-n`) = aucune écriture.** `transferConfirm()` se fie uniquement à `input()->isInteractive()` : tester `stream_isatty(STDIN)` casserait le mode interactif sous `ddev php`, qui n'alloue pas de TTY.
 
 ### Réécriture d'URLs en deux passes

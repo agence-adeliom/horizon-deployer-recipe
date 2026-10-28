@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.8.0');
+define('HORIZON_TRANSFER_RECIPE', '1.8.1');
 
 /*
 |--------------------------------------------------------------------------
@@ -449,7 +449,7 @@ function transferWpIsInstalled(?Host $env): array
  * « wp-cli/wp-cli » installé seul ne connaît aucune commande. Pire, l'échec est
  * silencieux quand la base est vide — WP-CLI charge WordPress pour chercher la
  * commande ailleurs, `wp_not_installed()` déclenche une redirection, et le processus
- * se termine avec le code de sortie 0. Autrement dit `wp db reset` rend la main sans
+ * se termine avec le code de sortie 0. Autrement dit `wp db clean` rend la main sans
  * rien faire ET sans erreur, juste avant un import.
  *
  * `cli cmd-dump` interroge le registre et ne dépend pas de l'état de la base.
@@ -2155,7 +2155,7 @@ function transferDbImport(?Host $env, string $dumpGz): void
     $bin = transferWpBin($env);
     $label = transferEnvLabel($env);
 
-    // Vérifié AVANT le reset : sur une base vide, un WP-CLI amputé de ses commandes
+    // Vérifié AVANT la suppression des tables : sur une base vide, un WP-CLI amputé de ses commandes
     // rend la main en code 0 sans rien faire, et la tâche enchaînerait sur l'import.
     if (!transferWpHasCommand($env, 'db')) {
         throw new \RuntimeException(sprintf(
@@ -2226,8 +2226,13 @@ function transferDbImport(?Host $env, string $dumpGz): void
         }
     }
 
+    // `db clean` et non `db reset` : `reset` supprime puis recrée la base entière
+    // (DROP DATABASE / CREATE DATABASE), ce que refusent les hébergements mutualisés
+    // (OVH : « ERROR 1010 … can't rmdir »). `clean` ne supprime que les tables du
+    // préfixe de la destination, ce qui suffit avant un import et épargne les autres
+    // applications d'une base partagée.
     info(sprintf('🗑️  Suppression des tables de <comment>%s</comment>...', $label));
-    transferWpRun($env, "$bin db reset --yes --skip-plugins --skip-themes", ['timeout' => 600]);
+    transferWpRun($env, "$bin db clean --yes --skip-plugins --skip-themes", ['timeout' => 600]);
 
     // La réécriture s'insère dans le pipe : le dump n'est jamais modifié sur disque,
     // il reste donc réimportable tel quel ailleurs.
