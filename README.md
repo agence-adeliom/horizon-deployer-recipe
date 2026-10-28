@@ -287,9 +287,12 @@ Deux limites à connaître :
   faut saisir son alias en clair : un simple `[y/N]` est trop facile à valider par réflexe.
 - **La base de destination est dumpée avant tout import**, dans `{{transfer_backup_dir}}`.
   Ce dump est conservé : il survit au nettoyage.
-- **Rien n'est vidé tant que l'import n'est pas jouable.** Avant le `db reset`, le recipe
+- **Rien n'est vidé tant que l'import n'est pas jouable.** Avant de supprimer les tables, le recipe
   vérifie que la commande `wp db` existe et que les collations du dump sont acceptées par
   la destination. Sans ces contrôles, l'échec survient sur une base déjà vide.
+- **Seules les tables du site sont supprimées avant l'import** (`wp db clean`, préfixe de
+  la destination), jamais la base elle-même : les hébergements mutualisés comme OVH
+  refusent `DROP DATABASE`, et une base partagée peut contenir d'autres applications.
 - **Toute écriture volumineuse liée aux uploads est confirmée**, en annonçant le volume :
   la création de l'archive `tar.gz` sur le serveur (`uploads:pull`), et la copie de transit
   sur la machine locale quand `uploads:push` relie deux serveurs distincts. Un refus
