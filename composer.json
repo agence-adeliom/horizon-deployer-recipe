@@ -18,6 +18,6 @@
     ],
     "require": {
         "php": ">=7.4",
-        "deployer/deployer": "^7.4"
+        "deployer/deployer": "^7.4 || ^8.0"
     }
 }

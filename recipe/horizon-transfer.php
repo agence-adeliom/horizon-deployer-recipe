@@ -51,7 +51,7 @@ use Symfony\Component\Console\Input\InputOption;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.7.0');
+define('HORIZON_TRANSFER_RECIPE', '1.8.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -299,18 +299,67 @@ function transferIsLocalEndpoint(?Host $env): bool
 */
 
 /**
+ * Vrai sous Deployer 7, dont run() et runLocally() prennent un tableau d'options en
+ * second argument. Deployer 8 l'a remplacé par des paramètres nommés ($cwd en second) :
+ * lui passer le tableau serait une TypeError.
+ */
+function transferLegacyRunApi(): bool
+{
+    static $legacy = null;
+
+    if ($legacy === null) {
+        $parameters = (new \ReflectionFunction('Deployer\run'))->getParameters();
+        $legacy = isset($parameters[1]) && $parameters[1]->getName() === 'options';
+    }
+
+    return $legacy;
+}
+
+/**
+ * run() (ou runLocally() si $local) avec les options du recipe, exprimées dans le
+ * format Deployer 7 (`timeout`, `real_time_output`) et traduites pour Deployer 8.
+ * Les paramètres nommés n'existant qu'à partir de PHP 8.0, Deployer 8 est appelé en
+ * positionnel. Une option inconnue est refusée plutôt qu'ignorée en silence.
+ */
+function transferExec(bool $local, string $command, array $options = []): string
+{
+    if (transferLegacyRunApi()) {
+        return $local ? runLocally($command, $options) : run($command, $options);
+    }
+
+    $unknown = array_diff(array_keys($options), ['timeout', 'real_time_output']);
+
+    if ($unknown !== []) {
+        throw new \InvalidArgumentException('Option(s) non prise(s) en charge sous Deployer 8 : ' . implode(', ', $unknown));
+    }
+
+    $timeout = $options['timeout'] ?? null;
+    $forceOutput = (bool) ($options['real_time_output'] ?? false);
+
+    if ($local) {
+        // runLocally() n'a plus de délai par défaut sous Deployer 8 : on garde celui de
+        // Deployer 7, pour qu'une commande bloquée ne fige pas la tâche indéfiniment.
+        // runLocally($command, $cwd, $timeout, $idleTimeout, $secrets, $env, $forceOutput)
+        return runLocally($command, null, $timeout ?? (int) get('default_timeout', 300), null, null, null, $forceOutput);
+    }
+
+    // run($command, $cwd, $env, $secrets, $nothrow, $forceOutput, $timeout)
+    return run($command, null, null, null, false, $forceOutput, $timeout);
+}
+
+/**
  * Exécute une commande sur un environnement, local ou distant.
  */
 function transferRun(?Host $env, string $command, array $options = []): string
 {
     if ($env === null) {
-        return runLocally($command, $options);
+        return transferExec(true, $command, $options);
     }
 
     $output = '';
 
     on($env, static function () use ($command, $options, &$output): void {
-        $output = run($command, $options);
+        $output = transferExec(false, $command, $options);
     });
 
     return $output;
@@ -324,14 +373,14 @@ function transferRun(?Host $env, string $command, array $options = []): string
 function transferWpRun(?Host $env, string $command, array $options = []): string
 {
     if ($env === null) {
-        return runLocally($command, $options);
+        return transferExec(true, $command, $options);
     }
 
     $output = '';
 
     on($env, static function () use ($command, $options, &$output): void {
         within('{{current_path}}', static function () use ($command, $options, &$output): void {
-            $output = run($command, $options);
+            $output = transferExec(false, $command, $options);
         });
     });
 
@@ -977,7 +1026,8 @@ function transferReuseLocalArchive(string $pattern, string $subject): ?string
     // manquant. Un transfert interrompu laisse précisément un fichier de ce genre, qui
     // viderait la base locale avant de faire échouer l'import. Vaut aussi pour un
     // .tar.gz : c'est la couche gzip qui est testée.
-    $intact = trim(runLocally(
+    $intact = trim(transferRun(
+        null,
         sprintf('if gzip -t %s 2>/dev/null; then echo +intact; fi', escapeshellarg($path)),
         ['timeout' => 1800],
     )) === '+intact';
@@ -2579,7 +2629,7 @@ task('uploads:pull', static function (): void {
 
     info("📦 Extraction dans <comment>./$uploads</comment>...");
     runLocally('mkdir -p ' . escapeshellarg($localUploads));
-    runLocally(sprintf('tar -xzf %s -C %s', escapeshellarg($localPath), escapeshellarg($localUploads)), ['timeout' => 3600]);
+    transferRun(null, sprintf('tar -xzf %s -C %s', escapeshellarg($localPath), escapeshellarg($localUploads)), ['timeout' => 3600]);
 
     $extracted = trim(runLocally(sprintf('find %s -type f | wc -l', escapeshellarg($localUploads))));
     info(sprintf('   <comment>%s</comment> fichiers présents en local après extraction.', $extracted));
@@ -2834,6 +2884,17 @@ function buildCheckRemoteCommit(string $target): ?string
     return null;
 }
 
+/**
+ * Commit de {{target}} dans le dépôt local, résolu comme le fait deploy:update_code en
+ * stratégie `local_archive`. Null si la cible est introuvable.
+ */
+function buildCheckLocalCommit(string $target): ?string
+{
+    $commit = transferTryLocally(sprintf('git rev-list -1 %s --', escapeshellarg($target)));
+
+    return $commit !== null && preg_match('/^[0-9a-f]{40}$/', $commit) ? $commit : null;
+}
+
 desc('Vérifie que le code local, d\'où sont buildés les assets, est exactement le commit déployé et sans modification non commitée dans {{build_check_paths}}');
 task('build:check', static function (): void {
     if (!get('build_check')) {
@@ -2842,10 +2903,17 @@ task('build:check', static function (): void {
 
     $target = get('target');
     $local = runLocally('git rev-parse HEAD');
-    $remote = buildCheckRemoteCommit($target);
+
+    // Stratégie `local_archive` (Deployer 8) : le serveur ne clone rien, la release est
+    // l'archive de {{target}} prise dans le dépôt local. C'est donc là qu'il faut lire le
+    // commit ; exiger qu'il soit poussé bloquerait à tort un déploiement légitime.
+    $fromLocalRepository = get('update_code_strategy', 'archive') === 'local_archive';
+    $remote = $fromLocalRepository ? buildCheckLocalCommit($target) : buildCheckRemoteCommit($target);
 
     if ($remote === null) {
-        throw error("Cible « $target » introuvable sur le dépôt distant : la pousser avant de déployer.");
+        throw error($fromLocalRepository
+            ? "Cible « $target » introuvable dans le dépôt local."
+            : "Cible « $target » introuvable sur le dépôt distant : la pousser avant de déployer.");
     }
 
     if (strncmp($local, $remote, strlen($remote)) !== 0 && strncmp($remote, $local, strlen($local)) !== 0) {

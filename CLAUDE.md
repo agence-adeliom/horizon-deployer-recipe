@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Nature du dépôt
 
-Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus trois tâches greffées sur `dep deploy` : `build:check` avant `deploy`, `db:backup` avant `deploy:symlink` et `wp:update-db` à `deploy:success`.
+Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4+ et 8 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus trois tâches greffées sur `dep deploy` : `build:check` avant `deploy`, `db:backup` avant `deploy:symlink` et `wp:update-db` à `deploy:success`.
 
 Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de suite de tests, pas de linter configuré.
 
@@ -49,6 +49,8 @@ Toutes les fonctions de plomberie prennent un `?Host` et se comportent de façon
 | `transferTest` | test shell renvoyant un booléen |
 | `transferResolve` | résout les `{{placeholders}}` **dans le contexte de l'hôte visé** |
 | `transferSize`, `transferRunWatched`, `transferRsync` | opérations concrètes bâties sur les précédentes |
+
+**Jamais d'appel direct à `run()` / `runLocally()` avec un tableau d'options** : Deployer 8 a remplacé ce tableau par des paramètres nommés (`$cwd` en second argument, d'où une TypeError), et les paramètres nommés sont inutilisables ici (PHP 7.4). Tout passe par `transferExec()`, qui prend les options au format Deployer 7 (`timeout`, `real_time_output`), détecte l'API par réflexion (`transferLegacyRunApi()`) et appelle Deployer 8 en positionnel. Une nouvelle option doit y être traduite, faute de quoi elle est refusée. Un `runLocally()` sans options reste compatible tel quel.
 
 **Règle à respecter systématiquement :** toute lecture de configuration ou résolution de placeholder concernant un environnement doit passer par `transferResolve($env, …)` ou un bloc `on($env, …)`. Hors contexte, `{{bin/wp}}` serait résolu contre l'hôte *courant* — non seulement faux, mais générateur d'un appel SSH parasite, sa valeur étant calculée par une closure qui teste la présence du binaire.
 
