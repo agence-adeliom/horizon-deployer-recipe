@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Nature du dépôt
 
-Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4+ et 8 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus trois tâches greffées sur `dep deploy` : `build:check` avant `deploy`, `db:backup` avant `deploy:symlink` et `wp:update-db` à `deploy:success`.
+Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4+ et 8 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus des tâches greffées sur `dep deploy` : `build:check` et `roles:check` avant `deploy`, `db:backup` avant `deploy:symlink`, `wp:update-db` et `roles:status` à `deploy:success`. Les deux tâches `roles:*` ne servent qu'aux projets dotés du mu-plugin `adeliom-roles` et sont inertes ailleurs.
 
 Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de suite de tests, pas de linter configuré.
 
@@ -64,15 +64,30 @@ Chaque tâche commence par `transferResetState()` et se termine par `invoke('tra
 
 ### Les points d'accroche dans le flux de déploiement
 
-Ce fichier modifie `dep deploy` à trois endroits seulement, chacun avec son garde-fou (`set(…, true)`) et un test d'existence de la tâche cible avant de poser le hook :
+Ce fichier modifie `dep deploy` aux endroits suivants, chacun avec son garde-fou (`set(…, true)`) et un test d'existence de la tâche cible avant de poser le hook :
 
 - `before('deploy', 'build:check')` (`build_check`) : les assets sont buildés sur la machine qui déploie, donc le commit local (`git rev-parse HEAD`) doit être celui que le serveur clonera pour `{{target}}`, lu sur le dépôt distant (`git ls-remote {{repository}}`, tag annoté déréférencé via `^{}`), et `{{build_check_paths}}` doit être propre. Comparer des commits et non des noms de branche couvre les commits non poussés, les branches locales en retard et les têtes détachées de CI. Seuls les chemins listés sont vérifiés, pour tolérer une modification temporaire de l'inventaire.
 - `before('deploy:symlink', 'deploy:db-backup')` (`transfer_backup_on_deploy`) : dump de la base nommé d'après la release (`<alias>-avant-release-<N>-<date>.sql.gz`), puis rotation à `transfer_backup_keep` dumps. Dernier moment où la base est celle de la release en ligne ; aucune question n'est posée, donc tenir le verrou ne pose pas de problème. Un échec d'export **doit** faire échouer le déploiement (avant la bascule, donc sans dommage) ; un échec de rotation non. Le numéro vient du lien `{{deploy_path}}/release` lu sur le serveur, pas de `{{release_name}}` (qui, réévalué hors de `deploy:release`, donnerait la release suivante). `deploy:db-backup` est la variante cachée qui lit le réglage ; `db:backup` l'ignore, pour rester lançable à la main.
 - `after('deploy:success', 'wp:update-db')` (`transfer_update_db`), détaillé ci-dessous.
+- `before('deploy', 'roles:check')` et `after('deploy:success', 'roles:status')` (`roles_check`), détaillés dans « Rôles adeliom-roles ». Les `before()` s'empilent en tête (`array_unshift` dans `Task::addBefore()`) : `roles:check` est donc déclarée **avant** `build:check` pour s'exécuter après elle.
 
 La rotation (`transferRotateBackups`) ne touche que les fichiers `<alias>-*release-*.sql.gz` : les dumps d'avant import (`db:push`, `wp:update-db`) ne sont jamais supprimés.
 
 Le point d'accroche n'est pas interchangeable. `deploy:symlink` et `deploy:success` voient tous deux le symlink déjà basculé, mais la tâche pose une question : accrochée avant `deploy:unlock`, elle ferait attendre le verrou de déploiement, et un `Ctrl-C` sur la question laisserait le projet verrouillé. `deploy:unlock` lui-même est exclu pour une autre raison — c'est la commande qu'on lance à la main pour débloquer un déploiement interrompu, et une question sur la base y serait hors de propos. `deploy:success` clôt `deploy:publish`, est `->hidden()`, et n'est jamais atteinte par un déploiement en échec — celui-ci sort par `fail('deploy', 'deploy:failed')`, branche qui ne traverse pas `deploy:success`. Ne pas justifier cela par « `deploy:failed` est une tâche vide » : c'est vrai du `recipe/common.php` nu, mais la plupart des projets Horizon y accrochent `deploy:unlock` et de vraies actions de récupération — raison pour laquelle un échec de `wp:update-db` est rattrapé par un `try/catch` plutôt que propagé.
+
+### Rôles adeliom-roles : `roles:check` et `roles:status`
+
+Le mu-plugin `adeliom-roles` (skill Adeliom `wordpress-remplacer-ure`) synchronise des rôles déclarés dans le code au chargement de WordPress. En production, sa **première application seulement** est conditionnée à une empreinte (`expected`) : écart ⇒ synchro en attente. `roles:check` refait ce contrôle avant le déploiement ; `roles:status` affiche `wp adeliom-roles status` après.
+
+Invariants :
+
+- **Sans mu-plugin, rien.** `rolesCheckLocalFile()` (purement local) rend `null` si `roles_check` est faux ou si `{{roles_check_file}}` n'existe pas dans le projet : aucune commande distante, aucune question, une ligne en `-v` au plus. Tout nouveau code des deux tâches doit rester derrière ce test.
+- **Lectures en SQL, jamais `wp option get`.** `--skip-plugins` ne retient pas les mu-plugins (vérifié : un `wp option get … --skip-plugins` applique la synchro). `rolesCheckHostRoles()` lit donc le préfixe par `wp config get table_prefix` puis les options `<préfixe>user_roles` et `adeliom_roles_state` par `transferDbRows()`, en `HEX()` pour échapper à l'échappement du client mysql. Désérialisation avec `allowed_classes => false`.
+- **Même règle que le mu-plugin.** `applied_version` non vide ⇒ une ligne d'info, pas de comparaison. Sinon `rolesCheckDiff()` reproduit `adeliom_roles_snapshot()` + `adeliom_roles_diff()` : tous les rôles triés, caps surveillées seulement, cap absente = `null`, comparaison stricte. À garder alignée sur le moteur.
+- **Extraction dans un processus PHP distinct** (`PHP_BINARY -r`, `ABSPATH` et `ADELIOM_ROLES_EXTRACT_ONLY` définis) : inclus dans Deployer, le mu-plugin ferait `exit` sans `ABSPATH` et y déclarerait ses fonctions globales.
+- **Hôtes protégés seulement** (`transferIsProtected()`), le mu-plugin ne contrôlant qu'en production.
+- **Écart** : en interactif `askConfirmation('Continuer le déploiement ?', false)`, un « non » lève `error()` avant tout verrou ; en `-n`, avertissement et poursuite (décision du 09/11/2026). Sans TTY et sans `-n`, le défaut « non » arrête le déploiement. Une lecture en échec n'est qu'un avertissement.
+- **`roles:status`** tourne sans `--skip-plugins` (la commande est déclarée par le mu-plugin ; son chargement applique la synchro si elle est due, comme la première requête). Présence testée par `[ -f {{roles_check_file}} ]` dans la release, pas par `transferWpHasCommand()` : `wp cli cmd-dump` tourne avant le chargement de WordPress et ne voit jamais une commande de mu-plugin. `try/catch` et `|| echo` : jamais d'échec du déploiement.
 
 ### Le défaut d'une question qui écrit ne peut pas être l'écriture
 

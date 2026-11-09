@@ -32,6 +32,9 @@
 |    {{transfer_backup_dir}} ;
 |  - chaque `dep deploy` vérifie d'abord que le code local, d'où sont buildés les
 |    assets, est exactement le commit déployé (build:check) ;
+|  - pour un projet doté du mu-plugin adeliom-roles seulement, chaque `dep deploy`
+|    vers un hôte protégé contrôle les rôles avant leur première synchro
+|    (roles:check), puis affiche l'état de la synchro (roles:status) ;
 |  - chaque `dep deploy` dumpe la base juste avant la bascule du symlink, dans le
 |    même dossier, en ne gardant que les {{transfer_backup_keep}} derniers dumps de
 |    déploiement (`dep db:backup <hôte>` pour en faire un à la main) ;
@@ -45,13 +48,14 @@ namespace Deployer;
 use Deployer\Host\Host;
 use Deployer\Host\Localhost;
 use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 
 // À inclure avec require_once. Aucun garde runtime ne peut protéger d'un double
 // `require` : PHP déclare les fonctions d'un fichier inclus dès sa compilation,
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.8.1');
+define('HORIZON_TRANSFER_RECIPE', '1.9.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -179,6 +183,23 @@ set('transfer_backup_keep', 10);
 // sortie du déploiement sans rien demander de faire à ce moment-là. Les erreurs et
 // avertissements restent affichés. '' pour garder la configuration PHP du serveur.
 set('transfer_wp_php_args', "-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'");
+
+// Contrôle des rôles du mu-plugin adeliom-roles : roles:check avant `deploy` (hôtes protégés
+// seulement), roles:status après. Sans ce mu-plugin dans le projet, les deux tâches ne font
+// rien, sans aucun appel au serveur. À passer à false pour s'en passer.
+set('roles_check', true);
+
+// Mu-plugin adeliom-roles, relatif à la racine du projet (ou absolu) : celui de Bedrock par
+// défaut, celui d'un WordPress classique s'il est le seul présent.
+set('roles_check_file', static function (): string {
+    foreach (['web/app/mu-plugins/adeliom-roles.php', 'wp-content/mu-plugins/adeliom-roles.php'] as $path) {
+        if (is_file(transferProjectRoot() . '/' . $path)) {
+            return $path;
+        }
+    }
+
+    return 'web/app/mu-plugins/adeliom-roles.php';
+});
 
 // WP-CLI distant, installé à la demande s'il n'est pas disponible. Défini ici pour
 // que le recipe soit autonome ; un projet qui définit son propre `bin/wp` après le
@@ -3067,17 +3088,318 @@ task('wp:update-db', static function (): void {
     info('✅ ' . ($result !== '' ? $result : "Schéma de base de « $label » mis à jour."));
 });
 
+/*
+|--------------------------------------------------------------------------
+| Rôles déclarés dans le code (mu-plugin adeliom-roles)
+|--------------------------------------------------------------------------
+|
+| Le mu-plugin adeliom-roles remplace User Role Editor : les rôles sont déclarés
+| dans le code et synchronisés au chargement de WordPress. En production, sa
+| PREMIÈRE application est conditionnée à une empreinte : si les rôles de la base
+| ont changé depuis l'audit (clé « expected » de la déclaration), rien n'est
+| appliqué et la synchro reste en attente. roles:check fait ce même contrôle avant
+| le déploiement, pour que l'écart soit vu au moment de déployer et non découvert
+| plus tard dans wp-admin.
+*/
+
+/**
+ * Chemin absolu du mu-plugin adeliom-roles du projet, ou null si le contrôle est
+ * désactivé ou le projet n'en a pas. Purement local : aucun appel au serveur, pour
+ * que les projets sans ce mu-plugin ne voient aucune différence.
+ */
+function rolesCheckLocalFile(): ?string
+{
+    if (!get('roles_check')) {
+        return null;
+    }
+
+    $file = (string) get('roles_check_file');
+    $path = $file !== '' && $file[0] === '/' ? $file : transferProjectRoot() . '/' . $file;
+
+    if ($file === '' || !is_file($path)) {
+        writeln("   Pas de mu-plugin adeliom-roles ($file) : contrôle des rôles sans objet.", OutputInterface::VERBOSITY_VERBOSE);
+
+        return null;
+    }
+
+    return $path;
+}
+
+/**
+ * Empreinte attendue (clé « expected » de adeliom_roles_declaration()), extraite en
+ * local par un processus PHP distinct.
+ *
+ * Distinct parce que le mu-plugin s'arrête net (`exit`) sans ABSPATH et déclare des
+ * fonctions globales : l'inclure dans le processus de Deployer serait fatal ou
+ * polluant. ADELIOM_ROLES_EXTRACT_ONLY arrête le fichier juste après la déclaration,
+ * le moteur et ses hooks ne sont donc pas chargés. PHP_BINARY est le PHP qui exécute
+ * Deployer, donc celui du projet sous DDEV.
+ *
+ * @return ?array{roles: string[], caps: array<string, array<string, ?bool>>} null si la
+ *         déclaration ne contient pas d'empreinte.
+ */
+function rolesCheckExpected(string $file): ?array
+{
+    $code = sprintf(
+        'define("ABSPATH", sys_get_temp_dir() . "/"); define("ADELIOM_ROLES_EXTRACT_ONLY", true); require %s;'
+        . ' $declaration = adeliom_roles_declaration();'
+        . ' echo "\n+dep-expected:", json_encode(isset($declaration["expected"]) ? $declaration["expected"] : null), "\n";',
+        var_export($file, true),
+    );
+
+    $output = transferRun(null, sprintf('%s -r %s', escapeshellarg(PHP_BINARY !== '' ? PHP_BINARY : 'php'), escapeshellarg($code)));
+
+    if (preg_match('/^\+dep-expected:(.*)$/m', $output, $matches) !== 1) {
+        throw new \RuntimeException("Déclaration illisible dans $file :\n" . trim($output));
+    }
+
+    $expected = json_decode($matches[1], true);
+
+    if ($expected === null) {
+        return null;
+    }
+
+    if (!is_array($expected) || !isset($expected['roles']) || !is_array($expected['roles'])) {
+        throw new \RuntimeException("Empreinte attendue invalide dans $file.");
+    }
+
+    return $expected;
+}
+
+/**
+ * Rôles de la base de l'hôte et état de la synchro adeliom-roles, lus en SQL.
+ *
+ * SQL et non `wp option get` : celui-ci charge WordPress, et --skip-plugins ne retient
+ * pas les mu-plugins. Le mu-plugin adeliom-roles synchronise les rôles à son
+ * chargement : une simple lecture appliquerait la synchro qu'on cherche à contrôler.
+ * `wp config get` et `wp db query` ne chargent pas WordPress. HEX() pour recevoir la
+ * valeur sérialisée intacte, sans l'échappement du client mysql.
+ *
+ * @return array{roles: array, state: array}
+ */
+function rolesCheckHostRoles(Host $env): array
+{
+    $prefix = transferWpLastLine(transferWpRun($env, sprintf(
+        '%s config get table_prefix --skip-plugins --skip-themes 2>/dev/null || true',
+        transferWpBin($env),
+    )));
+
+    if (preg_match('/^\w+$/', $prefix) !== 1) {
+        throw new \RuntimeException('Préfixe des tables illisible (wp config get table_prefix).');
+    }
+
+    $values = [];
+
+    foreach (transferDbRows($env, sprintf(
+        "SELECT CONCAT('+dep|', option_name, '|', HEX(option_value)) FROM `%soptions` WHERE option_name IN ('adeliom_roles_state', '%suser_roles')",
+        $prefix,
+        $prefix,
+    )) as $row) {
+        if (count($row) === 2) {
+            $value = @unserialize((string) hex2bin($row[1]), ['allowed_classes' => false]);
+            $values[$row[0]] = is_array($value) ? $value : null;
+        }
+    }
+
+    if (!isset($values[$prefix . 'user_roles'])) {
+        throw new \RuntimeException("Option {$prefix}user_roles introuvable ou illisible.");
+    }
+
+    return [
+        'roles' => $values[$prefix . 'user_roles'],
+        'state' => $values['adeliom_roles_state'] ?? [],
+    ];
+}
+
+/**
+ * Écarts entre l'empreinte attendue et les rôles de l'hôte, avec la sémantique exacte
+ * du mu-plugin (adeliom_roles_snapshot() puis adeliom_roles_diff()) : liste triée de
+ * tous les rôles, et pour chaque rôle surveillé ses seules caps surveillées, une cap
+ * absente valant null. Une cap ajoutée par un plugin et non surveillée n'est donc
+ * jamais un écart.
+ *
+ * @return string[] une ligne lisible par écart
+ */
+function rolesCheckDiff(array $expected, array $roles): array
+{
+    $actualRoles = array_keys($roles);
+    $expectedRoles = $expected['roles'];
+    $allRoles = array_unique(array_merge($expectedRoles, $actualRoles));
+    sort($allRoles);
+
+    $show = static fn($value): string => $value === null ? 'absente' : ($value ? 'true' : 'false');
+    $lines = [];
+
+    foreach ($allRoles as $slug) {
+        $inExpected = in_array($slug, $expectedRoles, true);
+
+        if ($inExpected !== in_array($slug, $actualRoles, true)) {
+            $lines[] = sprintf(
+                'Rôle %s : %s',
+                $slug,
+                $inExpected ? 'attendu, absent sur l\'hôte' : 'absent de l\'audit, présent sur l\'hôte',
+            );
+        }
+    }
+
+    foreach ((array) ($expected['caps'] ?? []) as $slug => $caps) {
+        $current = isset($roles[$slug]['capabilities']) && is_array($roles[$slug]['capabilities'])
+            ? $roles[$slug]['capabilities']
+            : [];
+
+        foreach ((array) $caps as $cap => $value) {
+            $actual = array_key_exists($cap, $current) ? (bool) $current[$cap] : null;
+
+            if ($actual !== $value) {
+                $lines[] = sprintf('Rôle %s, cap %s : attendu %s, hôte %s', $slug, $cap, $show($value), $show($actual));
+            }
+        }
+    }
+
+    return $lines;
+}
+
+desc('Compare les rôles de l\'hôte à l\'empreinte attendue par le mu-plugin adeliom-roles, avant sa première application. Branchée avant le déploiement des hôtes protégés : dep roles:check production');
+task('roles:check', static function (): void {
+    $file = rolesCheckLocalFile();
+
+    if ($file === null) {
+        return;
+    }
+
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // Le mu-plugin ne contrôle l'empreinte qu'en production.
+    if (!transferIsProtected($env)) {
+        writeln("   « $label » n'est pas un hôte protégé : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
+
+        return;
+    }
+
+    // Une lecture ou une extraction en échec n'interrompt rien : le mu-plugin refait
+    // lui-même ce contrôle en production et met la synchro en attente en cas d'écart.
+    try {
+        $host = rolesCheckHostRoles($env);
+
+        // Le mu-plugin ne contrôle l'empreinte qu'à sa première application.
+        if (!empty($host['state']['applied_version'])) {
+            info(sprintf(
+                '   Rôles déjà synchronisés par adeliom-roles (version %s) : pas de contrôle d\'empreinte.',
+                (string) $host['state']['applied_version'],
+            ));
+
+            return;
+        }
+
+        $expected = rolesCheckExpected($file);
+    } catch (\Throwable $e) {
+        warning("Rôles de « $label » non contrôlés : la lecture a échoué. Le déploiement continue.");
+        writeln('   ' . $e->getMessage());
+
+        return;
+    }
+
+    if ($expected === null) {
+        info('   Aucune empreinte attendue dans la déclaration adeliom-roles : rien à contrôler.');
+
+        return;
+    }
+
+    $diff = rolesCheckDiff($expected, $host['roles']);
+
+    if ($diff === []) {
+        info("   Rôles de « $label » conformes à l'empreinte de l'audit : la synchro adeliom-roles s'appliquera.");
+
+        return;
+    }
+
+    warning("Les rôles de « $label » ont changé depuis l'audit : adeliom-roles ne s'appliquera pas et restera en attente.");
+
+    foreach ($diff as $line) {
+        writeln("   - $line");
+    }
+
+    writeln('   Refaire l\'audit et mettre à jour « expected » dans la déclaration, ou vérifier la production avant de déployer.');
+
+    if (!input()->isInteractive()) {
+        warning('Mode non interactif : déploiement poursuivi malgré l\'écart.');
+
+        return;
+    }
+
+    // Défaut « non » : sans TTY et sans -n, Symfony retombe sur le défaut, et un
+    // déploiement ne doit pas passer sur un écart sans décision. Voir CLAUDE.md.
+    if (!askConfirmation('Continuer le déploiement ?', false)) {
+        throw error("Déploiement interrompu : rôles de « $label » différents de l'empreinte de l'audit.");
+    }
+});
+
+desc('Affiche l\'état de la synchro adeliom-roles sur l\'hôte (wp adeliom-roles status). Branchée sur la fin du déploiement : dep roles:status production');
+task('roles:status', static function (): void {
+    if (rolesCheckLocalFile() === null) {
+        return;
+    }
+
+    $env = currentHost();
+    $label = $env->getAlias();
+    $file = (string) get('roles_check_file');
+
+    // Jamais d'échec : le déploiement est publié, le statut n'est qu'informatif.
+    try {
+        // Présence du mu-plugin dans la release en ligne, et non transferWpHasCommand() :
+        // `wp cli cmd-dump` tourne avant le chargement de WordPress et ne voit donc jamais
+        // une commande déclarée par un mu-plugin. Un chemin absolu est local, pas testable
+        // sur l'hôte : la commande est alors lancée directement.
+        if ($file[0] !== '/' && !transferTest($env, '[ -f ' . escapeshellarg($file) . ' ]')) {
+            writeln("   Mu-plugin adeliom-roles absent de la release de « $label » : état non affiché.", OutputInterface::VERBOSITY_VERBOSE);
+
+            return;
+        }
+
+        // Sans --skip-plugins : la commande est déclarée par le mu-plugin, qui doit se
+        // charger. Le chargement applique la synchro si elle est due, comme le ferait la
+        // première requête sur le site.
+        $output = trim(transferWpRun($env, sprintf(
+            '%s adeliom-roles status --no-color 2>&1 || echo "+dep-failed"',
+            transferWpBin($env),
+        )));
+    } catch (\Throwable $e) {
+        warning("État des rôles illisible sur « $label ».");
+        writeln('   ' . $e->getMessage());
+
+        return;
+    }
+
+    if (strpos($output, '+dep-failed') !== false) {
+        warning("État des rôles illisible sur « $label » (wp adeliom-roles status).");
+        $output = trim(str_replace('+dep-failed', '', $output));
+    } else {
+        info("Rôles adeliom-roles sur « $label » :");
+    }
+
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (trim($line) !== '') {
+            writeln('   ' . $line);
+        }
+    }
+});
+
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
 // deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la
 // main pour débloquer un déploiement. Voir CLAUDE.md pour le détail.
 if (Deployer::get()->tasks->has('deploy:success')) {
     after('deploy:success', 'wp:update-db');
+    // Après wp:update-db : le schéma est à jour quand le mu-plugin se charge.
+    after('deploy:success', 'roles:status');
 }
 
-// Avant tout le reste : inutile de verrouiller ou de cloner si le build local ne
-// correspondrait pas à la release.
+// Les `before` s'empilent en tête (array_unshift) : roles:check, déclarée en premier,
+// passe donc APRÈS build:check. Toutes deux avant le verrou : une question posée ou un
+// refus n'y laisse rien de verrouillé.
 if (Deployer::get()->tasks->has('deploy')) {
+    before('deploy', 'roles:check');
     before('deploy', 'build:check');
 }
 
