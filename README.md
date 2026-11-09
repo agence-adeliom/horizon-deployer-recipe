@@ -73,7 +73,7 @@ Le recipe modifie le comportement de `dep deploy` à cinq endroits, chacun désa
   [Mise à jour du schéma après déploiement](#mise-à-jour-du-schéma-après-déploiement)) ;
   `set('transfer_update_db', false)` le désarme ;
 - pour un projet qui utilise le mu-plugin `adeliom-roles`, il **contrôle les rôles de
-  l'hôte protégé avant le déploiement** (`roles:check`) et **affiche l'état de leur
+  la production avant le déploiement** (`roles:check`) et **affiche l'état de leur
   synchro à la fin** (`roles:status`), voir
   [Contrôle des rôles adeliom-roles](#contrôle-des-rôles-adeliom-roles) ;
   `set('roles_check', false)` les désarme. Sans ce mu-plugin, rien ne change.
@@ -96,7 +96,7 @@ Ajoutez à votre `.gitignore` :
 | `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 | `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
 | `dep build:check <hôte>` | — | Vérifie que le commit local est celui que le serveur va cloner, sans modification non commitée dans `{{build_check_paths}}`. Lancée d'elle-même avant `deploy` |
-| `dep roles:check <hôte>` | - | Compare les rôles de l'hôte à l'empreinte attendue par le mu-plugin `adeliom-roles`, avant sa première application. Lancée d'elle-même avant `deploy`, après `build:check`, sur les hôtes protégés. Sans effet sans ce mu-plugin |
+| `dep roles:check <hôte>` | - | Compare les rôles de l'hôte à l'empreinte attendue par le mu-plugin `adeliom-roles`, avant sa première application. Lancée d'elle-même avant `deploy`, après `build:check`, sur la production (`WP_ENV=production` dans `shared/.env`, à défaut un hôte protégé). Sans effet sans ce mu-plugin |
 | `dep roles:status <hôte>` | - | Affiche `wp adeliom-roles status`. Lancée d'elle-même après `deploy:success`. Sans effet sans ce mu-plugin |
 | `dep db:backup <hôte>` | — | Dumpe la base de l'hôte dans `{{transfer_backup_dir}}`, nommée d'après sa release, et ne garde que les `{{transfer_backup_keep}}` derniers dumps. Lancée d'elle-même juste avant `deploy:symlink` |
 
@@ -292,21 +292,33 @@ n'est appliqué et la synchro reste en attente. Deux tâches rendent ce contrôl
 moment de déployer, au lieu de le laisser découvrir plus tard dans wp-admin.
 
 **Sans le fichier `adeliom-roles.php` dans le projet, les deux tâches ne font rien** : aucun
-appel au serveur, aucune question, aucun affichage (une ligne en `-v`). Seul l'en-tête
-`task roles:check` de Deployer apparaît dans la sortie du déploiement. Le fichier est cherché
+appel au serveur, aucune question, aucun affichage (une ligne en `-v`). Seuls les deux
+en-têtes `task roles:check` et `task roles:status` de Deployer apparaissent dans la sortie
+du déploiement. Le fichier est cherché
 dans `web/app/mu-plugins/` (Bedrock) puis `wp-content/mu-plugins/` (WordPress classique),
 ou à l'emplacement donné par `roles_check_file`.
 
 `roles:check`, avant `deploy` (après `build:check`, avant tout verrou) :
 
-- elle ne contrôle que les **hôtes protégés** (`transfer_protected`), le mu-plugin ne
-  vérifiant l'empreinte qu'en production ;
+- elle ne contrôle que la **production**, au sens du mu-plugin (`wp_get_environment_type()`,
+  que Bedrock déduit de `WP_ENV`) : elle lit `{{deploy_path}}/shared/.env` sur l'hôte, en
+  lecture seule, et ne contrôle que si `WP_ENVIRONMENT_TYPE` (s'il y est défini) ou à défaut
+  `WP_ENV` vaut `production`. L'alias ne compte pas : une `preprod` en `WP_ENV=staging`
+  n'est pas contrôlée, une production nommée `live` l'est. Si aucune des deux variables
+  n'est trouvée (site non Bedrock, fichier absent), repli sur les **hôtes protégés**
+  (`transfer_protected`), avec une ligne d'information « contrôlé si cet hôte est la
+  production ». Une variable d'environnement du serveur qui surchargerait le `.env` n'est
+  pas vue ;
 - elle lit l'état de la synchro sur l'hôte : si l'option `adeliom_roles_state` porte déjà une
   `applied_version`, les rôles ont été synchronisés et l'empreinte n'est plus contrôlée,
   comme dans le mu-plugin. Une ligne d'information, rien d'autre ;
 - sinon elle compare les rôles de l'hôte (option `<préfixe>user_roles`) à l'empreinte
   `expected`, extraite en local du mu-plugin par un processus PHP distinct
-  (`ADELIOM_ROLES_EXTRACT_ONLY`, le moteur n'est pas chargé). La comparaison est celle du
+  (`ADELIOM_ROLES_EXTRACT_ONLY`, le moteur n'est pas chargé). Le mu-plugin est lu tel qu'au
+  commit `HEAD` (`git show HEAD:<fichier>` vers un fichier temporaire), celui que
+  `build:check` compare à la cible déployée : une modification non commitée n'y change
+  rien. Hors dépôt git ou fichier jamais commité, la copie de travail est lue, avec un
+  avertissement. La comparaison est celle du
   mu-plugin : liste triée de tous les rôles, et pour chaque rôle surveillé ses seules caps
   surveillées (une cap absente vaut `null`, `true` et `false` sont comparés strictement) ;
 - conforme : une ligne d'information. Écart : la liste des différences, puis
@@ -714,6 +726,10 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
   accrochent `deploy:unlock` et des actions de récupération.
 - **Ordre des accroches avant `deploy`.** Deployer empile les `before()` en tête de liste :
   `roles:check` est donc déclarée avant `build:check` pour passer après elle.
+- **Production selon `WP_ENV`, pas selon l'alias.** `roles:check` lit le type
+  d'environnement dans `shared/.env` de l'hôte (comme le mu-plugin, qui suit
+  `wp_get_environment_type()`), et ne retombe sur `transfer_protected` que s'il est
+  introuvable.
 - **Présence de `wp adeliom-roles`.** `roles:status` teste la présence du mu-plugin dans la
   release en ligne, et non `wp cli cmd-dump` : cette commande tourne avant le chargement de
   WordPress et ne voit jamais une commande déclarée par un mu-plugin.

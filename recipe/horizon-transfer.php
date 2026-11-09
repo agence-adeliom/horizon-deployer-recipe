@@ -33,8 +33,9 @@
 |  - chaque `dep deploy` vérifie d'abord que le code local, d'où sont buildés les
 |    assets, est exactement le commit déployé (build:check) ;
 |  - pour un projet doté du mu-plugin adeliom-roles seulement, chaque `dep deploy`
-|    vers un hôte protégé contrôle les rôles avant leur première synchro
-|    (roles:check), puis affiche l'état de la synchro (roles:status) ;
+|    vers la production (WP_ENV=production dans shared/.env, à défaut un hôte
+|    protégé) contrôle les rôles avant leur première synchro (roles:check), puis
+|    affiche l'état de la synchro (roles:status) ;
 |  - chaque `dep deploy` dumpe la base juste avant la bascule du symlink, dans le
 |    même dossier, en ne gardant que les {{transfer_backup_keep}} derniers dumps de
 |    déploiement (`dep db:backup <hôte>` pour en faire un à la main) ;
@@ -184,8 +185,8 @@ set('transfer_backup_keep', 10);
 // avertissements restent affichés. '' pour garder la configuration PHP du serveur.
 set('transfer_wp_php_args', "-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'");
 
-// Contrôle des rôles du mu-plugin adeliom-roles : roles:check avant `deploy` (hôtes protégés
-// seulement), roles:status après. Sans ce mu-plugin dans le projet, les deux tâches ne font
+// Contrôle des rôles du mu-plugin adeliom-roles : roles:check avant `deploy` (production
+// seulement : WP_ENV=production dans shared/.env, à défaut hôte protégé), roles:status après. Sans ce mu-plugin dans le projet, les deux tâches ne font
 // rien, sans aucun appel au serveur. À passer à false pour s'en passer.
 set('roles_check', true);
 
@@ -3167,6 +3168,85 @@ function rolesCheckExpected(string $file): ?array
 }
 
 /**
+ * Copie du mu-plugin telle qu'au commit HEAD, dans un fichier temporaire local.
+ *
+ * HEAD et non la copie de travail : c'est le commit que build:check compare à la cible
+ * déployée, donc la déclaration que le serveur recevra. Une modification non commitée
+ * de « expected » ne doit pas changer le résultat du contrôle.
+ *
+ * @return ?string chemin du fichier temporaire (à supprimer par l'appelant), ou null si
+ *         le fichier n'est pas suivi par git (hors dépôt, jamais commité)
+ */
+function rolesCheckCommittedCopy(string $path): ?string
+{
+    $tmp = tempnam(sys_get_temp_dir(), 'adeliom-roles-');
+
+    if ($tmp === false) {
+        return null;
+    }
+
+    try {
+        transferRun(null, sprintf(
+            'cd %s && git show %s > %s 2>/dev/null',
+            escapeshellarg(dirname($path)),
+            escapeshellarg('HEAD:./' . basename($path)),
+            escapeshellarg($tmp),
+        ));
+    } catch (\Throwable $e) {
+        @unlink($tmp);
+
+        return null;
+    }
+
+    clearstatcache(true, $tmp);
+
+    if (!is_file($tmp) || filesize($tmp) === 0) {
+        @unlink($tmp);
+
+        return null;
+    }
+
+    return $tmp;
+}
+
+/**
+ * Type d'environnement WordPress de l'hôte, lu dans {{deploy_path}}/shared/.env (lecture
+ * seule, sans charger WordPress) : WP_ENVIRONMENT_TYPE s'il y est défini, sinon WP_ENV,
+ * dont Bedrock déduit WP_ENVIRONMENT_TYPE. C'est ce type (wp_get_environment_type())
+ * qui décide si le mu-plugin contrôle l'empreinte, pas l'alias de l'hôte.
+ *
+ * @return ?string null si aucune des deux variables n'est trouvée (fichier absent, site
+ *         non Bedrock)
+ */
+function rolesCheckHostEnvironment(Host $env): ?string
+{
+    $output = transferRun($env, sprintf(
+        'grep -E %s %s 2>/dev/null | sed %s || true',
+        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE)[[:space:]]*='),
+        escapeshellarg(transferResolve($env, '{{deploy_path}}/shared/.env')),
+        escapeshellarg('s/^/+dep-env:/'),
+    ));
+
+    $values = [];
+
+    foreach (preg_split('/\R/', $output) as $line) {
+        // Première occurrence retenue, comme le chargement immuable de Dotenv dans Bedrock.
+        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(WP_ENV|WP_ENVIRONMENT_TYPE)\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
+            && !isset($values[$m[1]])) {
+            $values[$m[1]] = $m[3];
+        }
+    }
+
+    foreach (['WP_ENVIRONMENT_TYPE', 'WP_ENV'] as $name) {
+        if (($values[$name] ?? '') !== '') {
+            return $values[$name];
+        }
+    }
+
+    return null;
+}
+
+/**
  * Rôles de la base de l'hôte et état de la synchro adeliom-roles, lus en SQL.
  *
  * SQL et non `wp option get` : celui-ci charge WordPress, et --skip-plugins ne retient
@@ -3259,7 +3339,7 @@ function rolesCheckDiff(array $expected, array $roles): array
     return $lines;
 }
 
-desc('Compare les rôles de l\'hôte à l\'empreinte attendue par le mu-plugin adeliom-roles, avant sa première application. Branchée avant le déploiement des hôtes protégés : dep roles:check production');
+desc('Compare les rôles de l\'hôte à l\'empreinte attendue par le mu-plugin adeliom-roles, avant sa première application. Branchée avant le déploiement de la production (WP_ENV=production dans shared/.env, à défaut hôte protégé) : dep roles:check production');
 task('roles:check', static function (): void {
     $file = rolesCheckLocalFile();
 
@@ -3270,11 +3350,30 @@ task('roles:check', static function (): void {
     $env = currentHost();
     $label = $env->getAlias();
 
-    // Le mu-plugin ne contrôle l'empreinte qu'en production.
-    if (!transferIsProtected($env)) {
-        writeln("   « $label » n'est pas un hôte protégé : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
+    // Le mu-plugin ne contrôle l'empreinte qu'en production, au sens de
+    // wp_get_environment_type() : on lit donc WP_ENV sur l'hôte, et non son alias (une
+    // « preprod » contient « prod », une production peut s'appeler « live »).
+    try {
+        $type = rolesCheckHostEnvironment($env);
+    } catch (\Throwable $e) {
+        $type = null;
+    }
+
+    if ($type !== null && $type !== 'production') {
+        writeln("   « $label » est en environnement « $type » (shared/.env) : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
 
         return;
+    }
+
+    if ($type === null) {
+        // Repli : site non Bedrock ou .env absent, on retombe sur les hôtes protégés.
+        if (!transferIsProtected($env)) {
+            writeln("   WP_ENV introuvable sur « $label », hôte non protégé : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
+
+            return;
+        }
+
+        info("   WP_ENV introuvable dans shared/.env de « $label » : hôte protégé, contrôlé si cet hôte est la production.");
     }
 
     // Une lecture ou une extraction en échec n'interrompt rien : le mu-plugin refait
@@ -3292,7 +3391,22 @@ task('roles:check', static function (): void {
             return;
         }
 
-        $expected = rolesCheckExpected($file);
+        // Déclaration du commit HEAD (celui que build:check compare à la cible), et non
+        // de la copie de travail. Hors dépôt git ou fichier non commité : copie de
+        // travail, avec un avertissement.
+        $committed = rolesCheckCommittedCopy($file);
+
+        if ($committed === null) {
+            warning("Mu-plugin adeliom-roles lu dans la copie de travail : $file n'est pas commité (ou hors dépôt git), l'empreinte peut différer de celle déployée.");
+        }
+
+        try {
+            $expected = rolesCheckExpected($committed ?? $file);
+        } finally {
+            if ($committed !== null) {
+                @unlink($committed);
+            }
+        }
     } catch (\Throwable $e) {
         warning("Rôles de « $label » non contrôlés : la lecture a échoué. Le déploiement continue.");
         writeln('   ' . $e->getMessage());
