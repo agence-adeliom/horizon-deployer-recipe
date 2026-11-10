@@ -334,7 +334,12 @@ structure en classes.
   entier), une chaîne entre apostrophes ou guillemets sans interpolation, un entier
   décimal, `true`, `false` ou `null`. Tout autre jeton (appel de fonction, même
   `'f'(…)`, constante, `new`, heredoc, interpolation, backticks, opérateur…) fait refuser
-  le fichier : avertissement, pas de contrôle, le déploiement continue. La
+  le fichier : avertissement, pas de contrôle, le déploiement continue. La déclaration lue
+  est ensuite validée avec les règles du moteur (six clés, `version` entier positif,
+  `roles`, `expected` avec `roles` et `caps`, `extra_roles_ui` et `debug_page` booléens,
+  `default_extra_roles` liste de slugs) : une déclaration invalide, que le mu-plugin
+  n'appliquera pas, donne l'avertissement « déclaration invalide, la synchro ne
+  s'appliquera pas » avec ses erreurs, jamais « conformes ». La
   déclaration est lue telle qu'au
   commit `HEAD` (`git show HEAD:<fichier>` vers un fichier temporaire), celui que
   `build:check` compare à la cible déployée : une modification non commitée n'y change

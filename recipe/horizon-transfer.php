@@ -3317,10 +3317,18 @@ function rolesCheckParseValue(array $tokens, int &$i, callable $fail, int $depth
  * Valeur d'une chaîne PHP littérale sans interpolation (T_CONSTANT_ENCAPSED_STRING), avec
  * les séquences d'échappement de PHP : entre apostrophes `\\` et `\'` seulement ; entre
  * guillemets `\n \t \r \v \e \f \\ \$ \"`, octal, `\x`, `\u{…}`, toute autre séquence
- * gardée telle quelle.
+ * gardée telle quelle. Préfixe binaire `b` / `B` ignoré, comme PHP. `\u{` ouvre toujours une
+ * séquence Unicode : vide, non fermée, non hexadécimale ou au-delà de U+10FFFF, c'est une
+ * erreur de compilation pour PHP, donc un refus ici (même règle que le lecteur du skill).
+ *
+ * @throws \RuntimeException séquence \u{…} invalide
  */
 function rolesCheckUnquote(string $literal): string
 {
+    if ($literal[0] === 'b' || $literal[0] === 'B') {
+        $literal = substr($literal, 1);
+    }
+
     $quote = $literal[0];
     $body = substr($literal, 1, -1);
 
@@ -3329,7 +3337,7 @@ function rolesCheckUnquote(string $literal): string
     }
 
     return (string) preg_replace_callback(
-        '/\\\\(?:([ntrvef\\\\$"])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([0-9A-Fa-f]+)\})/',
+        '/\\\\(?:([ntrvef\\\\$"])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([^}]*)(\}?))/',
         static function (array $m): string {
             if (isset($m[1]) && $m[1] !== '') {
                 return ['n' => "\n", 't' => "\t", 'r' => "\r", 'v' => "\v", 'e' => "\e", 'f' => "\f", '\\' => '\\', '$' => '$', '"' => '"'][$m[1]];
@@ -3341,6 +3349,10 @@ function rolesCheckUnquote(string $literal): string
 
             if (isset($m[3]) && $m[3] !== '') {
                 return chr(hexdec($m[3]));
+            }
+
+            if ($m[5] !== '}' || preg_match('/^[0-9A-Fa-f]+$/D', $m[4]) !== 1 || hexdec($m[4]) > 0x10FFFF) {
+                throw new \RuntimeException('Déclaration adeliom-roles/roles.php refusée, jamais exécutée : séquence \\u{…} invalide (vide, non fermée ou hors de l\'Unicode).');
             }
 
             $code = (int) hexdec($m[4]);
@@ -3364,17 +3376,134 @@ function rolesCheckUnquote(string $literal): string
 }
 
 /**
+ * Erreurs de format d'une déclaration adeliom-roles/roles.php, avec les règles de la classe
+ * Declaration du moteur 2.x (à garder alignées) : les six clés présentes, `version` entier
+ * ≥ 1, `roles` tableau de rôles (name chaîne, caps cap => booléen, remove liste de
+ * chaînes), `expected` avec `roles` (liste de chaînes) et `caps` (cap => booléen ou null),
+ * `extra_roles_ui` et `debug_page` booléens, `default_extra_roles` liste de chaînes. Une
+ * déclaration invalide n'est jamais appliquée par le mu-plugin. Fonction pure.
+ *
+ * @return string[] liste vide si la déclaration est valide
+ */
+function rolesCheckDeclarationErrors(array $data): array
+{
+    $errors = [];
+
+    foreach (['version', 'roles', 'expected', 'extra_roles_ui', 'default_extra_roles', 'debug_page'] as $key) {
+        if (!array_key_exists($key, $data)) {
+            $errors[] = "clé manquante : $key";
+        }
+    }
+
+    if ($errors !== []) {
+        return $errors;
+    }
+
+    $isStringList = static function ($value): bool {
+        if (!is_array($value)) {
+            return false;
+        }
+
+        foreach ($value as $item) {
+            if (!is_string($item)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+    $isCapMap = static function ($value, bool $nullable): bool {
+        if (!is_array($value)) {
+            return false;
+        }
+
+        foreach ($value as $cap => $grant) {
+            if ((string) $cap === '' || !(is_bool($grant) || ($nullable && $grant === null))) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!is_int($data['version']) || $data['version'] < 1) {
+        $errors[] = 'version doit être un entier positif';
+    }
+
+    if (!is_array($data['roles'])) {
+        $errors[] = 'roles doit être un tableau';
+    } else {
+        foreach ($data['roles'] as $slug => $role) {
+            $label = 'roles[' . $slug . ']';
+
+            if ((string) $slug === '' || !is_array($role)) {
+                $errors[] = "$label doit être un tableau, indexé par le slug du rôle";
+
+                continue;
+            }
+
+            if (isset($role['name']) && !is_string($role['name'])) {
+                $errors[] = "{$label}[name] doit être une chaîne";
+            }
+
+            if (isset($role['caps']) && !$isCapMap($role['caps'], false)) {
+                $errors[] = "{$label}[caps] doit être un tableau cap => true ou false";
+            }
+
+            if (isset($role['remove']) && !$isStringList($role['remove'])) {
+                $errors[] = "{$label}[remove] doit être une liste de caps";
+            }
+        }
+    }
+
+    $expected = $data['expected'];
+
+    if (!is_array($expected) || !isset($expected['roles'], $expected['caps'])) {
+        $errors[] = 'expected doit contenir roles et caps';
+    } else {
+        if (!$isStringList($expected['roles'])) {
+            $errors[] = 'expected[roles] doit être une liste de slugs';
+        }
+
+        if (!is_array($expected['caps'])) {
+            $errors[] = 'expected[caps] doit être un tableau';
+        } else {
+            foreach ($expected['caps'] as $slug => $caps) {
+                if (!$isCapMap($caps, true)) {
+                    $errors[] = "expected[caps][$slug] doit être un tableau cap => true, false ou null";
+                }
+            }
+        }
+    }
+
+    if (!is_bool($data['extra_roles_ui'])) {
+        $errors[] = 'extra_roles_ui doit valoir true ou false';
+    }
+
+    if (!$isStringList($data['default_extra_roles'])) {
+        $errors[] = 'default_extra_roles doit être une liste de slugs';
+    }
+
+    if (!is_bool($data['debug_page'])) {
+        $errors[] = 'debug_page doit valoir true ou false';
+    }
+
+    return $errors;
+}
+
+/**
  * Empreinte attendue (clé « expected ») de la déclaration adeliom-roles/roles.php.
  *
  * roles.php est un pur fichier de données (`return array(...)`) : il n'est jamais inclus
  * ni exécuté, sa valeur est reconstruite par rolesCheckParseData() à partir du contenu
  * lu une seule fois. Un fichier qui sort de la grammaire des littéraux (code, ancien
  * mu-plugin d'un seul fichier) lève une exception : un avertissement, pas de contrôle.
+ * La déclaration est ensuite validée comme le fait le moteur (rolesCheckDeclarationErrors()).
  *
- * @return ?array{roles: string[], caps: array<string, array<string, ?bool>>} null si la
- *         déclaration ne contient pas d'empreinte.
+ * @throws \DomainException déclaration invalide (le mu-plugin ne l'appliquera pas), erreurs dans le message
+ * @return array{roles: string[], caps: array<string, array<string, ?bool>>}
  */
-function rolesCheckExpected(string $file): ?array
+function rolesCheckExpected(string $file): array
 {
     $content = @file_get_contents($file);
 
@@ -3392,18 +3521,13 @@ function rolesCheckExpected(string $file): ?array
         throw new \RuntimeException('Déclaration adeliom-roles/roles.php invalide : elle doit renvoyer un tableau.');
     }
 
-    if (!isset($declaration['expected'])) {
-        return null;
+    $errors = rolesCheckDeclarationErrors($declaration);
+
+    if ($errors !== []) {
+        throw new \DomainException('- ' . implode("\n   - ", $errors));
     }
 
-    $expected = $declaration['expected'];
-
-    if (!is_array($expected) || !isset($expected['roles']) || !is_array($expected['roles'])
-        || (isset($expected['caps']) && !is_array($expected['caps']))) {
-        throw new \RuntimeException('Empreinte attendue invalide dans la déclaration adeliom-roles/roles.php.');
-    }
-
-    return $expected;
+    return $declaration['expected'];
 }
 
 /**
@@ -3685,15 +3809,15 @@ task('roles:check', static function (): void {
                 @unlink($committed);
             }
         }
-    } catch (\Throwable $e) {
-        warning("Rôles de « $label » non contrôlés : la lecture a échoué. Le déploiement continue.");
+    } catch (\DomainException $e) {
+        // Le mu-plugin refuse une déclaration invalide : rien ne sera appliqué, même sans écart.
+        warning('Déclaration adeliom-roles/roles.php invalide : la synchro ne s\'appliquera pas. Corriger roles.php avant de déployer.');
         writeln('   ' . $e->getMessage());
 
         return;
-    }
-
-    if ($expected === null) {
-        info('   Aucune empreinte attendue dans la déclaration adeliom-roles : rien à contrôler.');
+    } catch (\Throwable $e) {
+        warning("Rôles de « $label » non contrôlés : la lecture a échoué. Le déploiement continue.");
+        writeln('   ' . $e->getMessage());
 
         return;
     }
