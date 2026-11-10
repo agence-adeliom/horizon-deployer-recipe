@@ -56,7 +56,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.9.0');
+define('HORIZON_TRANSFER_RECIPE', '1.9.1');
 
 /*
 |--------------------------------------------------------------------------
@@ -3615,7 +3615,9 @@ function rolesCheckHostEnvironmentValues(Host $env): array
     $output = transferRun($env, sprintf(
         'grep -E %s %s 2>/dev/null | sed %s || true',
         escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE)[[:space:]]*='),
-        escapeshellarg(transferResolve($env, '{{deploy_path}}/shared/.env')),
+        // transferResolvePath() et non transferResolve() : un deploy_path en « ~/ » (courant
+        // sur les mutualisés) ne serait pas développé entre guillemets simples.
+        escapeshellarg(transferResolvePath($env, '{{deploy_path}}/shared/.env')),
         escapeshellarg('s/^/+dep-env:/'),
     ));
 
