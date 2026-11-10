@@ -6,16 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4+ et 8 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus des tâches greffées sur `dep deploy` : `build:check` et `roles:check` avant `deploy`, `db:backup` avant `deploy:symlink`, `wp:update-db` et `roles:status` à `deploy:success`. Les deux tâches `roles:*` ne servent qu'aux projets dotés du mu-plugin `adeliom-roles` et sont inertes ailleurs.
 
-Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de suite de tests, pas de linter configuré.
+Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de linter configuré. Les fonctions pures de `roles:check` (lecture de `roles.php`, validation de la déclaration, type d'environnement, comparaison des rôles) ont une suite de tests sans dépendance, `tests/run.php`, lancée par GitHub Actions (`.github/workflows/tests.yml`) sur PHP 7.4 à 8.4 à chaque push sur `main` et à chaque PR.
 
 ## Commandes
 
 ```bash
-php -l recipe/horizon-transfer.php   # seule vérification automatisable localement
+php -l recipe/horizon-transfer.php
+php tests/run.php                    # tests de roles:check (fonctions extraites du recipe, sans Deployer)
 composer validate
 ```
 
-La validation réelle se fait **depuis un projet Horizon consommateur** : y déclarer le dépôt en `repositories` (type `path` vers ce clone pendant le développement), puis exécuter les tâches (`dep db:push --from=… --to=…`). Les chemins de code les plus fragiles — parsing de la progression `rsync`, propagation des codes de sortie, résolution des symlinks — ne sont observables que là.
+`tests/run.php` extrait les fonctions par leur nom (`^function nom(` … `^}`) : une fonction renommée ou supprimée fait échouer la suite, qu'il faut alors mettre à jour. Tout nouveau code pur de `roles:*` y ajoute ses cas. Les fixtures sont fictives (dépôt public : aucune donnée de client).
+
+Le reste de la validation se fait **depuis un projet Horizon consommateur** : y déclarer le dépôt en `repositories` (type `path` vers ce clone pendant le développement), puis exécuter les tâches (`dep db:push --from=… --to=…`). Les chemins de code les plus fragiles — parsing de la progression `rsync`, propagation des codes de sortie, résolution des symlinks — ne sont observables que là.
 
 Ajouter `-n` pour le mode non interactif (aucune écriture n'est alors effectuée) et `-vvv` pour voir les commandes shell générées.
 

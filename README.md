@@ -768,6 +768,17 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
   tâche `fail()` ne voit pas les variables statiques de la tâche qui a échoué. La liste des
   répertoires à nettoyer est donc persistée dans `<racine projet>/.dep/transfer-state.json`.
 
+## Tests
+
+```bash
+php tests/run.php
+```
+
+Couvre les fonctions pures de `roles:check` : lecture de `roles.php` sans exécution, validation de la
+déclaration, type d'environnement et comparaison des rôles. Sans dépendance, la suite tourne aussi dans
+GitHub Actions sur PHP 7.4 à 8.4, à chaque push sur `main` et à chaque pull request. Les tâches de
+transfert et de déploiement se valident depuis un projet Horizon.
+
 ## Licence
 
 MIT
