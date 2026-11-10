@@ -3169,45 +3169,207 @@ function rolesCheckWarnLegacy(): void
 }
 
 /**
- * Le contenu est-il un pur fichier de données : un seul `return` d'un tableau littéral
- * (commentaires, array() ou [], chaînes sans interpolation, nombres, true, false, null) ?
- * Contrôlé avant tout require : un fichier qui contient du code n'est jamais exécuté.
- * Même règle que scripts/check-fingerprint.php du skill wordpress-remplacer-ure.
+ * Lit une déclaration adeliom-roles/roles.php comme des données, SANS JAMAIS L'EXÉCUTER.
+ *
+ * Le fichier n'est ni inclus ni évalué : la valeur est reconstruite par un petit
+ * analyseur de littéraux posé sur token_get_all(). Grammaire acceptée, rien d'autre :
+ * `<?php`, puis `return`, une valeur, `;` et la fin du fichier (espaces et commentaires
+ * permis partout). Une valeur est `array(…)` ou `[…]` (éléments `valeur` ou
+ * `clé => valeur` séparés par des virgules, virgule finale permise, clé chaîne ou
+ * entier), une chaîne entre apostrophes ou guillemets sans interpolation, un entier
+ * décimal (avec `-` éventuel), `true`, `false` ou `null`. Tout autre jeton (appel,
+ * constante, `new`, heredoc, interpolation, accolades, backticks…) : refus.
+ *
+ * @throws \RuntimeException si le contenu sort de cette grammaire
+ * @return mixed
  */
-function rolesCheckIsPureData(string $content): bool
+function rolesCheckParseData(string $content)
 {
-    $allowed = [T_OPEN_TAG, T_WHITESPACE, T_COMMENT, T_DOC_COMMENT, T_RETURN, T_ARRAY, T_CONSTANT_ENCAPSED_STRING, T_LNUMBER, T_DNUMBER, T_DOUBLE_ARROW];
-    $returns = 0;
+    $tokens = [];
 
     foreach (token_get_all($content) as $token) {
-        if (is_array($token)) {
-            if ($token[0] === T_RETURN) {
-                $returns++;
+        if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+
+        $tokens[] = $token;
+    }
+
+    $fail = static function (string $why): \RuntimeException {
+        return new \RuntimeException("Déclaration adeliom-roles/roles.php refusée, jamais exécutée : $why. Seul un pur fichier de données est lu (return d'un tableau littéral).");
+    };
+    $is = static function ($token, $type): bool {
+        return is_array($token) ? $token[0] === $type : $token === $type;
+    };
+
+    if (!isset($tokens[0]) || !$is($tokens[0], T_OPEN_TAG) || !isset($tokens[1]) || !$is($tokens[1], T_RETURN)) {
+        throw $fail('le fichier doit commencer par <?php puis return');
+    }
+
+    $i = 2;
+    $value = rolesCheckParseValue($tokens, $i, $fail, 0);
+
+    if (!isset($tokens[$i]) || !$is($tokens[$i], ';') || isset($tokens[$i + 1])) {
+        throw $fail('rien n\'est permis après la valeur renvoyée, hormis « ; »');
+    }
+
+    return $value;
+}
+
+/**
+ * Une valeur littérale à la position $i (avancée au-delà). Voir rolesCheckParseData().
+ *
+ * @return mixed
+ */
+function rolesCheckParseValue(array $tokens, int &$i, callable $fail, int $depth)
+{
+    if ($depth > 32) {
+        throw $fail('tableaux trop imbriqués');
+    }
+
+    $token = $tokens[$i] ?? null;
+
+    if ($token === null) {
+        throw $fail('fin de fichier inattendue');
+    }
+
+    if ($token === '[' || (is_array($token) && $token[0] === T_ARRAY)) {
+        if ($token !== '[') {
+            $i++;
+
+            if (($tokens[$i] ?? null) !== '(') {
+                throw $fail('« array » doit être suivi de « ( »');
+            }
+        }
+
+        $close = $token === '[' ? ']' : ')';
+        $i++;
+        $result = [];
+
+        while (($tokens[$i] ?? null) !== $close) {
+            $item = rolesCheckParseValue($tokens, $i, $fail, $depth + 1);
+
+            if (is_array($tokens[$i] ?? null) && $tokens[$i][0] === T_DOUBLE_ARROW) {
+                if (!is_string($item) && !is_int($item)) {
+                    throw $fail('une clé de tableau doit être une chaîne ou un entier');
+                }
+
+                $i++;
+                $result[$item] = rolesCheckParseValue($tokens, $i, $fail, $depth + 1);
+            } else {
+                $result[] = $item;
             }
 
-            if ($token[0] === T_STRING && in_array(strtolower($token[1]), ['true', 'false', 'null'], true)) {
-                continue;
+            if (($tokens[$i] ?? null) === ',') {
+                $i++;
+            } elseif (($tokens[$i] ?? null) !== $close) {
+                throw $fail("« , » ou « $close » attendu dans un tableau");
             }
+        }
 
-            if (!in_array($token[0], $allowed, true)) {
-                return false;
-            }
-        } elseif (!in_array($token, ['(', ')', '[', ']', ',', ';', '-'], true)) {
-            return false;
+        $i++;
+
+        return $result;
+    }
+
+    $negative = false;
+
+    if ($token === '-') {
+        $negative = true;
+        $token = $tokens[++$i] ?? null;
+
+        if (!is_array($token) || $token[0] !== T_LNUMBER) {
+            throw $fail('« - » doit précéder un entier');
         }
     }
 
-    return $returns === 1;
+    if (is_array($token) && $token[0] === T_LNUMBER) {
+        if (preg_match('/^(0|[1-9][0-9]*)$/', $token[1]) !== 1 || strlen($token[1]) > 18) {
+            throw $fail('seuls les entiers décimaux sont permis (' . $token[1] . ')');
+        }
+
+        $i++;
+
+        return $negative ? -(int) $token[1] : (int) $token[1];
+    }
+
+    if (is_array($token) && $token[0] === T_CONSTANT_ENCAPSED_STRING) {
+        $i++;
+
+        return rolesCheckUnquote($token[1]);
+    }
+
+    if (is_array($token) && $token[0] === T_STRING) {
+        $word = strtolower($token[1]);
+        $words = ['true' => true, 'false' => false, 'null' => null];
+
+        if (array_key_exists($word, $words)) {
+            $i++;
+
+            return $words[$word];
+        }
+    }
+
+    throw $fail('jeton non permis « ' . (is_array($token) ? token_name($token[0]) . ' ' . $token[1] : $token) . ' »');
+}
+
+/**
+ * Valeur d'une chaîne PHP littérale sans interpolation (T_CONSTANT_ENCAPSED_STRING), avec
+ * les séquences d'échappement de PHP : entre apostrophes `\\` et `\'` seulement ; entre
+ * guillemets `\n \t \r \v \e \f \\ \$ \"`, octal, `\x`, `\u{…}`, toute autre séquence
+ * gardée telle quelle.
+ */
+function rolesCheckUnquote(string $literal): string
+{
+    $quote = $literal[0];
+    $body = substr($literal, 1, -1);
+
+    if ($quote === "'") {
+        return (string) preg_replace('/\\\\([\\\\\'])/', '$1', $body);
+    }
+
+    return (string) preg_replace_callback(
+        '/\\\\(?:([ntrvef\\\\$"])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([0-9A-Fa-f]+)\})/',
+        static function (array $m): string {
+            if (isset($m[1]) && $m[1] !== '') {
+                return ['n' => "\n", 't' => "\t", 'r' => "\r", 'v' => "\v", 'e' => "\e", 'f' => "\f", '\\' => '\\', '$' => '$', '"' => '"'][$m[1]];
+            }
+
+            if (isset($m[2]) && $m[2] !== '') {
+                return chr(octdec($m[2]) & 0xFF);
+            }
+
+            if (isset($m[3]) && $m[3] !== '') {
+                return chr(hexdec($m[3]));
+            }
+
+            $code = (int) hexdec($m[4]);
+
+            if ($code < 0x80) {
+                return chr($code);
+            }
+
+            if ($code < 0x800) {
+                return chr(0xC0 | ($code >> 6)) . chr(0x80 | ($code & 0x3F));
+            }
+
+            if ($code < 0x10000) {
+                return chr(0xE0 | ($code >> 12)) . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+            }
+
+            return chr(0xF0 | ($code >> 18)) . chr(0x80 | (($code >> 12) & 0x3F)) . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+        },
+        $body,
+    );
 }
 
 /**
  * Empreinte attendue (clé « expected ») de la déclaration adeliom-roles/roles.php.
  *
- * roles.php est un pur fichier de données (`return array(...)`) : il est contrôlé jeton
- * par jeton (rolesCheckIsPureData()), puis seulement lu par require dans le processus de
- * Deployer, sans WordPress ni moteur du mu-plugin. Un fichier qui contient du code (ou
- * l'ancien mu-plugin d'un seul fichier) n'est jamais exécuté : exception, donc un
- * avertissement et pas de contrôle.
+ * roles.php est un pur fichier de données (`return array(...)`) : il n'est jamais inclus
+ * ni exécuté, sa valeur est reconstruite par rolesCheckParseData() à partir du contenu
+ * lu une seule fois. Un fichier qui sort de la grammaire des littéraux (code, ancien
+ * mu-plugin d'un seul fichier) lève une exception : un avertissement, pas de contrôle.
  *
  * @return ?array{roles: string[], caps: array<string, array<string, ?bool>>} null si la
  *         déclaration ne contient pas d'empreinte.
@@ -3224,13 +3386,7 @@ function rolesCheckExpected(string $file): ?array
         throw new \RuntimeException('Déclaration au format de l\'ancien mu-plugin adeliom-roles d\'un seul fichier (moteur 1.x) : le migrer vers la structure en classes (skill wordpress-remplacer-ure).');
     }
 
-    if (!rolesCheckIsPureData($content)) {
-        throw new \RuntimeException('Déclaration adeliom-roles/roles.php non exécutée : ce n\'est pas un pur fichier de données (un seul return array(...), sans code).');
-    }
-
-    $declaration = (static function (string $path) {
-        return require $path;
-    })($file);
+    $declaration = rolesCheckParseData($content);
 
     if (!is_array($declaration)) {
         throw new \RuntimeException('Déclaration adeliom-roles/roles.php invalide : elle doit renvoyer un tableau.');
@@ -3322,10 +3478,12 @@ function rolesCheckHostEnvironmentValues(Host $env): array
 
 /**
  * Type d'environnement WordPress déduit des variables du .env, comme Bedrock puis
- * wp_get_environment_type() : WP_ENVIRONMENT_TYPE s'il est valide, sinon WP_ENV s'il est
- * valide, sinon `production` (valeur vide ou non standard comprise : une « preprod »
- * tourne en production pour WordPress). C'est ce type qui décide si le mu-plugin contrôle
- * l'empreinte, pas l'alias de l'hôte. Fonction pure.
+ * wp_get_environment_type() : un WP_ENVIRONMENT_TYPE non vide l'emporte (Bedrock n'infère
+ * alors rien de WP_ENV) et vaut `production` s'il n'est pas valide, comme dans WordPress ;
+ * sinon WP_ENV s'il est valide ; sinon `production` (WP_ENV vide ou non standard : une
+ * « preprod » tourne en production pour WordPress). Valides : production, staging,
+ * development, local. C'est ce type qui décide si le mu-plugin contrôle l'empreinte, pas
+ * l'alias de l'hôte. Fonction pure.
  *
  * @param array<string, string> $values sortie de rolesCheckHostEnvironmentValues()
  * @return ?string null si aucune des deux variables n'existe (fichier absent, site non
@@ -3339,13 +3497,11 @@ function rolesCheckEnvironmentType(array $values): ?string
 
     $types = ['production', 'staging', 'development', 'local'];
 
-    foreach (['WP_ENVIRONMENT_TYPE', 'WP_ENV'] as $name) {
-        if (isset($values[$name]) && in_array($values[$name], $types, true)) {
-            return $values[$name];
-        }
+    if (($values['WP_ENVIRONMENT_TYPE'] ?? '') !== '') {
+        return in_array($values['WP_ENVIRONMENT_TYPE'], $types, true) ? $values['WP_ENVIRONMENT_TYPE'] : 'production';
     }
 
-    return 'production';
+    return in_array($values['WP_ENV'] ?? '', $types, true) ? $values['WP_ENV'] : 'production';
 }
 
 /**
@@ -3395,7 +3551,7 @@ function rolesCheckHostRoles(Host $env): array
 
 /**
  * Écarts entre l'empreinte attendue et les rôles de l'hôte, avec la sémantique exacte
- * du mu-plugin (adeliom_roles_snapshot() puis adeliom_roles_diff()) : liste triée de
+ * du moteur 2.x du mu-plugin (Fingerprint::snapshot() puis Fingerprint::diff()) : liste triée de
  * tous les rôles, et pour chaque rôle surveillé ses seules caps surveillées, une cap
  * absente valant null. Une cap ajoutée par un plugin et non surveillée n'est donc
  * jamais un écart.
@@ -3473,14 +3629,17 @@ task('roles:check', static function (): void {
 
     // Valeur vide ou non standard (WP_ENV=preprod) : WordPress tourne en production,
     // comme le décident Bedrock (WP_ENV vide = production) puis wp_get_environment_type().
-    if ($type === 'production' && !in_array('production', $values, true)) {
-        $found = [];
+    if ($type === 'production') {
+        $name = ($values['WP_ENVIRONMENT_TYPE'] ?? '') !== '' ? 'WP_ENVIRONMENT_TYPE' : 'WP_ENV';
+        $value = $values[$name] ?? '';
 
-        foreach ($values as $name => $value) {
-            $found[] = $value === '' ? "$name vide" : "$name « $value »";
+        if ($value !== 'production') {
+            info(sprintf(
+                '   %s dans shared/.env de « %s » : valeur vide ou non standard, WordPress tourne en production. Empreinte contrôlée.',
+                $value === '' ? "$name vide" : "$name « $value »",
+                $label,
+            ));
         }
-
-        info('   ' . implode(', ', $found) . " dans shared/.env de « $label » : valeur vide ou non standard, WordPress tourne en production. Empreinte contrôlée.");
     }
 
     if ($type === null) {

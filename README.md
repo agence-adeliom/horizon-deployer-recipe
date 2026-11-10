@@ -310,11 +310,12 @@ structure en classes.
 
 - elle ne contrôle que la **production**, au sens du mu-plugin (`wp_get_environment_type()`,
   que Bedrock déduit de `WP_ENV`) : elle lit `{{deploy_path}}/shared/.env` sur l'hôte, en
-  lecture seule, et normalise comme Bedrock puis WordPress : `WP_ENVIRONMENT_TYPE` s'il vaut
-  `production`, `staging`, `development` ou `local` ; sinon `WP_ENV` s'il prend l'une de ces
-  quatre valeurs ; sinon `production`, valeur vide ou non standard comprise (Bedrock fait
-  d'un `WP_ENV` vide la production, et `wp_get_environment_type()` ramène toute valeur
-  inconnue à `production`). Seul le type `production` est contrôlé. L'alias ne compte pas :
+  lecture seule, et normalise comme Bedrock puis WordPress : un `WP_ENVIRONMENT_TYPE` non
+  vide l'emporte (Bedrock n'infère alors rien de `WP_ENV`), et vaut `production` s'il ne
+  fait pas partie de `production`, `staging`, `development`, `local` ; sinon `WP_ENV` s'il
+  prend l'une de ces quatre valeurs ; sinon `production`, valeur vide ou non standard
+  comprise (Bedrock fait d'un `WP_ENV` vide la production, et `wp_get_environment_type()`
+  ramène toute valeur inconnue à `production`). Seul le type `production` est contrôlé. L'alias ne compte pas :
   une `preprod` en `WP_ENV=staging` n'est pas contrôlée, une production nommée `live`
   l'est, et un `WP_ENV=preprod` l'est aussi (WordPress y tourne en production), avec une
   ligne d'information. Si aucune des deux variables n'existe dans le fichier (site non
@@ -325,11 +326,15 @@ structure en classes.
   `applied_version`, les rôles ont été synchronisés et l'empreinte n'est plus contrôlée,
   comme dans le mu-plugin. Une ligne d'information, rien d'autre ;
 - sinon elle compare les rôles de l'hôte (option `<préfixe>user_roles`) à l'empreinte
-  `expected` de `adeliom-roles/roles.php`, lue en local comme un pur fichier de données :
-  le fichier est d'abord contrôlé jeton par jeton (un seul `return` d'un tableau littéral,
-  chaînes sans interpolation, nombres, `true`, `false`, `null`, commentaires), puis
-  seulement lu, sans WordPress ni moteur du mu-plugin. Un fichier qui contient du code
-  n'est **jamais exécuté** : avertissement, pas de contrôle, le déploiement continue. La
+  `expected` de `adeliom-roles/roles.php`, lue en local comme un pur fichier de données.
+  **Le fichier n'est jamais inclus ni exécuté** : un analyseur de littéraux posé sur
+  `token_get_all()` reconstruit la valeur à partir du texte lu. Seule cette forme passe :
+  `<?php`, `return`, une valeur, `;`, fin du fichier (espaces et commentaires permis). Une
+  valeur est `array(…)` ou `[…]` (éléments `valeur` ou `clé => valeur`, clé chaîne ou
+  entier), une chaîne entre apostrophes ou guillemets sans interpolation, un entier
+  décimal, `true`, `false` ou `null`. Tout autre jeton (appel de fonction, même
+  `'f'(…)`, constante, `new`, heredoc, interpolation, backticks, opérateur…) fait refuser
+  le fichier : avertissement, pas de contrôle, le déploiement continue. La
   déclaration est lue telle qu'au
   commit `HEAD` (`git show HEAD:<fichier>` vers un fichier temporaire), celui que
   `build:check` compare à la cible déployée : une modification non commitée n'y change
@@ -747,9 +752,10 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
   d'environnement dans `shared/.env` de l'hôte et le normalise comme Bedrock puis
   `wp_get_environment_type()` (valeur vide ou non standard = `production`), et ne retombe
   sur `transfer_protected` que si ni `WP_ENVIRONMENT_TYPE` ni `WP_ENV` n'y figurent.
-- **Déclaration lue comme des données.** `adeliom-roles/roles.php` n'est lu qu'après un
-  contrôle de ses jetons PHP (`token_get_all()`) : seul un `return` de tableau littéral
-  passe, aucun code du projet ne s'exécute dans Deployer.
+- **Déclaration lue comme des données, jamais exécutée.** `adeliom-roles/roles.php` n'est
+  ni inclus ni évalué : sa valeur est reconstruite par un analyseur de littéraux sur
+  `token_get_all()`, qui refuse tout ce qui n'est pas tableau, chaîne sans interpolation,
+  entier, `true`, `false` ou `null`. Aucun code du projet ne s'exécute dans Deployer.
 - **Présence de `wp adeliom-roles`.** `roles:status` teste la présence du chargeur du mu-plugin dans la
   release en ligne, et non `wp cli cmd-dump` : cette commande tourne avant le chargement de
   WordPress et ne voit jamais une commande déclarée par un mu-plugin.
