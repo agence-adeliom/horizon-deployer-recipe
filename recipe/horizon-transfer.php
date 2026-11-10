@@ -11,8 +11,8 @@
 |
 |   dep db:pull       <hôte>                  distant → local
 |   dep uploads:pull  <hôte>                  distant → local
-|   dep db:push       --from=X --to=Y         local|distant → distant
-|   dep uploads:push  --from=X --to=Y         local|distant → distant
+|   dep db:push       <hôte> --from=X         local|distant → distant
+|   dep uploads:push  <hôte> --from=X         local|distant → distant
 |
 | --from / --to sont facultatifs : ils sont demandés interactivement si absents.
 | La destination d'un push est toujours un environnement distant ; pour rapatrier
@@ -690,8 +690,11 @@ function transferRsyncCommand(?Host $from, string $fromPath, ?Host $to, string $
     if ($sshHost !== null) {
         // rsync retire les quotes en découpant la valeur de -e : les options de
         // connexion calculées par Deployer sont réutilisables telles quelles.
+        // Deployer 8 a renommé connectionOptionsArray() en connectionOptions().
         $options[] = '-e';
-        $options[] = 'ssh ' . implode(' ', $sshHost->connectionOptionsArray());
+        $options[] = 'ssh ' . implode(' ', method_exists($sshHost, 'connectionOptions')
+            ? $sshHost->connectionOptions()
+            : $sshHost->connectionOptionsArray());
     }
 
     $command = 'rsync ' . implode(' ', array_map('escapeshellarg', $options))
@@ -1511,9 +1514,12 @@ function transferMultisiteTarget(
     $choices = array_values(array_diff($candidates ?: $hostnames, $taken));
 
     if ($env === null && $choices !== []) {
+        // Choix indexés par leur valeur, comme les autres questions : askChoice() attend
+        // une clé pour défaut, et renvoie alors la même chose en interactif et en « quiet ».
+        // Un hostname contient toujours un point : il ne peut pas valoir $skip.
         $answer = transferChoice(
             sprintf('Domaine local pour « %s »%s ?', $domain, $blogId !== null ? " (blog $blogId)" : ''),
-            array_merge([$skip], $choices),
+            [$skip => $skip] + array_combine($choices, $choices),
             $skip,
         );
 
@@ -1965,6 +1971,20 @@ function transferRotateBackups(Host $env, int $keep): array
 function transferBackupWithRelease(Host $env): void
 {
     $label = $env->getAlias();
+    $online = false;
+
+    // Premier déploiement : sans release en ligne, il n'y a ni WordPress à dumper ni
+    // {{current_path}} où lancer WP-CLI (transferWpRun() s'y place et échouerait).
+    on($env, static function () use (&$online): void {
+        $online = test('[ -d {{current_path}} ]');
+    });
+
+    if (!$online) {
+        warning("Pas de sauvegarde de « $label » : aucune release en ligne (premier déploiement).");
+
+        return;
+    }
+
     [$release, $upcoming] = transferBackupRelease($env);
 
     $name = sprintf(
@@ -2669,7 +2689,7 @@ task('uploads:pull', static function (): void {
     info("✅ Uploads récupérés dans <comment>./$uploads</comment>");
 });
 
-desc('Copie la base d\'un environnement vers un autre : dep db:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');
+desc('Copie la base d\'un environnement vers un autre : dep db:push staging --from=production (le sélecteur d\'hôte est la destination)');
 task('db:push', static function (): void {
     transferResetState();
     [$from, $to] = transferSelectEnvs('la base de données');
@@ -2709,7 +2729,7 @@ task('db:push', static function (): void {
     transferImportHooks($to, 'transfer_after_import', false);
 })->once();
 
-desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');
+desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push staging --from=production (le sélecteur d\'hôte est la destination)');
 task('uploads:push', static function (): void {
     transferResetState();
     [$from, $to] = transferSelectEnvs('les uploads');
@@ -2762,8 +2782,39 @@ task('uploads:push', static function (): void {
     $source = rtrim($sourcePath, '/') . '/';
     $target = rtrim($targetPath, '/') . '/';
 
+    // rsync n'accepte qu'une extrémité distante : entre deux serveurs, le transit passe
+    // par la machine locale, et la simulation se fait donc entre la copie locale et la
+    // destination. La copie précède la simulation : elle n'écrit qu'en local.
+    $transit = $from !== null && !transferSameServer($from, $to);
+    $syncFrom = $from;
+    $syncSource = $source;
+
+    if ($transit) {
+        // C'est le disque de qui lance la tâche qui se remplit, ce qui n'a rien
+        // d'évident : d'où la confirmation, demandée avant transferWorkdir() pour
+        // qu'un refus ne laisse aucun répertoire derrière lui.
+        info(sprintf(
+            '⚠️  Serveurs distincts : le transit passe par cette machine, dans <comment>%s</comment>,',
+            get('transfer_local_tmp_dir'),
+        ));
+        info(sprintf('   qui recevra jusqu\'à <comment>%s</comment> le temps du transfert.', $sourceSize));
+
+        if (!transferConfirmDiskUsage('Copier les uploads en local pour le transit ?', $sourceSize)) {
+            info('Abandon : aucune modification, ni en local ni à la destination.');
+            invoke('transfer:cleanup');
+
+            return;
+        }
+
+        $syncFrom = null;
+        $syncSource = transferWorkdir(null) . '/uploads/';
+        info(sprintf('🚚 Serveurs distincts : <comment>%s</comment> → local...', transferEnvLabel($from)));
+        runLocally('mkdir -p ' . escapeshellarg($syncSource));
+        transferRsync($from, $source, null, $syncSource, ['--delete']);
+    }
+
     info('🔍 Simulation avant écriture (aucune modification, progression ci-dessous)...');
-    $preview = transferRsyncPreview($from, $source, $to, $target, $options, (int) $sourceCount);
+    $preview = transferRsyncPreview($syncFrom, $syncSource, $to, $target, $options, (int) $sourceCount);
 
     if ($preview['transfer'] === 0 && $preview['delete'] === 0) {
         info('✅ Rien à faire : la destination est déjà conforme à la source.');
@@ -2780,38 +2831,18 @@ task('uploads:push', static function (): void {
 
     if (!transferConfirmDestination($to)) {
         info('Abandon, aucune modification.');
+        invoke('transfer:cleanup');
 
         return;
     }
 
-    if ($from !== null && !transferSameServer($from, $to)) {
-        // rsync n'accepte qu'une extrémité distante : entre deux serveurs, le transit
-        // passe par la machine locale. C'est donc le disque de qui lance la tâche qui
-        // se remplit, ce qui n'a rien d'évident — d'où la confirmation, demandée avant
-        // transferWorkdir() pour qu'un refus ne laisse aucun répertoire derrière lui.
-        info(sprintf(
-            '⚠️  Serveurs distincts : le transit passe par cette machine, dans <comment>%s</comment>,',
-            get('transfer_local_tmp_dir'),
-        ));
-        info(sprintf('   qui recevra jusqu\'à <comment>%s</comment> le temps du transfert.', $sourceSize));
-
-        if (!transferConfirmDiskUsage('Copier les uploads en local pour le transit ?', $sourceSize)) {
-            info('Abandon : aucune modification, ni en local ni à la destination.');
-            invoke('transfer:cleanup');
-
-            return;
-        }
-
-        $staging = transferWorkdir(null) . '/uploads/';
-        info(sprintf('🚚 Serveurs distincts : <comment>%s</comment> → local...', transferEnvLabel($from)));
-        runLocally('mkdir -p ' . escapeshellarg($staging));
-        transferRsync($from, $source, null, $staging, ['--delete']);
+    if ($transit) {
         info(sprintf('🚚 local → <comment>%s</comment>...', $to->getAlias()));
-        transferRsync(null, $staging, $to, $target, $options);
     } else {
         info('🚚 Synchronisation...');
-        transferRsync($from, $source, $to, $target, $options);
     }
+
+    transferRsync($syncFrom, $syncSource, $to, $target, $options);
 
     invoke('transfer:cleanup');
 
