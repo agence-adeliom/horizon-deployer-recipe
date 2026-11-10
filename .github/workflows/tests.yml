@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unitaires:
+    name: Unitaires, PHP ${{ matrix.php }}, Deployer ${{ matrix.deployer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { php: '7.4', deployer: '^7.4' }
+          - { php: '8.0', deployer: '^7.4' }
+          - { php: '8.1', deployer: '^7.4' }
+          - { php: '8.2', deployer: '^7.4' }
+          - { php: '8.3', deployer: '^7.4' }
+          - { php: '8.4', deployer: '^7.4' }
+          # Deployer 8 exige PHP 8.3 ou plus.
+          - { php: '8.3', deployer: '^8.0' }
+          - { php: '8.4', deployer: '^8.0' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      # rsync 3 et git servent aux cas exécutés pour de vrai entre dossiers temporaires.
+      - name: Outils
+        run: |
+          command -v rsync >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq rsync)
+          rsync --version | head -1
+          git --version
+
+      - name: Deployer ${{ matrix.deployer }}
+        run: composer update --no-interaction --no-progress --prefer-dist --with "deployer/deployer:${{ matrix.deployer }}"
+
+      - name: Syntaxe
+        run: for f in recipe/*.php tests/run.php tests/unit/*.php tests/fixtures/*.php; do php -l "$f" || exit 1; done
+
+      - name: Tests unitaires
+        run: php tests/run.php

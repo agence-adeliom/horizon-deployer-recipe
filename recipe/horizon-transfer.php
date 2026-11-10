@@ -11,8 +11,8 @@
 |
 |   dep db:pull       <hôte>                  distant → local
 |   dep uploads:pull  <hôte>                  distant → local
-|   dep db:push       --from=X --to=Y         local|distant → distant
-|   dep uploads:push  --from=X --to=Y         local|distant → distant
+|   dep db:push       <hôte> --from=X         local|distant → distant
+|   dep uploads:push  <hôte> --from=X         local|distant → distant
 |
 | --from / --to sont facultatifs : ils sont demandés interactivement si absents.
 | La destination d'un push est toujours un environnement distant ; pour rapatrier
@@ -32,6 +32,10 @@
 |    {{transfer_backup_dir}} ;
 |  - chaque `dep deploy` vérifie d'abord que le code local, d'où sont buildés les
 |    assets, est exactement le commit déployé (build:check) ;
+|  - pour un projet doté du mu-plugin adeliom-roles seulement, chaque `dep deploy`
+|    vers la production (type d'environnement lu dans shared/.env comme le fait
+|    Bedrock, à défaut un hôte protégé) contrôle les rôles avant leur première
+|    synchro (roles:check), puis affiche l'état de la synchro (roles:status) ;
 |  - chaque `dep deploy` dumpe la base juste avant la bascule du symlink, dans le
 |    même dossier, en ne gardant que les {{transfer_backup_keep}} derniers dumps de
 |    déploiement (`dep db:backup <hôte>` pour en faire un à la main) ;
@@ -45,13 +49,14 @@ namespace Deployer;
 use Deployer\Host\Host;
 use Deployer\Host\Localhost;
 use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 
 // À inclure avec require_once. Aucun garde runtime ne peut protéger d'un double
 // `require` : PHP déclare les fonctions d'un fichier inclus dès sa compilation,
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.8.1');
+define('HORIZON_TRANSFER_RECIPE', '1.9.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -179,6 +184,25 @@ set('transfer_backup_keep', 10);
 // sortie du déploiement sans rien demander de faire à ce moment-là. Les erreurs et
 // avertissements restent affichés. '' pour garder la configuration PHP du serveur.
 set('transfer_wp_php_args', "-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'");
+
+// Contrôle des rôles du mu-plugin adeliom-roles : roles:check avant `deploy` (production
+// seulement, au sens de WordPress : type d'environnement lu dans shared/.env comme le fait
+// Bedrock, à défaut hôte protégé), roles:status après. Sans ce mu-plugin dans le projet, les
+// deux tâches ne font rien, sans aucun appel au serveur. À passer à false pour s'en passer.
+set('roles_check', true);
+
+// Déclaration du mu-plugin adeliom-roles (roles.php, pur fichier de données, à côté du
+// chargeur adeliom-roles.php), relative à la racine du projet (ou absolue) : celle de
+// Bedrock par défaut, celle d'un WordPress classique si elle est la seule présente.
+set('roles_check_file', static function (): string {
+    foreach (['web/app/mu-plugins/adeliom-roles/roles.php', 'wp-content/mu-plugins/adeliom-roles/roles.php'] as $path) {
+        if (is_file(transferProjectRoot() . '/' . $path)) {
+            return $path;
+        }
+    }
+
+    return 'web/app/mu-plugins/adeliom-roles/roles.php';
+});
 
 // WP-CLI distant, installé à la demande s'il n'est pas disponible. Défini ici pour
 // que le recipe soit autonome ; un projet qui définit son propre `bin/wp` après le
@@ -666,8 +690,11 @@ function transferRsyncCommand(?Host $from, string $fromPath, ?Host $to, string $
     if ($sshHost !== null) {
         // rsync retire les quotes en découpant la valeur de -e : les options de
         // connexion calculées par Deployer sont réutilisables telles quelles.
+        // Deployer 8 a renommé connectionOptionsArray() en connectionOptions().
         $options[] = '-e';
-        $options[] = 'ssh ' . implode(' ', $sshHost->connectionOptionsArray());
+        $options[] = 'ssh ' . implode(' ', method_exists($sshHost, 'connectionOptions')
+            ? $sshHost->connectionOptions()
+            : $sshHost->connectionOptionsArray());
     }
 
     $command = 'rsync ' . implode(' ', array_map('escapeshellarg', $options))
@@ -1487,9 +1514,12 @@ function transferMultisiteTarget(
     $choices = array_values(array_diff($candidates ?: $hostnames, $taken));
 
     if ($env === null && $choices !== []) {
+        // Choix indexés par leur valeur, comme les autres questions : askChoice() attend
+        // une clé pour défaut, et renvoie alors la même chose en interactif et en « quiet ».
+        // Un hostname contient toujours un point : il ne peut pas valoir $skip.
         $answer = transferChoice(
             sprintf('Domaine local pour « %s »%s ?', $domain, $blogId !== null ? " (blog $blogId)" : ''),
-            array_merge([$skip], $choices),
+            [$skip => $skip] + array_combine($choices, $choices),
             $skip,
         );
 
@@ -1941,6 +1971,20 @@ function transferRotateBackups(Host $env, int $keep): array
 function transferBackupWithRelease(Host $env): void
 {
     $label = $env->getAlias();
+    $online = false;
+
+    // Premier déploiement : sans release en ligne, il n'y a ni WordPress à dumper ni
+    // {{current_path}} où lancer WP-CLI (transferWpRun() s'y place et échouerait).
+    on($env, static function () use (&$online): void {
+        $online = test('[ -d {{current_path}} ]');
+    });
+
+    if (!$online) {
+        warning("Pas de sauvegarde de « $label » : aucune release en ligne (premier déploiement).");
+
+        return;
+    }
+
     [$release, $upcoming] = transferBackupRelease($env);
 
     $name = sprintf(
@@ -2645,7 +2689,7 @@ task('uploads:pull', static function (): void {
     info("✅ Uploads récupérés dans <comment>./$uploads</comment>");
 });
 
-desc('Copie la base d\'un environnement vers un autre : dep db:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');
+desc('Copie la base d\'un environnement vers un autre : dep db:push staging --from=production (le sélecteur d\'hôte est la destination)');
 task('db:push', static function (): void {
     transferResetState();
     [$from, $to] = transferSelectEnvs('la base de données');
@@ -2685,7 +2729,7 @@ task('db:push', static function (): void {
     transferImportHooks($to, 'transfer_after_import', false);
 })->once();
 
-desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push --from=production --to=staging (le sélecteur d\'hôte fait office de destination si --to est omis)');
+desc('Copie les uploads d\'un environnement vers un autre : dep uploads:push staging --from=production (le sélecteur d\'hôte est la destination)');
 task('uploads:push', static function (): void {
     transferResetState();
     [$from, $to] = transferSelectEnvs('les uploads');
@@ -2738,8 +2782,39 @@ task('uploads:push', static function (): void {
     $source = rtrim($sourcePath, '/') . '/';
     $target = rtrim($targetPath, '/') . '/';
 
+    // rsync n'accepte qu'une extrémité distante : entre deux serveurs, le transit passe
+    // par la machine locale, et la simulation se fait donc entre la copie locale et la
+    // destination. La copie précède la simulation : elle n'écrit qu'en local.
+    $transit = $from !== null && !transferSameServer($from, $to);
+    $syncFrom = $from;
+    $syncSource = $source;
+
+    if ($transit) {
+        // C'est le disque de qui lance la tâche qui se remplit, ce qui n'a rien
+        // d'évident : d'où la confirmation, demandée avant transferWorkdir() pour
+        // qu'un refus ne laisse aucun répertoire derrière lui.
+        info(sprintf(
+            '⚠️  Serveurs distincts : le transit passe par cette machine, dans <comment>%s</comment>,',
+            get('transfer_local_tmp_dir'),
+        ));
+        info(sprintf('   qui recevra jusqu\'à <comment>%s</comment> le temps du transfert.', $sourceSize));
+
+        if (!transferConfirmDiskUsage('Copier les uploads en local pour le transit ?', $sourceSize)) {
+            info('Abandon : aucune modification, ni en local ni à la destination.');
+            invoke('transfer:cleanup');
+
+            return;
+        }
+
+        $syncFrom = null;
+        $syncSource = transferWorkdir(null) . '/uploads/';
+        info(sprintf('🚚 Serveurs distincts : <comment>%s</comment> → local...', transferEnvLabel($from)));
+        runLocally('mkdir -p ' . escapeshellarg($syncSource));
+        transferRsync($from, $source, null, $syncSource, ['--delete']);
+    }
+
     info('🔍 Simulation avant écriture (aucune modification, progression ci-dessous)...');
-    $preview = transferRsyncPreview($from, $source, $to, $target, $options, (int) $sourceCount);
+    $preview = transferRsyncPreview($syncFrom, $syncSource, $to, $target, $options, (int) $sourceCount);
 
     if ($preview['transfer'] === 0 && $preview['delete'] === 0) {
         info('✅ Rien à faire : la destination est déjà conforme à la source.');
@@ -2756,38 +2831,18 @@ task('uploads:push', static function (): void {
 
     if (!transferConfirmDestination($to)) {
         info('Abandon, aucune modification.');
+        invoke('transfer:cleanup');
 
         return;
     }
 
-    if ($from !== null && !transferSameServer($from, $to)) {
-        // rsync n'accepte qu'une extrémité distante : entre deux serveurs, le transit
-        // passe par la machine locale. C'est donc le disque de qui lance la tâche qui
-        // se remplit, ce qui n'a rien d'évident — d'où la confirmation, demandée avant
-        // transferWorkdir() pour qu'un refus ne laisse aucun répertoire derrière lui.
-        info(sprintf(
-            '⚠️  Serveurs distincts : le transit passe par cette machine, dans <comment>%s</comment>,',
-            get('transfer_local_tmp_dir'),
-        ));
-        info(sprintf('   qui recevra jusqu\'à <comment>%s</comment> le temps du transfert.', $sourceSize));
-
-        if (!transferConfirmDiskUsage('Copier les uploads en local pour le transit ?', $sourceSize)) {
-            info('Abandon : aucune modification, ni en local ni à la destination.');
-            invoke('transfer:cleanup');
-
-            return;
-        }
-
-        $staging = transferWorkdir(null) . '/uploads/';
-        info(sprintf('🚚 Serveurs distincts : <comment>%s</comment> → local...', transferEnvLabel($from)));
-        runLocally('mkdir -p ' . escapeshellarg($staging));
-        transferRsync($from, $source, null, $staging, ['--delete']);
+    if ($transit) {
         info(sprintf('🚚 local → <comment>%s</comment>...', $to->getAlias()));
-        transferRsync(null, $staging, $to, $target, $options);
     } else {
         info('🚚 Synchronisation...');
-        transferRsync($from, $source, $to, $target, $options);
     }
+
+    transferRsync($syncFrom, $syncSource, $to, $target, $options);
 
     invoke('transfer:cleanup');
 
@@ -3067,17 +3122,835 @@ task('wp:update-db', static function (): void {
     info('✅ ' . ($result !== '' ? $result : "Schéma de base de « $label » mis à jour."));
 });
 
+/*
+|--------------------------------------------------------------------------
+| Rôles déclarés dans le code (mu-plugin adeliom-roles)
+|--------------------------------------------------------------------------
+|
+| Le mu-plugin adeliom-roles remplace User Role Editor : les rôles sont déclarés
+| dans le code et synchronisés au chargement de WordPress. En production, sa
+| PREMIÈRE application est conditionnée à une empreinte : si les rôles de la base
+| ont changé depuis l'audit (clé « expected » de la déclaration), rien n'est
+| appliqué et la synchro reste en attente. roles:check fait ce même contrôle avant
+| le déploiement, pour que l'écart soit vu au moment de déployer et non découvert
+| plus tard dans wp-admin.
+*/
+
+/**
+ * Chemin absolu de la déclaration du mu-plugin adeliom-roles (adeliom-roles/roles.php),
+ * ou null si le contrôle est désactivé ou le projet n'en a pas. Purement local : aucun
+ * appel au serveur, pour que les projets sans ce mu-plugin ne voient aucune différence.
+ */
+function rolesCheckLocalFile(): ?string
+{
+    if (!get('roles_check')) {
+        return null;
+    }
+
+    $file = (string) get('roles_check_file');
+    $path = $file !== '' && $file[0] === '/' ? $file : transferProjectRoot() . '/' . $file;
+
+    if ($file === '' || !is_file($path)) {
+        writeln("   Pas de mu-plugin adeliom-roles ($file) : contrôle des rôles sans objet.", OutputInterface::VERBOSITY_VERBOSE);
+
+        return null;
+    }
+
+    return $path;
+}
+
+/**
+ * Chargeur du mu-plugin (adeliom-roles.php) correspondant à une déclaration
+ * adeliom-roles/roles.php : il est à côté du dossier adeliom-roles/.
+ */
+function rolesCheckLoaderPath(string $file): string
+{
+    return dirname($file) . '.php';
+}
+
+/**
+ * Avertit, en local seulement, si le projet a encore l'ancien mu-plugin adeliom-roles
+ * d'un seul fichier (moteur 1.x) à la place de la structure en classes : sa déclaration
+ * n'est pas un pur fichier de données, les rôles ne sont donc pas contrôlés.
+ */
+function rolesCheckWarnLegacy(): void
+{
+    if (!get('roles_check')) {
+        return;
+    }
+
+    $file = (string) get('roles_check_file');
+
+    if ($file === '') {
+        return;
+    }
+
+    $path = $file[0] === '/' ? $file : transferProjectRoot() . '/' . $file;
+    $legacy = rolesCheckLoaderPath($path);
+
+    if (is_dir(dirname($path)) || !is_file($legacy)) {
+        return;
+    }
+
+    $content = (string) @file_get_contents($legacy);
+
+    if (strpos($content, 'function adeliom_roles_') !== false) {
+        warning('Ancien mu-plugin adeliom-roles d\'un seul fichier (' . rolesCheckLoaderPath($file) . ') : rôles non contrôlés. Le migrer vers la structure en classes (skill wordpress-remplacer-ure).');
+    }
+}
+
+/**
+ * Lit une déclaration adeliom-roles/roles.php comme des données, SANS JAMAIS L'EXÉCUTER.
+ *
+ * Le fichier n'est ni inclus ni évalué : la valeur est reconstruite par un petit
+ * analyseur de littéraux posé sur token_get_all(). Grammaire acceptée, rien d'autre :
+ * `<?php`, puis `return`, une valeur, `;` et la fin du fichier (espaces et commentaires
+ * permis partout). Une valeur est `array(…)` ou `[…]` (éléments `valeur` ou
+ * `clé => valeur` séparés par des virgules, virgule finale permise, clé chaîne ou
+ * entier), une chaîne entre apostrophes ou guillemets sans interpolation, un entier
+ * décimal (avec `-` éventuel), `true`, `false` ou `null`. Tout autre jeton (appel,
+ * constante, `new`, heredoc, interpolation, accolades, backticks…) : refus.
+ *
+ * @throws \RuntimeException si le contenu sort de cette grammaire
+ * @return mixed
+ */
+function rolesCheckParseData(string $content)
+{
+    $tokens = [];
+
+    foreach (token_get_all($content) as $token) {
+        if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+
+        $tokens[] = $token;
+    }
+
+    $fail = static function (string $why): \RuntimeException {
+        return new \RuntimeException("Déclaration adeliom-roles/roles.php refusée, jamais exécutée : $why. Seul un pur fichier de données est lu (return d'un tableau littéral).");
+    };
+    $is = static function ($token, $type): bool {
+        return is_array($token) ? $token[0] === $type : $token === $type;
+    };
+
+    if (!isset($tokens[0]) || !$is($tokens[0], T_OPEN_TAG) || !isset($tokens[1]) || !$is($tokens[1], T_RETURN)) {
+        throw $fail('le fichier doit commencer par <?php puis return');
+    }
+
+    $i = 2;
+    $value = rolesCheckParseValue($tokens, $i, $fail, 0);
+
+    if (!isset($tokens[$i]) || !$is($tokens[$i], ';') || isset($tokens[$i + 1])) {
+        throw $fail('rien n\'est permis après la valeur renvoyée, hormis « ; »');
+    }
+
+    return $value;
+}
+
+/**
+ * Une valeur littérale à la position $i (avancée au-delà). Voir rolesCheckParseData().
+ *
+ * @return mixed
+ */
+function rolesCheckParseValue(array $tokens, int &$i, callable $fail, int $depth)
+{
+    if ($depth > 32) {
+        throw $fail('tableaux trop imbriqués');
+    }
+
+    $token = $tokens[$i] ?? null;
+
+    if ($token === null) {
+        throw $fail('fin de fichier inattendue');
+    }
+
+    if ($token === '[' || (is_array($token) && $token[0] === T_ARRAY)) {
+        if ($token !== '[') {
+            $i++;
+
+            if (($tokens[$i] ?? null) !== '(') {
+                throw $fail('« array » doit être suivi de « ( »');
+            }
+        }
+
+        $close = $token === '[' ? ']' : ')';
+        $i++;
+        $result = [];
+
+        while (($tokens[$i] ?? null) !== $close) {
+            $item = rolesCheckParseValue($tokens, $i, $fail, $depth + 1);
+
+            if (is_array($tokens[$i] ?? null) && $tokens[$i][0] === T_DOUBLE_ARROW) {
+                if (!is_string($item) && !is_int($item)) {
+                    throw $fail('une clé de tableau doit être une chaîne ou un entier');
+                }
+
+                $i++;
+                $result[$item] = rolesCheckParseValue($tokens, $i, $fail, $depth + 1);
+            } else {
+                $result[] = $item;
+            }
+
+            if (($tokens[$i] ?? null) === ',') {
+                $i++;
+            } elseif (($tokens[$i] ?? null) !== $close) {
+                throw $fail("« , » ou « $close » attendu dans un tableau");
+            }
+        }
+
+        $i++;
+
+        return $result;
+    }
+
+    $negative = false;
+
+    if ($token === '-') {
+        $negative = true;
+        $token = $tokens[++$i] ?? null;
+
+        if (!is_array($token) || $token[0] !== T_LNUMBER) {
+            throw $fail('« - » doit précéder un entier');
+        }
+    }
+
+    if (is_array($token) && $token[0] === T_LNUMBER) {
+        if (preg_match('/^(0|[1-9][0-9]*)$/', $token[1]) !== 1 || strlen($token[1]) > 18) {
+            throw $fail('seuls les entiers décimaux sont permis (' . $token[1] . ')');
+        }
+
+        $i++;
+
+        return $negative ? -(int) $token[1] : (int) $token[1];
+    }
+
+    if (is_array($token) && $token[0] === T_CONSTANT_ENCAPSED_STRING) {
+        $i++;
+
+        return rolesCheckUnquote($token[1]);
+    }
+
+    if (is_array($token) && $token[0] === T_STRING) {
+        $word = strtolower($token[1]);
+        $words = ['true' => true, 'false' => false, 'null' => null];
+
+        if (array_key_exists($word, $words)) {
+            $i++;
+
+            return $words[$word];
+        }
+    }
+
+    throw $fail('jeton non permis « ' . (is_array($token) ? token_name($token[0]) . ' ' . $token[1] : $token) . ' »');
+}
+
+/**
+ * Valeur d'une chaîne PHP littérale sans interpolation (T_CONSTANT_ENCAPSED_STRING), avec
+ * les séquences d'échappement de PHP : entre apostrophes `\\` et `\'` seulement ; entre
+ * guillemets `\n \t \r \v \e \f \\ \$ \"`, octal, `\x`, `\u{…}`, toute autre séquence
+ * gardée telle quelle. Préfixe binaire `b` / `B` ignoré, comme PHP. `\u{` ouvre toujours une
+ * séquence Unicode : vide, non fermée, non hexadécimale ou au-delà de U+10FFFF, c'est une
+ * erreur de compilation pour PHP, donc un refus ici (même règle que le lecteur du skill).
+ *
+ * @throws \RuntimeException séquence \u{…} invalide
+ */
+function rolesCheckUnquote(string $literal): string
+{
+    if ($literal[0] === 'b' || $literal[0] === 'B') {
+        $literal = substr($literal, 1);
+    }
+
+    $quote = $literal[0];
+    $body = substr($literal, 1, -1);
+
+    if ($quote === "'") {
+        return (string) preg_replace('/\\\\([\\\\\'])/', '$1', $body);
+    }
+
+    return (string) preg_replace_callback(
+        '/\\\\(?:([ntrvef\\\\$"])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([^}]*)(\}?))/',
+        static function (array $m): string {
+            if (isset($m[1]) && $m[1] !== '') {
+                return ['n' => "\n", 't' => "\t", 'r' => "\r", 'v' => "\v", 'e' => "\e", 'f' => "\f", '\\' => '\\', '$' => '$', '"' => '"'][$m[1]];
+            }
+
+            if (isset($m[2]) && $m[2] !== '') {
+                return chr(octdec($m[2]) & 0xFF);
+            }
+
+            if (isset($m[3]) && $m[3] !== '') {
+                return chr(hexdec($m[3]));
+            }
+
+            if ($m[5] !== '}' || preg_match('/^[0-9A-Fa-f]+$/D', $m[4]) !== 1 || hexdec($m[4]) > 0x10FFFF) {
+                throw new \RuntimeException('Déclaration adeliom-roles/roles.php refusée, jamais exécutée : séquence \\u{…} invalide (vide, non fermée ou hors de l\'Unicode).');
+            }
+
+            $code = (int) hexdec($m[4]);
+
+            if ($code < 0x80) {
+                return chr($code);
+            }
+
+            if ($code < 0x800) {
+                return chr(0xC0 | ($code >> 6)) . chr(0x80 | ($code & 0x3F));
+            }
+
+            if ($code < 0x10000) {
+                return chr(0xE0 | ($code >> 12)) . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+            }
+
+            return chr(0xF0 | ($code >> 18)) . chr(0x80 | (($code >> 12) & 0x3F)) . chr(0x80 | (($code >> 6) & 0x3F)) . chr(0x80 | ($code & 0x3F));
+        },
+        $body,
+    );
+}
+
+/**
+ * Erreurs de format d'une déclaration adeliom-roles/roles.php, avec les règles de la classe
+ * Declaration du moteur 2.x (à garder alignées) : les six clés présentes, `version` entier
+ * ≥ 1, `roles` tableau de rôles (name chaîne, caps cap => booléen, remove liste de
+ * chaînes), `expected` avec `roles` (liste de chaînes) et `caps` (cap => booléen ou null),
+ * `extra_roles_ui` et `debug_page` booléens, `default_extra_roles` liste de chaînes. Une
+ * déclaration invalide n'est jamais appliquée par le mu-plugin. Fonction pure.
+ *
+ * @return string[] liste vide si la déclaration est valide
+ */
+function rolesCheckDeclarationErrors(array $data): array
+{
+    $errors = [];
+
+    foreach (['version', 'roles', 'expected', 'extra_roles_ui', 'default_extra_roles', 'debug_page'] as $key) {
+        if (!array_key_exists($key, $data)) {
+            $errors[] = "clé manquante : $key";
+        }
+    }
+
+    if ($errors !== []) {
+        return $errors;
+    }
+
+    $isStringList = static function ($value): bool {
+        if (!is_array($value)) {
+            return false;
+        }
+
+        foreach ($value as $item) {
+            if (!is_string($item)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+    $isCapMap = static function ($value, bool $nullable): bool {
+        if (!is_array($value)) {
+            return false;
+        }
+
+        foreach ($value as $cap => $grant) {
+            if ((string) $cap === '' || !(is_bool($grant) || ($nullable && $grant === null))) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!is_int($data['version']) || $data['version'] < 1) {
+        $errors[] = 'version doit être un entier positif';
+    }
+
+    if (!is_array($data['roles'])) {
+        $errors[] = 'roles doit être un tableau';
+    } else {
+        foreach ($data['roles'] as $slug => $role) {
+            $label = 'roles[' . $slug . ']';
+
+            if ((string) $slug === '' || !is_array($role)) {
+                $errors[] = "$label doit être un tableau, indexé par le slug du rôle";
+
+                continue;
+            }
+
+            if (isset($role['name']) && !is_string($role['name'])) {
+                $errors[] = "{$label}[name] doit être une chaîne";
+            }
+
+            if (isset($role['caps']) && !$isCapMap($role['caps'], false)) {
+                $errors[] = "{$label}[caps] doit être un tableau cap => true ou false";
+            }
+
+            if (isset($role['remove']) && !$isStringList($role['remove'])) {
+                $errors[] = "{$label}[remove] doit être une liste de caps";
+            }
+        }
+    }
+
+    $expected = $data['expected'];
+
+    if (!is_array($expected) || !isset($expected['roles'], $expected['caps'])) {
+        $errors[] = 'expected doit contenir roles et caps';
+    } else {
+        if (!$isStringList($expected['roles'])) {
+            $errors[] = 'expected[roles] doit être une liste de slugs';
+        }
+
+        if (!is_array($expected['caps'])) {
+            $errors[] = 'expected[caps] doit être un tableau';
+        } else {
+            foreach ($expected['caps'] as $slug => $caps) {
+                if (!$isCapMap($caps, true)) {
+                    $errors[] = "expected[caps][$slug] doit être un tableau cap => true, false ou null";
+                }
+            }
+        }
+    }
+
+    if (!is_bool($data['extra_roles_ui'])) {
+        $errors[] = 'extra_roles_ui doit valoir true ou false';
+    }
+
+    if (!$isStringList($data['default_extra_roles'])) {
+        $errors[] = 'default_extra_roles doit être une liste de slugs';
+    }
+
+    if (!is_bool($data['debug_page'])) {
+        $errors[] = 'debug_page doit valoir true ou false';
+    }
+
+    return $errors;
+}
+
+/**
+ * Empreinte attendue (clé « expected ») de la déclaration adeliom-roles/roles.php.
+ *
+ * roles.php est un pur fichier de données (`return array(...)`) : il n'est jamais inclus
+ * ni exécuté, sa valeur est reconstruite par rolesCheckParseData() à partir du contenu
+ * lu une seule fois. Un fichier qui sort de la grammaire des littéraux (code, ancien
+ * mu-plugin d'un seul fichier) lève une exception : un avertissement, pas de contrôle.
+ * La déclaration est ensuite validée comme le fait le moteur (rolesCheckDeclarationErrors()).
+ *
+ * @throws \DomainException déclaration invalide (le mu-plugin ne l'appliquera pas), erreurs dans le message
+ * @return array{roles: string[], caps: array<string, array<string, ?bool>>}
+ */
+function rolesCheckExpected(string $file): array
+{
+    $content = @file_get_contents($file);
+
+    if (!is_string($content) || $content === '') {
+        throw new \RuntimeException("Déclaration illisible : $file.");
+    }
+
+    if (strpos($content, 'adeliom-roles:declaration') !== false || strpos($content, 'function adeliom_roles_') !== false) {
+        throw new \RuntimeException('Déclaration au format de l\'ancien mu-plugin adeliom-roles d\'un seul fichier (moteur 1.x) : le migrer vers la structure en classes (skill wordpress-remplacer-ure).');
+    }
+
+    $declaration = rolesCheckParseData($content);
+
+    if (!is_array($declaration)) {
+        throw new \RuntimeException('Déclaration adeliom-roles/roles.php invalide : elle doit renvoyer un tableau.');
+    }
+
+    $errors = rolesCheckDeclarationErrors($declaration);
+
+    if ($errors !== []) {
+        throw new \DomainException('- ' . implode("\n   - ", $errors));
+    }
+
+    return $declaration['expected'];
+}
+
+/**
+ * Copie de la déclaration adeliom-roles/roles.php telle qu'au commit HEAD, dans un fichier temporaire local.
+ *
+ * HEAD et non la copie de travail : c'est le commit que build:check compare à la cible
+ * déployée, donc la déclaration que le serveur recevra. Une modification non commitée
+ * de « expected » ne doit pas changer le résultat du contrôle.
+ *
+ * @return ?string chemin du fichier temporaire (à supprimer par l'appelant), ou null si
+ *         le fichier n'est pas suivi par git (hors dépôt, jamais commité)
+ */
+function rolesCheckCommittedCopy(string $path): ?string
+{
+    $tmp = tempnam(sys_get_temp_dir(), 'adeliom-roles-');
+
+    if ($tmp === false) {
+        return null;
+    }
+
+    try {
+        transferRun(null, sprintf(
+            'cd %s && git show %s > %s 2>/dev/null',
+            escapeshellarg(dirname($path)),
+            escapeshellarg('HEAD:./' . basename($path)),
+            escapeshellarg($tmp),
+        ));
+    } catch (\Throwable $e) {
+        @unlink($tmp);
+
+        return null;
+    }
+
+    clearstatcache(true, $tmp);
+
+    if (!is_file($tmp) || filesize($tmp) === 0) {
+        @unlink($tmp);
+
+        return null;
+    }
+
+    return $tmp;
+}
+
+/**
+ * Variables WP_ENVIRONMENT_TYPE et WP_ENV de {{deploy_path}}/shared/.env sur l'hôte
+ * (lecture seule, sans charger WordPress). Première occurrence de chacune, comme le
+ * chargement immuable de Dotenv dans Bedrock ; une variable présente mais vide vaut ''.
+ *
+ * @return array<string, string> nom => valeur, sans les variables absentes du fichier
+ */
+function rolesCheckHostEnvironmentValues(Host $env): array
+{
+    $output = transferRun($env, sprintf(
+        'grep -E %s %s 2>/dev/null | sed %s || true',
+        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE)[[:space:]]*='),
+        escapeshellarg(transferResolve($env, '{{deploy_path}}/shared/.env')),
+        escapeshellarg('s/^/+dep-env:/'),
+    ));
+
+    $values = [];
+
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(WP_ENV|WP_ENVIRONMENT_TYPE)\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
+            && !isset($values[$m[1]])) {
+            $values[$m[1]] = $m[3];
+        }
+    }
+
+    return $values;
+}
+
+/**
+ * Type d'environnement WordPress déduit des variables du .env, comme Bedrock puis
+ * wp_get_environment_type() : un WP_ENVIRONMENT_TYPE non vide l'emporte (Bedrock n'infère
+ * alors rien de WP_ENV) et vaut `production` s'il n'est pas valide, comme dans WordPress ;
+ * sinon WP_ENV s'il est valide ; sinon `production` (WP_ENV vide ou non standard : une
+ * « preprod » tourne en production pour WordPress). Valides : production, staging,
+ * development, local. C'est ce type qui décide si le mu-plugin contrôle l'empreinte, pas
+ * l'alias de l'hôte. Fonction pure.
+ *
+ * @param array<string, string> $values sortie de rolesCheckHostEnvironmentValues()
+ * @return ?string null si aucune des deux variables n'existe (fichier absent, site non
+ *         Bedrock)
+ */
+function rolesCheckEnvironmentType(array $values): ?string
+{
+    if (!isset($values['WP_ENVIRONMENT_TYPE']) && !isset($values['WP_ENV'])) {
+        return null;
+    }
+
+    $types = ['production', 'staging', 'development', 'local'];
+
+    if (($values['WP_ENVIRONMENT_TYPE'] ?? '') !== '') {
+        return in_array($values['WP_ENVIRONMENT_TYPE'], $types, true) ? $values['WP_ENVIRONMENT_TYPE'] : 'production';
+    }
+
+    return in_array($values['WP_ENV'] ?? '', $types, true) ? $values['WP_ENV'] : 'production';
+}
+
+/**
+ * Rôles de la base de l'hôte et état de la synchro adeliom-roles, lus en SQL.
+ *
+ * SQL et non `wp option get` : celui-ci charge WordPress, et --skip-plugins ne retient
+ * pas les mu-plugins. Le mu-plugin adeliom-roles synchronise les rôles à son
+ * chargement : une simple lecture appliquerait la synchro qu'on cherche à contrôler.
+ * `wp config get` et `wp db query` ne chargent pas WordPress. HEX() pour recevoir la
+ * valeur sérialisée intacte, sans l'échappement du client mysql.
+ *
+ * @return array{roles: array, state: array}
+ */
+function rolesCheckHostRoles(Host $env): array
+{
+    $prefix = transferWpLastLine(transferWpRun($env, sprintf(
+        '%s config get table_prefix --skip-plugins --skip-themes 2>/dev/null || true',
+        transferWpBin($env),
+    )));
+
+    if (preg_match('/^\w+$/', $prefix) !== 1) {
+        throw new \RuntimeException('Préfixe des tables illisible (wp config get table_prefix).');
+    }
+
+    $values = [];
+
+    foreach (transferDbRows($env, sprintf(
+        "SELECT CONCAT('+dep|', option_name, '|', HEX(option_value)) FROM `%soptions` WHERE option_name IN ('adeliom_roles_state', '%suser_roles')",
+        $prefix,
+        $prefix,
+    )) as $row) {
+        if (count($row) === 2) {
+            $value = @unserialize((string) hex2bin($row[1]), ['allowed_classes' => false]);
+            $values[$row[0]] = is_array($value) ? $value : null;
+        }
+    }
+
+    if (!isset($values[$prefix . 'user_roles'])) {
+        throw new \RuntimeException("Option {$prefix}user_roles introuvable ou illisible.");
+    }
+
+    return [
+        'roles' => $values[$prefix . 'user_roles'],
+        'state' => $values['adeliom_roles_state'] ?? [],
+    ];
+}
+
+/**
+ * Écarts entre l'empreinte attendue et les rôles de l'hôte, avec la sémantique exacte
+ * du moteur 2.x du mu-plugin (Fingerprint::snapshot() puis Fingerprint::diff()) : liste triée de
+ * tous les rôles, et pour chaque rôle surveillé ses seules caps surveillées, une cap
+ * absente valant null. Une cap ajoutée par un plugin et non surveillée n'est donc
+ * jamais un écart.
+ *
+ * @return string[] une ligne lisible par écart
+ */
+function rolesCheckDiff(array $expected, array $roles): array
+{
+    $actualRoles = array_keys($roles);
+    $expectedRoles = $expected['roles'];
+    $allRoles = array_unique(array_merge($expectedRoles, $actualRoles));
+    sort($allRoles);
+
+    $show = static fn($value): string => $value === null ? 'absente' : ($value ? 'true' : 'false');
+    $lines = [];
+
+    foreach ($allRoles as $slug) {
+        $inExpected = in_array($slug, $expectedRoles, true);
+
+        if ($inExpected !== in_array($slug, $actualRoles, true)) {
+            $lines[] = sprintf(
+                'Rôle %s : %s',
+                $slug,
+                $inExpected ? 'attendu, absent sur l\'hôte' : 'absent de l\'audit, présent sur l\'hôte',
+            );
+        }
+    }
+
+    foreach ((array) ($expected['caps'] ?? []) as $slug => $caps) {
+        $current = isset($roles[$slug]['capabilities']) && is_array($roles[$slug]['capabilities'])
+            ? $roles[$slug]['capabilities']
+            : [];
+
+        foreach ((array) $caps as $cap => $value) {
+            $actual = array_key_exists($cap, $current) ? (bool) $current[$cap] : null;
+
+            if ($actual !== $value) {
+                $lines[] = sprintf('Rôle %s, cap %s : attendu %s, hôte %s', $slug, $cap, $show($value), $show($actual));
+            }
+        }
+    }
+
+    return $lines;
+}
+
+desc('Compare les rôles de l\'hôte à l\'empreinte attendue par le mu-plugin adeliom-roles, avant sa première application. Branchée avant le déploiement de la production (type d\'environnement lu dans shared/.env comme le fait Bedrock, à défaut hôte protégé) : dep roles:check production');
+task('roles:check', static function (): void {
+    $file = rolesCheckLocalFile();
+
+    if ($file === null) {
+        rolesCheckWarnLegacy();
+
+        return;
+    }
+
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // Le mu-plugin ne contrôle l'empreinte qu'en production, au sens de
+    // wp_get_environment_type() : on lit donc le .env de l'hôte, et non son alias (une
+    // « preprod » contient « prod », une production peut s'appeler « live »).
+    try {
+        $values = rolesCheckHostEnvironmentValues($env);
+    } catch (\Throwable $e) {
+        $values = [];
+    }
+
+    $type = rolesCheckEnvironmentType($values);
+
+    if ($type !== null && $type !== 'production') {
+        writeln("   « $label » est en environnement « $type » (shared/.env) : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
+
+        return;
+    }
+
+    // Valeur vide ou non standard (WP_ENV=preprod) : WordPress tourne en production,
+    // comme le décident Bedrock (WP_ENV vide = production) puis wp_get_environment_type().
+    if ($type === 'production') {
+        $name = ($values['WP_ENVIRONMENT_TYPE'] ?? '') !== '' ? 'WP_ENVIRONMENT_TYPE' : 'WP_ENV';
+        $value = $values[$name] ?? '';
+
+        if ($value !== 'production') {
+            info(sprintf(
+                '   %s dans shared/.env de « %s » : valeur vide ou non standard, WordPress tourne en production. Empreinte contrôlée.',
+                $value === '' ? "$name vide" : "$name « $value »",
+                $label,
+            ));
+        }
+    }
+
+    if ($type === null) {
+        // Repli : ni WP_ENVIRONMENT_TYPE ni WP_ENV (site non Bedrock, .env absent ou
+        // illisible), on retombe sur les hôtes protégés.
+        if (!transferIsProtected($env)) {
+            writeln("   WP_ENV introuvable sur « $label », hôte non protégé : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);
+
+            return;
+        }
+
+        info("   WP_ENV introuvable dans shared/.env de « $label » : hôte protégé, contrôlé si cet hôte est la production.");
+    }
+
+    // Une lecture en échec (hôte ou déclaration) n'interrompt rien : le mu-plugin refait
+    // lui-même ce contrôle en production et met la synchro en attente en cas d'écart.
+    try {
+        $host = rolesCheckHostRoles($env);
+
+        // Le mu-plugin ne contrôle l'empreinte qu'à sa première application.
+        if (!empty($host['state']['applied_version'])) {
+            info(sprintf(
+                '   Rôles déjà synchronisés par adeliom-roles (version %s) : pas de contrôle d\'empreinte.',
+                (string) $host['state']['applied_version'],
+            ));
+
+            return;
+        }
+
+        // Déclaration du commit HEAD (celui que build:check compare à la cible), et non
+        // de la copie de travail. Hors dépôt git ou fichier non commité : copie de
+        // travail, avec un avertissement.
+        $committed = rolesCheckCommittedCopy($file);
+
+        if ($committed === null) {
+            warning("Déclaration adeliom-roles lue dans la copie de travail : $file n'est pas commitée (ou hors dépôt git), l'empreinte peut différer de celle déployée.");
+        }
+
+        try {
+            $expected = rolesCheckExpected($committed ?? $file);
+        } finally {
+            if ($committed !== null) {
+                @unlink($committed);
+            }
+        }
+    } catch (\DomainException $e) {
+        // Le mu-plugin refuse une déclaration invalide : rien ne sera appliqué, même sans écart.
+        warning('Déclaration adeliom-roles/roles.php invalide : la synchro ne s\'appliquera pas. Corriger roles.php avant de déployer.');
+        writeln('   ' . $e->getMessage());
+
+        return;
+    } catch (\Throwable $e) {
+        warning("Rôles de « $label » non contrôlés : la lecture a échoué. Le déploiement continue.");
+        writeln('   ' . $e->getMessage());
+
+        return;
+    }
+
+    $diff = rolesCheckDiff($expected, $host['roles']);
+
+    if ($diff === []) {
+        info("   Rôles de « $label » conformes à l'empreinte de l'audit : la synchro adeliom-roles s'appliquera.");
+
+        return;
+    }
+
+    warning("Les rôles de « $label » ont changé depuis l'audit : adeliom-roles ne s'appliquera pas et restera en attente.");
+
+    foreach ($diff as $line) {
+        writeln("   - $line");
+    }
+
+    writeln('   Refaire l\'audit et mettre à jour « expected » dans la déclaration, ou vérifier la production avant de déployer.');
+
+    if (!input()->isInteractive()) {
+        warning('Mode non interactif : déploiement poursuivi malgré l\'écart.');
+
+        return;
+    }
+
+    // Défaut « non » : sans TTY et sans -n, Symfony retombe sur le défaut, et un
+    // déploiement ne doit pas passer sur un écart sans décision. Voir CLAUDE.md.
+    if (!askConfirmation('Continuer le déploiement ?', false)) {
+        throw error("Déploiement interrompu : rôles de « $label » différents de l'empreinte de l'audit.");
+    }
+});
+
+desc('Affiche l\'état de la synchro adeliom-roles sur l\'hôte (wp adeliom-roles status). Branchée sur la fin du déploiement : dep roles:status production');
+task('roles:status', static function (): void {
+    if (rolesCheckLocalFile() === null) {
+        return;
+    }
+
+    $env = currentHost();
+    $label = $env->getAlias();
+    $file = (string) get('roles_check_file');
+
+    // Jamais d'échec : le déploiement est publié, le statut n'est qu'informatif.
+    try {
+        // Présence du chargeur du mu-plugin (adeliom-roles.php, à côté du dossier
+        // adeliom-roles/ de la déclaration) dans la release en ligne, et non
+        // transferWpHasCommand() : `wp cli cmd-dump` tourne avant le chargement de
+        // WordPress et ne voit donc jamais une commande déclarée par un mu-plugin. Un
+        // chemin absolu est local, pas testable sur l'hôte : la commande est alors lancée
+        // directement.
+        $loader = rolesCheckLoaderPath($file);
+
+        if ($file[0] !== '/' && !transferTest($env, '[ -f ' . escapeshellarg($loader) . ' ]')) {
+            writeln("   Mu-plugin adeliom-roles absent de la release de « $label » : état non affiché.", OutputInterface::VERBOSITY_VERBOSE);
+
+            return;
+        }
+
+        // Sans --skip-plugins : la commande est déclarée par le mu-plugin, qui doit se
+        // charger. Le chargement applique la synchro si elle est due, comme le ferait la
+        // première requête sur le site.
+        $output = trim(transferWpRun($env, sprintf(
+            '%s adeliom-roles status --no-color 2>&1 || echo "+dep-failed"',
+            transferWpBin($env),
+        )));
+    } catch (\Throwable $e) {
+        warning("État des rôles illisible sur « $label ».");
+        writeln('   ' . $e->getMessage());
+
+        return;
+    }
+
+    if (strpos($output, '+dep-failed') !== false) {
+        warning("État des rôles illisible sur « $label » (wp adeliom-roles status).");
+        $output = trim(str_replace('+dep-failed', '', $output));
+    } else {
+        info("Rôles adeliom-roles sur « $label » :");
+    }
+
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (trim($line) !== '') {
+            writeln('   ' . $line);
+        }
+    }
+});
+
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
 // deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la
 // main pour débloquer un déploiement. Voir CLAUDE.md pour le détail.
 if (Deployer::get()->tasks->has('deploy:success')) {
     after('deploy:success', 'wp:update-db');
+    // Après wp:update-db : le schéma est à jour quand le mu-plugin se charge.
+    after('deploy:success', 'roles:status');
 }
 
-// Avant tout le reste : inutile de verrouiller ou de cloner si le build local ne
-// correspondrait pas à la release.
+// Les `before` s'empilent en tête (array_unshift) : roles:check, déclarée en premier,
+// passe donc APRÈS build:check. Toutes deux avant le verrou : une question posée ou un
+// refus n'y laisse rien de verrouillé.
 if (Deployer::get()->tasks->has('deploy')) {
+    before('deploy', 'roles:check');
     before('deploy', 'build:check');
 }
 

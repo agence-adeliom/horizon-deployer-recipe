@@ -1,0 +1,8 @@
+/vendor/
+/composer.lock
+/web/wp/
+/web/app/uploads/
+/.env
+/db-*.sql.gz
+/uploads-*.tar.gz
+/.dep/
