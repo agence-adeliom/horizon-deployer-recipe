@@ -1,0 +1,65 @@
+# Environnement de la suite d'intégration. Lancé par run.sh, qui fixe le nom du projet Compose,
+# PHP_VERSION, DEPLOYER_VERSION et RECIPE_DIR. Aucun port publié : tout passe par le réseau interne.
+#
+#   local    machine qui lance dep (projet Bedrock minimal, WordPress local, client ssh)
+#   server1  hôtes staging, recette (même compte : cas « même serveur ») et reseau-b
+#   server2  hôtes production (protégé) et reseau-a
+#   db       MariaDB, une base par environnement
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - ./docker/db-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  local:
+    build:
+      context: ./docker
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.2}
+    image: hdr-integration:php${PHP_VERSION:-8.2}
+    command: ["local"]
+    hostname: local
+    environment:
+      DEPLOYER_VERSION: ${DEPLOYER_VERSION:-7}
+      COMPOSER_CACHE_DIR: /home/deployer/.cache/composer
+    volumes:
+      - ${RECIPE_DIR:-../..}:/recipe:ro
+      - ./:/tests:ro
+      - keys:/keys
+      - git:/srv/git
+      - composer-cache:/home/deployer/.cache/composer
+    depends_on:
+      db:
+        condition: service_healthy
+
+  server1:
+    image: hdr-integration:php${PHP_VERSION:-8.2}
+    command: ["server"]
+    hostname: server1
+    volumes:
+      - keys:/keys:ro
+      - git:/srv/git
+    depends_on:
+      - local
+
+  server2:
+    image: hdr-integration:php${PHP_VERSION:-8.2}
+    command: ["server"]
+    hostname: server2
+    volumes:
+      - keys:/keys:ro
+      - git:/srv/git
+    depends_on:
+      - local
+
+volumes:
+  keys:
+  git:
+  composer-cache:

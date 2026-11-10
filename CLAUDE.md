@@ -6,19 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Bibliothèque Composer d'un seul fichier : `recipe/horizon-transfer.php`, un recipe [Deployer](https://deployer.org) 7.4+ et 8 pour les projets WordPress Horizon (Bedrock + Sage + Acorn). Il ajoute quatre tâches — `db:pull`, `uploads:pull`, `db:push`, `uploads:push` — qui déplacent base de données et uploads entre environnements, plus des tâches greffées sur `dep deploy` : `build:check` et `roles:check` avant `deploy`, `db:backup` avant `deploy:symlink`, `wp:update-db` et `roles:status` à `deploy:success`. Les deux tâches `roles:*` ne servent qu'aux projets dotés du mu-plugin `adeliom-roles` et sont inertes ailleurs.
 
-Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de linter configuré. Les fonctions pures de `roles:check` (lecture de `roles.php`, validation de la déclaration, type d'environnement, comparaison des rôles) ont une suite de tests sans dépendance, `tests/run.php`, lancée par GitHub Actions (`.github/workflows/tests.yml`) sur PHP 7.4 à 8.4 à chaque push sur `main` et à chaque PR.
+Pas de `vendor/` requis pour lire ou modifier le code : aucune dépendance n'est utilisée à l'exécution en dehors de Deployer lui-même, qui fournit l'environnement d'exécution. Pas de linter configuré. Les tests, eux, chargent le vrai Deployer (`composer install` d'abord). Toutes les fonctions et tâches du recipe ont des tests unitaires (`tests/unit/`, lancés par `php tests/run.php`), exécutés par GitHub Actions (`.github/workflows/tests.yml`) à chaque push sur `main` et à chaque PR, sur PHP 7.4 à 8.4 avec Deployer 7 et sur PHP 8.3 et 8.4 avec Deployer 8. `tests/COUVERTURE.md` indique, fonction par fonction, le fichier qui la couvre et ce qui ne se vérifie qu'en intégration.
 
 ## Commandes
 
 ```bash
 php -l recipe/horizon-transfer.php
-php tests/run.php                    # tests de roles:check (fonctions extraites du recipe, sans Deployer)
+composer install                     # Deployer, requis par les tests
+php tests/run.php                    # tests unitaires (tests/unit/*.test.php)
+php tests/run.php rsync roles        # seulement tests/unit/rsync.test.php et roles.test.php
 composer validate
 ```
 
-`tests/run.php` extrait les fonctions par leur nom (`^function nom(` … `^}`) : une fonction renommée ou supprimée fait échouer la suite, qu'il faut alors mettre à jour. Tout nouveau code pur de `roles:*` y ajoute ses cas. Les fixtures sont fictives (dépôt public : aucune donnée de client).
+Les tests unitaires chargent `recipe/common.php` de Deployer puis le recipe entier, comme un `deploy.php` ; seuls le client SSH et l'exécuteur local sont remplacés par l'enregistreur `Shell` de `tests/unit/bootstrap.php`. Un cas (`cas()`) déclare ses hôtes (`hote()`, `hoteLocal()` pour un hôte `localhost()`), pose les réponses aux commandes (`Shell::quand(motif, réponse)`), fournit options et réponses aux questions (`entree()`), puis vérifie les commandes envoyées (`uneCommande()`, `aucuneCommande()`) et la sortie (`sortie()`). Chaque cas a un hôte courant et une racine de projet (`DEPLOYER_ROOT`) neufs. `Shell::$reel = true` exécute pour de vrai, avec bash, les commandes sans réponse posée : à réserver aux dossiers temporaires (`dossierTemporaire()`). Les cas qui demandent rsync 3 ou git sont sautés sans eux. Un bug connu du recipe se marque `casBug()` : signalé sans faire échouer la suite, qui échoue en revanche dès qu'il ne se reproduit plus. Toute nouvelle fonction ou tâche ajoute ses cas dans le fichier de son domaine et sa ligne dans `tests/COUVERTURE.md`. `HORIZON_TESTS_VENDOR` désigne un autre `vendor/` (autre version de Deployer), `HORIZON_TESTS_RECIPE` une copie modifiée du recipe (vérifier qu'une mutation casse la suite). Les fixtures sont fictives (dépôt public : aucune donnée de client).
 
-Le reste de la validation se fait **depuis un projet Horizon consommateur** : y déclarer le dépôt en `repositories` (type `path` vers ce clone pendant le développement), puis exécuter les tâches (`dep db:push --from=… --to=…`). Les chemins de code les plus fragiles — parsing de la progression `rsync`, propagation des codes de sortie, résolution des symlinks — ne sont observables que là.
+Le reste de la validation se fait **depuis un projet Horizon consommateur** : y déclarer le dépôt en `repositories` (type `path` vers ce clone pendant le développement), puis exécuter les tâches (`dep db:push <hôte> --from=…`). Les scripts les plus fragiles (lecture de la progression `rsync`, propagation des codes de sortie, résolution des symlinks) sont exécutés pour de vrai par les tests unitaires, mais en local seulement : leur comportement au travers de SSH ne s'observe que là.
 
 Ajouter `-n` pour le mode non interactif (aucune écriture n'est alors effectuée) et `-vvv` pour voir les commandes shell générées.
 
@@ -151,6 +153,10 @@ En local, la corrélation et la vérification du routage s'appuient sur `DDEV_HO
 ### Symlinks côté distant
 
 `find` et `du` ne descendent pas dans un symlink passé en point de départ et renverraient 0. Il y a deux symlinks à traverser (`current` → release, uploads shared_dir → `shared/`), donc `transferUploadsPath()` résout explicitement le chemin réel (`readlink -f`, repli `cd && pwd -P`).
+
+## Tests d'intégration
+
+`tests/integration/run.sh` (Docker requis ; `DEPLOYER_VERSION=8` pour Deployer 8) lance un vrai `dep` depuis un conteneur « local » contre deux serveurs SSH et MariaDB, avec WordPress installé partout. Un scénario par fonctionnalité dans `tests/integration/scenarios/`, outils communs dans `tests/integration/lib/common.sh` (`reset_all`, `dep_run '<réponses>' …`, assertions). Les réponses aux questions passent par stdin, comme un `dep` sans TTY. Un bug avéré du recipe se marque par `skip_bug` (scénario « ignoré », non bloquant) tant qu'il n'est pas corrigé. Options : `--keep`, `--reuse`, `--recipe <dossier>` (tester une copie modifiée du recipe). Workflow : `.github/workflows/integration.yml`.
 
 ## Documentation
 

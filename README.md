@@ -92,8 +92,8 @@ Ajoutez à votre `.gitignore` :
 |---|---|---|
 | `dep db:pull <hôte>` | distant → local | Dump `.sql.gz` à la racine du projet, puis propose l'import local et la réécriture d'URLs. Propose de réutiliser un dump récent au lieu d'en refaire un |
 | `dep uploads:pull <hôte>` | distant → local | Archive `.tar.gz` à la racine du projet, puis propose l'extraction. `--favicon-only` ne récupère que le favicon. Propose de réutiliser une archive récente |
-| `dep db:push --from=X --to=Y` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
-| `dep uploads:push --from=X --to=Y` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
+| `dep db:push <hôte> --from=X` | local\|distant → distant | Sauvegarde la destination, importe, puis propose la réécriture d'URLs |
+| `dep uploads:push <hôte> --from=X` | local\|distant → distant | Synchronise, au choix en fusion ou en miroir |
 | `dep wp:update-db <hôte>` | — | Met à jour le schéma de base si le cœur déployé l'exige. Accrochée à `deploy:success`, donc lancée d'elle-même en fin de déploiement |
 | `dep build:check <hôte>` | — | Vérifie que le commit local est celui que le serveur va cloner, sans modification non commitée dans `{{build_check_paths}}`. Lancée d'elle-même avant `deploy` |
 | `dep roles:check <hôte>` | - | Compare les rôles de l'hôte à l'empreinte attendue par le mu-plugin `adeliom-roles`, avant sa première application. Lancée d'elle-même avant `deploy`, après `build:check`, sur la production (type d'environnement lu dans `shared/.env` comme le fait Bedrock, à défaut un hôte protégé). Sans effet sans ce mu-plugin |
@@ -111,21 +111,18 @@ dep uploads:pull production
 dep uploads:pull production --favicon-only
 
 # Rafraîchir la préproduction depuis la production
-dep db:push --from=production --to=staging
-dep uploads:push --from=production --to=staging
+dep db:push staging --from=production
+dep uploads:push staging --from=production
 
 # Envoyer sa base locale en préproduction
-dep db:push --from=local --to=staging
+dep db:push staging --from=local
 ```
 
-`--from` et `--to` sont facultatifs : ils sont demandés interactivement si absents. Le
-sélecteur d'hôte de Deployer fait office de destination quand `--to` est omis, ce qui rend
-ces deux commandes équivalentes :
-
-```bash
-dep db:push --from=production --to=staging
-dep db:push staging --from=production
-```
+Le sélecteur d'hôte de Deployer (`staging` ci-dessus) désigne la destination. `--from` est
+facultatif : il est demandé interactivement s'il est absent. `--to` existe aussi, mais ne
+dispense pas du sélecteur : avec plusieurs hôtes dans l'inventaire, Deployer demande
+« Select hosts » avant même de lancer la tâche, et échoue en `-n` (« No host selected »).
+Mieux vaut donc toujours passer la destination en sélecteur.
 
 La destination d'un push est toujours un environnement distant. Pour rapatrier vers le
 local, utilisez les tâches `pull`, qui gèrent en plus l'import et la réécriture d'URLs.
@@ -531,7 +528,7 @@ compare le contenu octet par octet ; c'est nettement plus lent (lecture intégra
 côtés) mais insensible aux dates.
 
 ```bash
-dep uploads:push --from=production --to=staging --checksum
+dep uploads:push staging --from=production --checksum
 ```
 
 La simulation affiche sa propre progression, utile quand `--checksum` doit relire
@@ -718,7 +715,10 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
 - **Détection du même serveur.** Quand la source et la destination partagent la même
   chaîne de connexion, aucun transfert réseau n'a lieu : le dump est lu directement, et les
   uploads sont synchronisés par un `rsync` local exécuté sur le serveur. Entre deux
-  serveurs distincts, le transit passe par la machine locale.
+  serveurs distincts, le transit passe par la machine locale : `uploads:push` y copie
+  d'abord la source (après confirmation du volume), simule ensuite la synchronisation
+  entre cette copie et la destination, puis demande la confirmation de la destination.
+  Un refus à cette étape supprime la copie locale sans rien écrire à la destination.
 - **Progression.** La barre de Deployer s'appuie sur le compteur `to-chk` de `rsync`, que
   celui-ci n'émet qu'à la toute fin pour un fichier unique. Le recipe utilise donc
   `--info=progress2`, convertit les `\r` en lignes et n'en affiche qu'une par palier de
@@ -771,13 +771,40 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
 ## Tests
 
 ```bash
-php tests/run.php
+composer install
+php tests/run.php              # toute la suite unitaire
+php tests/run.php rsync roles  # seulement tests/unit/rsync.test.php et roles.test.php
 ```
 
-Couvre les fonctions pures de `roles:check` : lecture de `roles.php` sans exécution, validation de la
-déclaration, type d'environnement et comparaison des rôles. Sans dépendance, la suite tourne aussi dans
-GitHub Actions sur PHP 7.4 à 8.4, à chaque push sur `main` et à chaque pull request. Les tâches de
-transfert et de déploiement se valident depuis un projet Horizon.
+Toutes les fonctions et tâches du recipe ont des tests unitaires, rangés par domaine dans
+`tests/unit/` : rôles, réécriture d'URLs, multisite, base et collations, rsync, sauvegardes, état et
+répertoires de travail, environnements et questions, `build:check`, WP-CLI, uploads, déclarations
+(options, défauts, points d'accroche) et scénarios des quatre tâches de transfert. Ils chargent le vrai
+Deployer et le recipe entier ; seules les commandes shell sont interceptées et vérifiées comme chaînes,
+et exécutées pour de vrai quand c'est local et sans risque (rsync 3, gzip, grep, git entre dossiers
+temporaires). `tests/COUVERTURE.md` donne la correspondance fonction par fonction, et ce qui ne se
+vérifie qu'en intégration.
+
+La suite tourne dans GitHub Actions à chaque push sur `main` et à chaque pull request : PHP 7.4 à 8.4
+avec Deployer 7, PHP 8.3 et 8.4 avec Deployer 8.
+
+## Tests d'intégration
+
+```bash
+tests/integration/run.sh                      # Deployer 7 (PHP 8.2)
+DEPLOYER_VERSION=8 tests/integration/run.sh   # Deployer 8 (PHP 8.3)
+tests/integration/run.sh db-push roles        # seulement certains scénarios
+```
+
+Prérequis : Docker et `docker compose`. La suite lance un vrai `dep` contre de vrais hôtes SSH :
+un conteneur « local » (projet Bedrock minimal qui installe ce recipe par un dépôt Composer
+`path`), deux serveurs SSH portant cinq hôtes (dont `production`, protégé, et deux hôtes sur le
+même compte pour le cas « même serveur »), et MariaDB. WordPress est installé partout avec des
+URLs différentes, dont deux réseaux multisite. Chaque scénario de `tests/integration/scenarios/`
+vérifie l'effet réel (bases, URLs réécrites, uploads, sauvegardes, fichiers temporaires, codes de
+sortie). Les clés SSH sont générées au démarrage et l'environnement est détruit à la fin
+(`--keep` pour le garder). GitHub Actions lance la suite sous Deployer 7 et 8
+(`.github/workflows/integration.yml`) à chaque push sur `main` et à chaque pull request.
 
 ## Licence
 

@@ -1,0 +1,50 @@
+name: Intégration
+
+# Un vrai `dep` contre de vrais hôtes SSH, dans Docker : voir tests/integration/run.sh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Deployer ${{ matrix.deployer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        deployer: ['7', '8']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image de test (cache GitHub Actions)
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/integration/docker
+          load: true
+          tags: hdr-integration:php${{ matrix.deployer == '8' && '8.3' || '8.2' }}
+          build-args: PHP_VERSION=${{ matrix.deployer == '8' && '8.3' || '8.2' }}
+          cache-from: type=gha,scope=integration-${{ matrix.deployer }}
+          cache-to: type=gha,mode=max,scope=integration-${{ matrix.deployer }}
+
+      - name: Scénarios d'intégration
+        env:
+          DEPLOYER_VERSION: ${{ matrix.deployer }}
+        run: tests/integration/run.sh --no-build
+
+      - name: Journaux
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-deployer-${{ matrix.deployer }}
+          path: tests/integration/.logs/
+          include-hidden-files: true
+          if-no-files-found: ignore
