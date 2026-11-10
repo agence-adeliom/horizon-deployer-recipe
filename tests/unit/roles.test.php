@@ -277,6 +277,19 @@ cas('rolesCheckHostEnvironmentValues : vrai grep sur un .env (quotes, export, vi
     verifie('fichier absent : aucune variable', rolesCheckHostEnvironmentValues($h), array());
 });
 
+cas('rolesCheckHostEnvironmentValues : deploy_path en « ~/ » (mutualisé), vrai grep', static function (): void {
+    $home = dossierTemporaire();
+    mkdir("$home/sites/exemple/shared", 0777, true);
+    file_put_contents("$home/sites/exemple/shared/.env", "WP_ENV='staging'\n");
+    $h = hote('mutualise-env', array('deploy_path' => '~/sites/exemple'));
+    Shell::quand('/^printf %s "\$HOME"$/', $home);
+    Shell::$reel = true;
+
+    verifie('« ~ » développé avant les guillemets', rolesCheckHostEnvironmentValues($h), array('WP_ENV' => 'staging'));
+    $appel = uneCommande('grep sur le chemin absolu', '/^grep -E /');
+    contient('chemin sans « ~ »', $appel['commande'] ?? '', escapeshellarg("$home/sites/exemple/shared/.env"));
+});
+
 /*
  * Rôles de l'hôte en SQL.
  */
