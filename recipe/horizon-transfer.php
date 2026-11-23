@@ -56,7 +56,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.9.1');
+define('HORIZON_TRANSFER_RECIPE', '1.9.2');
 
 /*
 |--------------------------------------------------------------------------
@@ -2183,6 +2183,79 @@ function transferImportHooks(?Host $env, string $name, bool $abortOnFailure): vo
 }
 
 /**
+ * Supprime les tables du préfixe d'un environnement, juste avant un import.
+ *
+ * `wp db clean` charge WordPress (`@when after_wp_load`) : il échoue donc avec
+ * "The site you have requested is not installed" dès que WordPress n'est pas
+ * installé dans la base. C'est pourtant l'état ordinaire d'une base qu'on s'apprête
+ * à écraser : base locale neuve ou vide, import précédent interrompu à mi-chemin
+ * (tables partielles, `options` absente), multisite dont le domaine en base diffère
+ * de DOMAIN_CURRENT_SITE.
+ *
+ * Dans ce cas, les tables du préfixe sont listées puis supprimées en SQL :
+ * `wp db query` ne lit que wp-config.php et ne dépend pas de l'état de la base. Le
+ * résultat est celui de `wp db clean` (tables du préfixe seulement, jamais la base).
+ * Une liste illisible (base injoignable) est traitée comme une base vide : l'import
+ * qui suit échouera alors lui aussi, avec le message du client mysql.
+ */
+function transferDbDropTables(?Host $env): void
+{
+    $bin = transferWpBin($env);
+    [$installed] = transferWpIsInstalled($env);
+
+    if ($installed) {
+        transferWpRun($env, "$bin db clean --yes --skip-plugins --skip-themes", ['timeout' => 600]);
+
+        return;
+    }
+
+    $prefix = transferWpLastLine(transferWpRun($env, sprintf(
+        '%s config get table_prefix --skip-plugins --skip-themes 2>/dev/null || true',
+        $bin,
+    )));
+
+    // Interpolé dans du SQL, et pas de préfixe par défaut : on s'apprête à supprimer.
+    if (preg_match('/^\w+$/', $prefix) !== 1) {
+        throw new \RuntimeException(sprintf(
+            "Préfixe des tables illisible sur \"%s\" (wp config get table_prefix) : rien n'a été supprimé.",
+            transferEnvLabel($env),
+        ));
+    }
+
+    // LEFT() et non LIKE : le "_" du préfixe serait un joker. Les vues sont écartées,
+    // comme le fait `wp db clean`, puisque DROP TABLE les refuse.
+    $tables = [];
+
+    foreach (transferDbRows($env, sprintf(
+        "SELECT CONCAT('+dep|', TABLE_NAME) FROM information_schema.TABLES"
+        . " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' AND LEFT(TABLE_NAME, %d) = '%s'",
+        strlen($prefix),
+        $prefix,
+    )) as $row) {
+        $tables[] = '`' . str_replace('`', '``', implode('|', $row)) . '`';
+    }
+
+    if ($tables === []) {
+        info('   Base vide : aucune table à supprimer.');
+
+        return;
+    }
+
+    warning(sprintf(
+        'WordPress n\'est pas installé sur "%s" (import précédent interrompu ?) : suppression en SQL de %d table(s) du préfixe %s.',
+        transferEnvLabel($env),
+        count($tables),
+        $prefix,
+    ));
+
+    transferWpRun($env, sprintf(
+        '%s db query %s --skip-plugins --skip-themes',
+        $bin,
+        escapeshellarg('SET FOREIGN_KEY_CHECKS = 0; DROP TABLE ' . implode(', ', $tables) . ';'),
+    ), ['timeout' => 600]);
+}
+
+/**
  * Vide la base d'un environnement puis y importe un dump gzippé.
  *
  * On passe par un pipe gunzip → wp db import avec `set -o pipefail`, sans quoi un
@@ -2274,9 +2347,10 @@ function transferDbImport(?Host $env, string $dumpGz): void
     // (DROP DATABASE / CREATE DATABASE), ce que refusent les hébergements mutualisés
     // (OVH : « ERROR 1010 … can't rmdir »). `clean` ne supprime que les tables du
     // préfixe de la destination, ce qui suffit avant un import et épargne les autres
-    // applications d'une base partagée.
+    // applications d'une base partagée. Base sans WordPress installé : voir
+    // transferDbDropTables().
     info(sprintf('🗑️  Suppression des tables de <comment>%s</comment>...', $label));
-    transferWpRun($env, "$bin db clean --yes --skip-plugins --skip-themes", ['timeout' => 600]);
+    transferDbDropTables($env);
 
     // La réécriture s'insère dans le pipe : le dump n'est jamais modifié sur disque,
     // il reste donc réimportable tel quel ailleurs.

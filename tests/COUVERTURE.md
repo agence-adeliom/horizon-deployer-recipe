@@ -77,6 +77,7 @@ Deux suites complémentaires :
 | `transferCollationCharsets` | `base` | | `70-collations` (indirect) |
 | `transferCollationFallback` | `base` | | `70-collations` (`utf8mb4_0900_ai_ci` → `utf8mb4_unicode_ci`) |
 | `transferImportHooks` | `base` | Commandes du projet réelles | `30-db-push` (avant, après, échec qui annule) |
+| `transferDbDropTables` | `base` (installé, base vide, tables restantes, préfixe illisible) | `DROP TABLE` réel sur une base partielle | |
 | `transferDbImport` | `base` (pipefail réel) | `wp db clean` et import réels, `--fix-collations` sur un vrai dump MySQL 8 | `10`, `30`, `70` (refus sans rien supprimer, `--fix-collations`) |
 | `transferFaviconFiles` | `uploads` | Métadonnées réelles | `20-uploads-pull` |
 | `transferPullFavicon` | `uploads` | rsync réel depuis le serveur | `20-uploads-pull` (base locale, repli distant, fichier absent, refus) |

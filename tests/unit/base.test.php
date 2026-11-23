@@ -16,10 +16,14 @@ function baseDump(string $sql): string
     return $fichier;
 }
 
-/** Destination prête à l'import : wp db connu, collations du serveur, dump scanné. */
-function baseDestinationPrete(array $collationsServeur, string $collationsDump): void
+/**
+ * Destination prête à l'import : wp db connu, WordPress installé (sauf $installe faux), collations du
+ * serveur, dump scanné.
+ */
+function baseDestinationPrete(array $collationsServeur, string $collationsDump, bool $installe = true): void
 {
     Shell::quand('/cmd-dump/', '1');
+    Shell::quand('/core is-installed/', $installe ? '+dep-installed' : 'Error: The site you have requested is not installed.');
     Shell::quand('/SHOW COLLATION/', implode("\n", array_map(static function (string $c): string {
         return "$c\tutf8mb4\t45\t\tYes\t1";
     }, $collationsServeur)));
@@ -126,10 +130,10 @@ cas('transferDbImport : contrôles avant suppression, puis clean et import', sta
     transferDbImport($h, '/srv/s/.dep/transfer/x/db.sql.gz');
     $commandes = Shell::commandes();
     verifie('ordre', array_map(static function (string $c): string {
-        return (string) preg_replace('/^(wp \S+ \S+|gunzip -c|set -o pipefail).*$/s', '$1', $c);
-    }, $commandes), array('wp cli cmd-dump', 'wp db query', 'gunzip -c', 'wp db clean', 'set -o pipefail'));
-    verifie('db clean et non db reset', $commandes[3], 'wp db clean --yes --skip-plugins --skip-themes');
-    verifie('import en pipe avec pipefail', $commandes[4], "set -o pipefail; gunzip -c '/srv/s/.dep/transfer/x/db.sql.gz' | wp db import - --skip-plugins --skip-themes");
+        return (string) preg_replace('/^(wp \S+ \S+|if wp \S+ \S+|gunzip -c|set -o pipefail).*$/s', '$1', $c);
+    }, $commandes), array('wp cli cmd-dump', 'wp db query', 'gunzip -c', 'if wp core is-installed', 'wp db clean', 'set -o pipefail'));
+    verifie('db clean et non db reset', $commandes[4], 'wp db clean --yes --skip-plugins --skip-themes');
+    verifie('import en pipe avec pipefail', $commandes[5], "set -o pipefail; gunzip -c '/srv/s/.dep/transfer/x/db.sql.gz' | wp db import - --skip-plugins --skip-themes");
     aucuneCommande('jamais db reset', '/db reset/');
     $import = Shell::appel('/db import/');
     verifie('délai', $import['timeout'] ?? null, 7200);
@@ -143,6 +147,54 @@ cas('transferDbImport : wp db absent, rien n\'est supprimé', static function ()
         transferDbImport(hote('staging'), '/x.sql.gz');
     }, \RuntimeException::class, 'La commande « wp db » n\'existe pas');
     aucuneCommande('pas de suppression', '/db clean/');
+});
+
+cas('transferDbImport : WordPress non installé et base vide, rien à supprimer', static function (): void {
+    $h = hote('staging');
+    baseDestinationPrete(array('utf8mb4_unicode_ci'), "utf8mb4_unicode_ci\n", false);
+    Shell::quand('/config get table_prefix/', 'wp_');
+
+    transferDbImport($h, '/x.sql.gz');
+    aucuneCommande('pas de db clean, qui échouerait', '/db clean/');
+    aucuneCommande('rien à supprimer', '/DROP TABLE/');
+    contient('liste en SQL, préfixe exact', Shell::appel('/information_schema/')['commande'] ?? '', "LEFT(TABLE_NAME, 3) = '\''wp_'\''");
+    contient('annoncé', sortie(), 'Base vide : aucune table à supprimer.');
+    uneCommande('import quand même', '/db import/');
+});
+
+cas('transferDbImport : WordPress non installé, tables restantes supprimées en SQL', static function (): void {
+    $h = hote('staging');
+    baseDestinationPrete(array('utf8mb4_unicode_ci'), "utf8mb4_unicode_ci\n", false);
+    Shell::quand('/config get table_prefix/', 'wp_');
+    Shell::quand('/information_schema/', "+dep|wp_commentmeta\n+dep|wp_comments\n");
+
+    transferDbImport($h, '/x.sql.gz');
+    aucuneCommande('pas de db clean', '/db clean/');
+    verifie('suppression des seules tables listées', Shell::appel('/DROP TABLE/')['commande'] ?? null, "wp db query 'SET FOREIGN_KEY_CHECKS = 0; DROP TABLE `wp_commentmeta`, `wp_comments`;' --skip-plugins --skip-themes");
+    contient('avertissement', sortie(), '2 table(s) du préfixe wp_');
+    $commandes = Shell::commandes();
+    $rang = static function (string $motif) use ($commandes): int {
+        foreach ($commandes as $i => $c) {
+            if (preg_match($motif, $c) === 1) {
+                return $i;
+            }
+        }
+
+        return -1;
+    };
+    verifie('suppression avant import', $rang('/DROP TABLE/') < $rang('/db import/'), true);
+});
+
+cas('transferDbImport : WordPress non installé, préfixe illisible, rien n\'est supprimé', static function (): void {
+    $h = hote('staging');
+    baseDestinationPrete(array('utf8mb4_unicode_ci'), "utf8mb4_unicode_ci\n", false);
+    Shell::quand('/config get table_prefix/', 'Error: wp-config.php introuvable');
+
+    leve('exception explicite', static function () use ($h): void {
+        transferDbImport($h, '/x.sql.gz');
+    }, \RuntimeException::class, 'Préfixe des tables illisible');
+    aucuneCommande('pas de suppression', '/DROP TABLE|db clean/');
+    aucuneCommande('pas d\'import', '/db import/');
 });
 
 cas('transferDbImport : collations absentes, --fix-collations', static function (): void {
@@ -171,6 +223,7 @@ cas('transferDbImport : collations absentes, --fix-collations', static function 
 
     Shell::reinitialiser();
     Shell::quand('/cmd-dump/', '1');
+    Shell::quand('/core is-installed/', '+dep-installed');
     transferDbImport($h, '/x.sql.gz');
     aucuneCommande('collations du serveur illisibles : dump non scanné', '/grep -oiE/');
     uneCommande('import quand même', '/db import/');
@@ -182,6 +235,7 @@ cas('transferDbImport : pipefail fait échouer un import sur un dump tronqué (e
     Suite::$courant->set('bin/wp_local', 'cat > /dev/null #');
     Shell::quand('/cmd-dump/', '1');
     Shell::quand('/SHOW COLLATION/', '');
+    Shell::quand('/core is-installed/', '+dep-installed');
     Shell::quand('/db clean/', '');
 
     $dump = baseDump(str_repeat("INSERT INTO t VALUES (1);\n", 500));
