@@ -132,7 +132,7 @@ Ces invariants sont le contrat du recipe ; ne pas les affaiblir sans demande exp
 - **Un `pull` ne modifie jamais le distant**, hormis ses propres fichiers temporaires.
 - **Un `push` exige une confirmation de la destination** (`transferConfirmDestination()`), et la saisie de l'alias en clair si l'hôte est protégé (`transfer_protected`, vrai par défaut dès que l'alias ou le stage contient `prod`).
 - **La base de destination est dumpée avant tout import** dans `{{transfer_backup_dir}}`, et cette sauvegarde survit au nettoyage.
-- **On ne supprime que les tables, jamais la base** : avant un import, `wp db clean` (tables du préfixe de la destination) et non `wp db reset`, dont le `DROP DATABASE` est refusé par les hébergements mutualisés (OVH) et emporterait les autres applications d'une base partagée.
+- **On ne supprime que les tables, jamais la base** : avant un import, `wp db clean` (tables du préfixe de la destination) et non `wp db reset`, dont le `DROP DATABASE` est refusé par les hébergements mutualisés (OVH) et emporterait les autres applications d'une base partagée. `wp db clean` chargeant WordPress, il échoue sur une base où WordPress n'est pas installé (base vide, import interrompu) : `transferDbDropTables()` liste alors les tables du préfixe par `information_schema` et les supprime par `wp db query`, sans préfixe par défaut (préfixe illisible = exception, rien de supprimé).
 - **Mode non interactif (`-n`) = aucune écriture.** `transferConfirm()` se fie uniquement à `input()->isInteractive()` : tester `stream_isatty(STDIN)` casserait le mode interactif sous `ddev php`, qui n'alloue pas de TTY.
 
 ### Réécriture d'URLs en deux passes

@@ -396,6 +396,9 @@ dep roles:status production
 - **Seules les tables du site sont supprimées avant l'import** (`wp db clean`, préfixe de
   la destination), jamais la base elle-même : les hébergements mutualisés comme OVH
   refusent `DROP DATABASE`, et une base partagée peut contenir d'autres applications.
+  Si WordPress n'est pas installé dans la base de destination (base vide, import
+  précédent interrompu), `wp db clean` est inutilisable : les tables du préfixe sont
+  alors supprimées en SQL, et une base vide est importée directement.
 - **Toute écriture volumineuse liée aux uploads est confirmée**, en annonçant le volume :
   la création de l'archive `tar.gz` sur le serveur (`uploads:pull`), et la copie de transit
   sur la machine locale quand `uploads:push` relie deux serveurs distincts. Un refus
