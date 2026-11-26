@@ -3678,17 +3678,18 @@ function rolesCheckCommittedCopy(string $path): ?string
 }
 
 /**
- * Variables WP_ENVIRONMENT_TYPE et WP_ENV de {{deploy_path}}/shared/.env sur l'hôte
- * (lecture seule, sans charger WordPress). Première occurrence de chacune, comme le
+ * Variables WP_ENVIRONMENT_TYPE, WP_ENV et WP_HOME de {{deploy_path}}/shared/.env sur
+ * l'hôte (lecture seule, sans charger WordPress). Première occurrence de chacune, comme le
  * chargement immuable de Dotenv dans Bedrock ; une variable présente mais vide vaut ''.
+ * Commune à roles:check (type d'environnement) et aux tâches http-auth (URL du site).
  *
  * @return array<string, string> nom => valeur, sans les variables absentes du fichier
  */
-function rolesCheckHostEnvironmentValues(Host $env): array
+function transferHostEnvironmentValues(Host $env): array
 {
     $output = transferRun($env, sprintf(
         'grep -E %s %s 2>/dev/null | sed %s || true',
-        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE)[[:space:]]*='),
+        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE|WP_HOME)[[:space:]]*='),
         // transferResolvePath() et non transferResolve() : un deploy_path en « ~/ » (courant
         // sur les mutualisés) ne serait pas développé entre guillemets simples.
         escapeshellarg(transferResolvePath($env, '{{deploy_path}}/shared/.env')),
@@ -3698,7 +3699,7 @@ function rolesCheckHostEnvironmentValues(Host $env): array
     $values = [];
 
     foreach (preg_split('/\R/', $output) as $line) {
-        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(WP_ENV|WP_ENVIRONMENT_TYPE)\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
+        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(WP_ENV|WP_ENVIRONMENT_TYPE|WP_HOME)\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
             && !isset($values[$m[1]])) {
             $values[$m[1]] = $m[3];
         }
@@ -3716,11 +3717,11 @@ function rolesCheckHostEnvironmentValues(Host $env): array
  * development, local. C'est ce type qui décide si le mu-plugin contrôle l'empreinte, pas
  * l'alias de l'hôte. Fonction pure.
  *
- * @param array<string, string> $values sortie de rolesCheckHostEnvironmentValues()
- * @return ?string null si aucune des deux variables n'existe (fichier absent, site non
- *         Bedrock)
+ * @param array<string, string> $values sortie de transferHostEnvironmentValues()
+ * @return ?string null si ni WP_ENVIRONMENT_TYPE ni WP_ENV n'existe (fichier absent, site
+ *         non Bedrock), WP_HOME n'entrant pas en compte
  */
-function rolesCheckEnvironmentType(array $values): ?string
+function transferEnvironmentType(array $values): ?string
 {
     if (!isset($values['WP_ENVIRONMENT_TYPE']) && !isset($values['WP_ENV'])) {
         return null;
@@ -3845,12 +3846,12 @@ task('roles:check', static function (): void {
     // wp_get_environment_type() : on lit donc le .env de l'hôte, et non son alias (une
     // « preprod » contient « prod », une production peut s'appeler « live »).
     try {
-        $values = rolesCheckHostEnvironmentValues($env);
+        $values = transferHostEnvironmentValues($env);
     } catch (\Throwable $e) {
         $values = [];
     }
 
-    $type = rolesCheckEnvironmentType($values);
+    $type = transferEnvironmentType($values);
 
     if ($type !== null && $type !== 'production') {
         writeln("   « $label » est en environnement « $type » (shared/.env) : empreinte des rôles non contrôlée.", OutputInterface::VERBOSITY_VERBOSE);

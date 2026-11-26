@@ -95,8 +95,8 @@ Deux suites complémentaires :
 | `rolesCheckDeclarationErrors` | `roles` | | `60-roles` (déclaration invalide) |
 | `rolesCheckExpected` | `roles` | | `60-roles` |
 | `rolesCheckCommittedCopy` | `roles` (vrai dépôt git) | | `60-roles` (HEAD, fichier jamais commité) |
-| `rolesCheckHostEnvironmentValues` | `roles` (grep et sed réels) | `shared/.env` sur le serveur | `61-roles-environnements` (13 variantes de `shared/.env`) |
-| `rolesCheckEnvironmentType` | `roles` | | `61-roles-environnements` |
+| `transferHostEnvironmentValues` | `roles` (grep et sed réels, `WP_HOME` compris) | `shared/.env` sur le serveur | `61-roles-environnements` (13 variantes de `shared/.env`) |
+| `transferEnvironmentType` | `roles` | | `61-roles-environnements` |
 | `rolesCheckHostRoles` | `roles` | Options sérialisées réelles en `HEX()` | `60-roles` (vraies options sérialisées) |
 | `rolesCheckDiff` | `roles` | | `60-roles` (rôle en trop, cap retirée) |
 
