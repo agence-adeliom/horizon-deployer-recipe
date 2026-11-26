@@ -4873,6 +4873,18 @@ task('http-auth:setup', static function (): void {
 
         if ($ownBlock) {
             info("$url répond déjà 401 : le bloc Horizon de $liveHtaccessPath est en place. Il sera remplacé, avec les IP à jour.");
+
+            // Le provider HttpLogin peut rester actif derrière le bloc (relance pour mettre les
+            // IP à jour) : il répondrait 401 même avec les identifiants, la vérification
+            // finale ne pourrait pas conclure. Aucune question : le bloc est déjà le nôtre.
+            $legacy = httpAuthLegacyProvider($env, $values);
+
+            if ($legacy !== null) {
+                $alreadyProtected = true;
+                info($legacy['state'] === 'active'
+                    ? sprintf('Le provider HttpLoginServiceProvider de horizon-tools est aussi actif (ENABLED_HTTP_LOGIN est vraie selon %s). Passer ENABLED_HTTP_LOGIN à false dans ce fichier, commiter, puis déployer.', $legacy['file'])
+                    : sprintf('Le provider HttpLoginServiceProvider de horizon-tools est aussi présent, mais la valeur de ENABLED_HTTP_LOGIN n\'a pas pu être lue (%s).', $legacy['file']));
+            }
         } else {
             $alreadyProtected = true;
             $legacy = httpAuthLegacyProvider($env, $values);

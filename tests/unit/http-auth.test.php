@@ -2407,3 +2407,54 @@ cas('deploy:http-auth : production ou http_auth faux, provider jamais cherché',
     tache('deploy:http-auth', $h);
     verifie('http_auth faux : aucune commande', Shell::commandes(), []);
 });
+
+cas('http-auth:setup : bloc Horizon en place et provider HttpLogin actif, relance sans question, vérification non concluante', static function (): void {
+    $variantes = [
+        'actif' => ["Config::define('ENABLED_HTTP_LOGIN', true);", 'ENABLED_HTTP_LOGIN est vraie selon config/environments/staging.php', 'le provider HttpLoginServiceProvider de horizon-tools répond déjà 401'],
+        'illisible' => ["Config::define('ENABLED_HTTP_LOGIN', WP_DEBUG);", 'la valeur de ENABLED_HTTP_LOGIN n\'a pas pu être lue (config/environments/staging.php)', 'une autre protection répond déjà 401'],
+    ];
+
+    foreach ($variantes as $libelle => [$ligne, $information, $avertissement]) {
+        $h = httpAuthHoteSetup('http-auth-bloc-legacy-' . ($libelle === 'actif' ? 'actif' : 'illisible'));
+        [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+        httpAuthLoginTest($ligne);
+        httpAuthCurlTest(['401'], '401', '401');
+        Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode(httpAuthBlock($htpasswd, 'Accès restreint', ['192.0.2.50'], []) . "\n# BEGIN WordPress\n"));
+        // Une seule réponse : une question « Installer quand même ? » tomberait sur la fin d'entrée.
+        entree([], true, ['y']);
+        sortie();
+
+        tache('http-auth:setup', $h);
+        $sortie = sortie();
+        contient("$libelle : bloc Horizon signalé", $sortie, 'bloc Horizon');
+        contient("$libelle : provider nommé", $sortie, 'HttpLoginServiceProvider');
+        contient("$libelle : information", $sortie, $information);
+        absent("$libelle : pas de question supplémentaire", $sortie, 'Installer quand même');
+        contient("$libelle : vérification non concluante", $sortie, 'Vérification non concluante : ' . $avertissement);
+        contient("$libelle : récapitulatif", $sortie, 'Authentification HTTP installée');
+        $ecrit = (string) httpAuthEcritTest($htaccess);
+        contient("$libelle : bloc remplacé, IP à jour", $ecrit, 'Require ip 127.0.0.1 ::1 203.0.113.10' . "\n");
+        absent("$libelle : ancienne IP retirée", $ecrit, '192.0.2.50');
+        aucuneCommande("$libelle : pas de remise en état", '#^rm -f #');
+    }
+
+    // Provider inactif : vérification stricte, comme sans provider.
+    $h = httpAuthHoteSetup('http-auth-bloc-legacy-inactif');
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    Shell::reinitialiser();
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', false);");
+    httpAuthCurlTest(['401'], '401', '401');
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode(httpAuthBlock($htpasswd, 'Accès restreint', [], [])));
+    entree([], true, ['y']);
+    sortie();
+
+    leve('inactif : 401 avec identifiants, erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '200 ou 30x attendu');
+    $sortie = sortie();
+    absent('inactif : provider non nommé', $sortie, 'HttpLoginServiceProvider');
+    absent('inactif : pas d\'avertissement non concluant', $sortie, 'non concluante');
+});

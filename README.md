@@ -427,7 +427,9 @@ Le mot de passe n'apparaît jamais dans l'inventaire ni dans le dépôt.
   `-n`, cette question n'est pas posée. Si le `.htaccess` en ligne contient déjà le bloc
   Horizon, la tâche affiche une ligne d'information, sans avertissement ni question. Ce
   bloc sera remplacé, avec les IP à jour. Si le provider HttpLogin de horizon-tools est
-  actif, l'avertissement le nomme (voir « Site déjà protégé en PHP »).
+  actif, l'avertissement le nomme (voir « Site déjà protégé en PHP »). Derrière le bloc
+  Horizon, ce provider actif donne une seconde ligne d'information, toujours sans question.
+  La vérification finale ne peut alors pas conclure.
 - En `-n`, elle décrit ce qu'elle ferait et s'arrête. Le `.htaccess` décrit est le fichier
   réellement modifié : celui de `shared/` si la release n'en contient qu'un lien.
 - Elle demande confirmation, avec « non » pour réponse par défaut.
