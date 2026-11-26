@@ -3704,17 +3704,37 @@ function rolesCheckCommittedCopy(string $path): ?string
 
 /**
  * Variables WP_ENVIRONMENT_TYPE, WP_ENV et WP_HOME de {{deploy_path}}/shared/.env sur
- * l'hôte (lecture seule, sans charger WordPress). Première occurrence de chacune, comme le
- * chargement immuable de Dotenv dans Bedrock ; une variable présente mais vide vaut ''.
+ * l'hôte (lecture seule, sans charger WordPress), lues par transferHostEnvValues().
  * Commune à roles:check (type d'environnement) et aux tâches http-auth (URL du site).
  *
  * @return array<string, string> nom => valeur, sans les variables absentes du fichier
  */
 function transferHostEnvironmentValues(Host $env): array
 {
+    return transferHostEnvValues($env, ['WP_ENV', 'WP_ENVIRONMENT_TYPE', 'WP_HOME']);
+}
+
+/**
+ * Variables $names de {{deploy_path}}/shared/.env sur l'hôte (lecture seule, par grep,
+ * sans charger WordPress). Première occurrence de chacune, comme le chargement immuable de
+ * Dotenv dans Bedrock ; une variable présente mais vide vaut ''.
+ *
+ * @param list<string> $names noms de variables (lettres, chiffres, « _ »)
+ * @return array<string, string> nom => valeur, sans les variables absentes du fichier
+ * @throws \InvalidArgumentException nom de variable invalide
+ */
+function transferHostEnvValues(Host $env, array $names): array
+{
+    foreach ($names as $name) {
+        if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', (string) $name) !== 1) {
+            throw new \InvalidArgumentException("Nom de variable invalide : $name");
+        }
+    }
+
+    $alternatives = implode('|', $names);
     $output = transferRun($env, sprintf(
         'grep -E %s %s 2>/dev/null | sed %s || true',
-        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(WP_ENV|WP_ENVIRONMENT_TYPE|WP_HOME)[[:space:]]*='),
+        escapeshellarg('^[[:space:]]*(export[[:space:]]+)?(' . $alternatives . ')[[:space:]]*='),
         // transferResolvePath() et non transferResolve() : un deploy_path en « ~/ » (courant
         // sur les mutualisés) ne serait pas développé entre guillemets simples.
         escapeshellarg(transferResolvePath($env, '{{deploy_path}}/shared/.env')),
@@ -3724,7 +3744,7 @@ function transferHostEnvironmentValues(Host $env): array
     $values = [];
 
     foreach (preg_split('/\R/', $output) as $line) {
-        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(WP_ENV|WP_ENVIRONMENT_TYPE|WP_HOME)\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
+        if (preg_match('/^\+dep-env:\s*(?:export\s+)?(' . $alternatives . ')\s*=\s*(["\']?)([^"\'#\s]*)\2/', trim($line), $m) === 1
             && !isset($values[$m[1]])) {
             $values[$m[1]] = $m[3];
         }
@@ -4584,6 +4604,155 @@ function httpAuthGuard(Host $env): array
 }
 
 /**
+ * Définition de ENABLED_HTTP_LOGIN dans les lignes d'un fichier de configuration Bedrock
+ * (sortie de grep, jamais exécutée). Formes reconnues, en début de ligne :
+ * `Config::define('ENABLED_HTTP_LOGIN', <valeur>);` (classe éventuellement qualifiée) et
+ * `define('ENABLED_HTTP_LOGIN', <valeur>);`, guillemets simples ou doubles, espaces libres,
+ * commentaire de fin permis. Valeurs : `true`, `false` (casse libre), `env('NOM')` suivi
+ * ou non de `?? …`. Une autre valeur, ou une définition qui n'ouvre pas la ligne (dans un
+ * `if`), vaut `unknown`. Les lignes de commentaire sont ignorées. Plusieurs définitions :
+ * la dernière l'emporte, comme Config::define(). Fonction pure.
+ *
+ * @return ?array{form: string, name: ?string} form : 'true', 'false', 'env' (name : la
+ *         variable) ou 'unknown' ; null sans définition
+ */
+function httpAuthLegacyDefinition(string $lines): ?array
+{
+    $found = null;
+
+    foreach (preg_split('/\R/', $lines) as $line) {
+        $line = trim($line);
+
+        if ($line === '' || preg_match('~^(//|#|/\*|\*)~', $line) === 1) {
+            continue;
+        }
+
+        if (preg_match('/^(?:\\\\?(?:Roots\\\\WPConfig\\\\)?Config::)?define\s*\(\s*([\'"])ENABLED_HTTP_LOGIN\1\s*,\s*(.*?)\s*\)\s*;\s*(?:(?:\/\/|#).*)?$/i', $line, $m) === 1) {
+            $value = $m[2];
+
+            if (preg_match('/^(true|false)$/i', $value, $bool) === 1) {
+                $found = ['form' => strtolower($bool[1]), 'name' => null];
+            } elseif (preg_match('/^env\s*\(\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\)(?:\s*\?\?.+)?$/i', $value, $variable) === 1) {
+                $found = ['form' => 'env', 'name' => $variable[2]];
+            } else {
+                $found = ['form' => 'unknown', 'name' => null];
+            }
+        } elseif (preg_match('/define\s*\(\s*([\'"])ENABLED_HTTP_LOGIN\1/i', $line) === 1) {
+            $found = ['form' => 'unknown', 'name' => null];
+        }
+    }
+
+    return $found;
+}
+
+/**
+ * État du provider HttpLogin selon la valeur d'une variable de shared/.env lue par env() :
+ * true, 1, yes, on (casse libre) donnent `active` ; false, 0, no, off ou une valeur vide
+ * donnent `inactive` ; une variable absente ($value null) ou une autre valeur, `unknown`.
+ * Fonction pure.
+ */
+function httpAuthLegacyEnvState(?string $value): string
+{
+    if ($value === null) {
+        return 'unknown';
+    }
+
+    $value = strtolower($value);
+
+    if (in_array($value, ['true', '1', 'yes', 'on'], true)) {
+        return 'active';
+    }
+
+    return in_array($value, ['false', '0', 'no', 'off', ''], true) ? 'inactive' : 'unknown';
+}
+
+/**
+ * Ancienne protection PHP de la release en ligne : le provider Acorn
+ * `Adeliom\HorizonTools\Providers\HttpLoginServiceProvider` (paquet
+ * agence-adeliom/horizon-tools) répond 401 si la constante ENABLED_HTTP_LOGIN est vraie.
+ * Lecture seule par une seule commande, rien n'est exécuté par PHP : présence du provider
+ * dans {{current_path}}/vendor, puis lignes ENABLED_HTTP_LOGIN de
+ * config/environments/<WP_ENV>.php et de config/application.php (httpAuthLegacyDefinition()).
+ * Le fichier d'environnement l'emporte, comme dans Bedrock qui le charge en second. WP_ENV
+ * absent, vide ou qui n'est pas un simple nom : application.php seul. `env('NOM')` est
+ * résolu dans shared/.env (httpAuthLegacyEnvState()).
+ *
+ * Toute erreur de lecture rend null : la détection ne fait qu'enrichir un message, elle ne
+ * doit jamais faire échouer setup ni un déploiement, et un « unknown » sans fichier lu
+ * n'apprendrait rien de plus que l'avertissement générique.
+ *
+ * @param array<string, string> $envValues sortie de transferHostEnvironmentValues() (WP_ENV brut)
+ * @return ?array{state: string, file: string} null si le provider est absent, inactif ou
+ *         sans définition ; sinon state `active` ou `unknown` et le chemin, relatif à la
+ *         release, du fichier qui décide
+ */
+function httpAuthLegacyProvider(Host $env, array $envValues): ?array
+{
+    try {
+        $current = transferResolvePath($env, '{{current_path}}');
+        $files = [];
+        $wpEnv = $envValues['WP_ENV'] ?? '';
+
+        if (preg_match('/^[A-Za-z0-9_-]+$/', $wpEnv) === 1) {
+            $files['env'] = "config/environments/$wpEnv.php";
+        }
+
+        $files['app'] = 'config/application.php';
+        $reads = '';
+
+        foreach ($files as $key => $file) {
+            $reads .= sprintf(
+                ' grep -F ENABLED_HTTP_LOGIN %s 2>/dev/null | sed %s;',
+                escapeshellarg("$current/$file"),
+                escapeshellarg("s/^/+dep-login-$key:/")
+            );
+        }
+
+        $output = transferRun($env, sprintf(
+            'if [ -f %s ]; then echo +dep-login;%s fi',
+            escapeshellarg("$current/vendor/agence-adeliom/horizon-tools/src/Providers/HttpLoginServiceProvider.php"),
+            $reads
+        ));
+
+        $lines = preg_split('/\R/', $output);
+
+        if (!in_array('+dep-login', array_map('trim', $lines), true)) {
+            return null;
+        }
+
+        foreach ($files as $key => $file) {
+            $prefix = "+dep-login-$key:";
+            $own = '';
+
+            foreach ($lines as $line) {
+                if (strpos($line, $prefix) === 0) {
+                    $own .= substr($line, strlen($prefix)) . "\n";
+                }
+            }
+
+            $definition = httpAuthLegacyDefinition($own);
+
+            if ($definition === null) {
+                continue;
+            }
+
+            if ($definition['form'] === 'env') {
+                $values = transferHostEnvValues($env, [(string) $definition['name']]);
+                $state = httpAuthLegacyEnvState($values[$definition['name']] ?? null);
+            } else {
+                $state = ['true' => 'active', 'false' => 'inactive'][$definition['form']] ?? 'unknown';
+            }
+
+            return $state === 'inactive' ? null : ['state' => $state, 'file' => $file];
+        }
+    } catch (\Throwable $e) {
+        // Détection indicative : jamais d'échec pour elle.
+    }
+
+    return null;
+}
+
+/**
  * Droits du fichier existant $path sur l'hôte, en octal ; $default s'ils sont illisibles.
  * `stat -c` (GNU) puis `stat -f` (BSD, macOS).
  */
@@ -4649,6 +4818,8 @@ task('http-auth:setup', static function (): void {
     // remplacement du bloc : seule elle rend la vérification finale non concluante.
     $alreadyProtected = false;
     $liveHtaccessPath = null;
+    // Provider HttpLogin de horizon-tools, cherché seulement si le site répond déjà 401.
+    $legacy = null;
 
     if ($status === null) {
         warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
@@ -4667,7 +4838,21 @@ task('http-auth:setup', static function (): void {
             info("$url répond déjà 401 : le bloc Horizon de $liveHtaccessPath est en place. Il sera remplacé, avec les IP à jour.");
         } else {
             $alreadyProtected = true;
-            warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
+            $legacy = httpAuthLegacyProvider($env, $values);
+
+            if ($legacy !== null && $legacy['state'] === 'active') {
+                warning(sprintf(
+                    '%s répond déjà 401 : le provider HttpLoginServiceProvider de horizon-tools est actif (ENABLED_HTTP_LOGIN vaut true dans %s). Après l\'installation, passer ENABLED_HTTP_LOGIN à false dans ce fichier, commiter, puis déployer : le site demanderait sinon deux authentifications.',
+                    $url,
+                    $legacy['file']
+                ));
+            } else {
+                warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
+
+                if ($legacy !== null) {
+                    writeln(sprintf('   Le provider HttpLoginServiceProvider de horizon-tools est présent, mais la valeur de ENABLED_HTTP_LOGIN n\'a pas pu être lue (%s).', $legacy['file']));
+                }
+            }
 
             // En -n, pas de question : l'étape 5 décrit ce que la tâche ferait.
             if (input()->isInteractive() && !transferConfirm('Installer quand même ?', false)) {
@@ -4846,7 +5031,11 @@ task('http-auth:setup', static function (): void {
                     // Protection détectée à l'étape 4 : l'autre couche (mu-plugin, provider
                     // Acorn) répond 401 à tout le monde, la vérification ne peut pas conclure.
                     // La sonde a déjà prouvé qu'Apache applique le bloc : il est conservé.
-                    warning("Vérification non concluante : une autre protection répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis retirer l'ancienne protection PHP du projet.");
+                    if ($legacy !== null && $legacy['state'] === 'active') {
+                        warning("Vérification non concluante : le provider HttpLoginServiceProvider de horizon-tools répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis passer ENABLED_HTTP_LOGIN à false dans {$legacy['file']}, commiter et déployer.");
+                    } else {
+                        warning("Vérification non concluante : une autre protection répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis retirer l'ancienne protection PHP du projet.");
+                    }
                 } else {
                     $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
                 }
@@ -5094,7 +5283,8 @@ task('deploy:http-auth', static function (): void {
 
     // 2. Garde-fou production, sans error() : le déploiement d'une production ne doit pas
     // échouer pour un réglage d'inventaire. Rien n'est écrit.
-    $refusal = httpAuthProductionRefusal(transferHostEnvironmentValues($env), transferIsProtected($env));
+    $values = transferHostEnvironmentValues($env);
+    $refusal = httpAuthProductionRefusal($values, transferIsProtected($env));
 
     if ($refusal !== null) {
         warning("$refusal Bloc non réinjecté dans la nouvelle release de « $label ».");
@@ -5149,19 +5339,29 @@ task('deploy:http-auth', static function (): void {
 
     if ($htaccess === $original) {
         info("Bloc d'authentification HTTP déjà présent et identique dans $releasePath : non réécrit.");
+    } else {
+        try {
+            httpAuthWriteFile($env, $releasePath, $htaccess, $original !== null ? httpAuthFileMode($env, $releasePath, '644') : '644');
+        } catch (\Throwable $e) {
+            warning("Bloc d'authentification HTTP non écrit dans $releasePath : déploiement interrompu avant la bascule, la release en ligne reste en place.");
 
-        return;
+            throw $e;
+        }
+
+        info("Bloc d'authentification HTTP réinjecté dans $releasePath.");
     }
 
+    // 6. Provider HttpLogin de horizon-tools encore actif dans la release en ligne : le site
+    // demanderait deux authentifications. Simple avertissement, jamais d'échec.
     try {
-        httpAuthWriteFile($env, $releasePath, $htaccess, $original !== null ? httpAuthFileMode($env, $releasePath, '644') : '644');
+        $legacy = httpAuthLegacyProvider($env, $values);
+
+        if ($legacy !== null && $legacy['state'] === 'active') {
+            warning("Double authentification sur « $label » : le provider HttpLoginServiceProvider de horizon-tools est actif. Pour la retirer, passer ENABLED_HTTP_LOGIN à false dans {$legacy['file']}, commiter, puis déployer.");
+        }
     } catch (\Throwable $e) {
-        warning("Bloc d'authentification HTTP non écrit dans $releasePath : déploiement interrompu avant la bascule, la release en ligne reste en place.");
-
-        throw $e;
+        // Détection indicative : le déploiement continue.
     }
-
-    info("Bloc d'authentification HTTP réinjecté dans $releasePath.");
 })->hidden();
 
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le

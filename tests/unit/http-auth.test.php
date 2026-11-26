@@ -2063,3 +2063,298 @@ cas('http-auth:remove : sans garde-fou production', static function (): void {
     verifie('bloc retiré', httpAuthEcritTest($htaccess), "# BEGIN WordPress\n# END WordPress\n");
     aucuneCommande('shared/.env non lu', '/^grep -E /');
 });
+
+/*
+ * Détection du provider HttpLogin de horizon-tools (ancienne protection PHP) :
+ * httpAuthLegacyDefinition, httpAuthLegacyEnvState, httpAuthLegacyProvider, et ses
+ * utilisations dans http-auth:setup et deploy:http-auth.
+ */
+
+cas('httpAuthLegacyDefinition : formes reconnues, commentaires et autres constantes ignorés', static function (): void {
+    $attendus = [
+        "Config::define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null],
+        'Config::define("ENABLED_HTTP_LOGIN", false);' => ['form' => 'false', 'name' => null],
+        "    Config::define( 'ENABLED_HTTP_LOGIN' ,  TRUE ) ;" => ['form' => 'true', 'name' => null],
+        "define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null],
+        "\\Roots\\WPConfig\\Config::define('ENABLED_HTTP_LOGIN', false);" => ['form' => 'false', 'name' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', true); // préproduction" => ['form' => 'true', 'name' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));" => ['form' => 'env', 'name' => 'HTTP_LOGIN'],
+        "Config::define('ENABLED_HTTP_LOGIN', env(\"HTTP_LOGIN\") ?? false);" => ['form' => 'env', 'name' => 'HTTP_LOGIN'],
+        "Config::define('ENABLED_HTTP_LOGIN', 1);" => ['form' => 'unknown', 'name' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', WP_ENV === 'staging');" => ['form' => 'unknown', 'name' => null],
+        "if (\$preprod) { Config::define('ENABLED_HTTP_LOGIN', true); }" => ['form' => 'unknown', 'name' => null],
+        "// Config::define('ENABLED_HTTP_LOGIN', true);" => null,
+        "# define('ENABLED_HTTP_LOGIN', true);" => null,
+        " * Config::define('ENABLED_HTTP_LOGIN', true);" => null,
+        "Config::define('ENABLED_HTTP_LOGIN_REALM', 'Website');" => null,
+        "if (ENABLED_HTTP_LOGIN) {" => null,
+        '' => null,
+    ];
+
+    foreach ($attendus as $lignes => $attendu) {
+        verifie("« $lignes »", httpAuthLegacyDefinition($lignes), $attendu);
+    }
+
+    verifie('CRLF', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\r\n"), ['form' => 'true', 'name' => null]);
+    verifie('dernière définition du fichier', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\n// x\nConfig::define('ENABLED_HTTP_LOGIN', false);"), ['form' => 'false', 'name' => null]);
+});
+
+cas('httpAuthLegacyEnvState : valeur de la variable lue dans shared/.env', static function (): void {
+    foreach (['true', 'TRUE', '1', 'yes', 'On'] as $valeur) {
+        verifie("« $valeur »", httpAuthLegacyEnvState($valeur), 'active');
+    }
+
+    foreach (['false', 'False', '0', 'no', 'off', ''] as $valeur) {
+        verifie("« $valeur »", httpAuthLegacyEnvState($valeur), 'inactive');
+    }
+
+    verifie('variable absente', httpAuthLegacyEnvState(null), 'unknown');
+    verifie('autre valeur', httpAuthLegacyEnvState('peut-être'), 'unknown');
+});
+
+/**
+ * Release en ligne sur le disque : paquet horizon-tools présent ou non, config/application.php
+ * et config/environments/staging.php (null : absent), shared/.env.
+ */
+function httpAuthReleaseLoginTest(string $racine, bool $paquet, ?string $application, ?string $staging, string $env = ''): void
+{
+    exec('rm -rf ' . escapeshellarg("$racine/current") . ' ' . escapeshellarg("$racine/shared"));
+    mkdir("$racine/current/config/environments", 0777, true);
+    mkdir("$racine/shared", 0777, true);
+    file_put_contents("$racine/shared/.env", $env);
+
+    if ($paquet) {
+        mkdir("$racine/current/vendor/agence-adeliom/horizon-tools/src/Providers", 0777, true);
+        file_put_contents("$racine/current/vendor/agence-adeliom/horizon-tools/src/Providers/HttpLoginServiceProvider.php", "<?php\n");
+    }
+
+    foreach (['application.php' => $application, 'environments/staging.php' => $staging] as $fichier => $contenu) {
+        if ($contenu !== null) {
+            file_put_contents("$racine/current/config/$fichier", "<?php\n\nuse Roots\\WPConfig\\Config;\n\n$contenu\n");
+        }
+    }
+}
+
+cas('httpAuthLegacyProvider : présence du paquet, fichier d\'environnement prioritaire, env() lu dans shared/.env (réel)', static function (): void {
+    $racine = dossierTemporaire();
+    $h = hoteLocal('http-auth-legacy-reel', ['deploy_path' => $racine]);
+    Shell::$reel = true;
+    $vrai = "Config::define('ENABLED_HTTP_LOGIN', true);";
+    $faux = "Config::define('ENABLED_HTTP_LOGIN', false);";
+    $staging = ['WP_ENV' => 'staging'];
+    $variantes = [
+        'paquet absent' => [false, $vrai, $vrai, '', $staging, null],
+        'staging vrai, application faux' => [true, $faux, $vrai, '', $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
+        'staging faux, application vrai' => [true, $vrai, $faux, '', $staging, null],
+        'application seule' => [true, $vrai, "Config::define('WP_DEBUG', true);", '', $staging, ['state' => 'active', 'file' => 'config/application.php']],
+        'fichier d\'environnement absent' => [true, $vrai, null, '', $staging, ['state' => 'active', 'file' => 'config/application.php']],
+        'WP_ENV absent : application seule' => [true, null, $vrai, '', [], null],
+        'WP_ENV vide : application seule' => [true, $faux, $vrai, '', ['WP_ENV' => ''], null],
+        'WP_ENV hors du dossier : application seule' => [true, null, $vrai, '', ['WP_ENV' => '../environments/staging'], null],
+        'aucune définition' => [true, "Config::define('WP_DEBUG', true);", null, '', $staging, null],
+        'env() vrai' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));", "WP_ENV=staging\nHTTP_LOGIN=true\n", $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
+        'env() faux' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? true);", "HTTP_LOGIN='off'\n", $staging, null],
+        'env() absent' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));", "WP_ENV=staging\n", $staging, ['state' => 'unknown', 'file' => 'config/environments/staging.php']],
+        'forme inconnue' => [true, "define('ENABLED_HTTP_LOGIN', WP_ENV !== 'production');", null, '', $staging, ['state' => 'unknown', 'file' => 'config/application.php']],
+    ];
+
+    foreach ($variantes as $libelle => [$paquet, $application, $fichierStaging, $env, $valeurs, $attendu]) {
+        httpAuthReleaseLoginTest($racine, $paquet, $application, $fichierStaging, $env);
+        verifie($libelle, httpAuthLegacyProvider($h, $valeurs), $attendu);
+    }
+});
+
+/** Réponse de la lecture distante : marqueur de présence et lignes ENABLED_HTTP_LOGIN. */
+function httpAuthLoginTest(?string $staging, ?string $application = null): void
+{
+    $lignes = ['+dep-login'];
+
+    foreach (['env' => $staging, 'app' => $application] as $prefixe => $contenu) {
+        if ($contenu !== null) {
+            $lignes[] = "+dep-login-$prefixe:$contenu";
+        }
+    }
+
+    Shell::quand('#HttpLoginServiceProvider\.php#', implode("\n", $lignes) . "\n");
+}
+
+cas('httpAuthLegacyProvider : lecture seule sur la release en ligne, erreur de lecture sans exception', static function (): void {
+    $h = hote('http-auth-legacy');
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+    verifie('actif', httpAuthLegacyProvider($h, ['WP_ENV' => 'staging']), ['state' => 'active', 'file' => 'config/environments/staging.php']);
+    $commande = Shell::commandes()[0] ?? '';
+    contient('présence testée dans la release en ligne', $commande, "[ -f '/srv/" . $h->getAlias() . "/current/vendor/agence-adeliom/horizon-tools/src/Providers/HttpLoginServiceProvider.php' ]");
+    contient('fichier d\'environnement lu', $commande, "'/srv/" . $h->getAlias() . "/current/config/environments/staging.php'");
+    contient('application.php lu', $commande, "'/srv/" . $h->getAlias() . "/current/config/application.php'");
+    verifie('une seule commande', count(Shell::commandes()), 1);
+    vrai('aucune exécution PHP ni WP-CLI', preg_match('/(^|[;&|]\s*|\bthen\s+)(php|wp)\s/', $commande) === 0);
+
+    Shell::reinitialiser();
+    verifie('paquet absent (rien en sortie)', httpAuthLegacyProvider($h, ['WP_ENV' => 'staging']), null);
+
+    Shell::reinitialiser();
+    Shell::quand('#HttpLoginServiceProvider\.php#', new \RuntimeException('Connection closed'));
+    verifie('lecture en échec : null', httpAuthLegacyProvider($h, ['WP_ENV' => 'staging']), null);
+
+    Shell::reinitialiser();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));");
+    Shell::quand('/^grep -E /', new \RuntimeException('Connection closed'));
+    verifie('lecture de shared/.env en échec : null', httpAuthLegacyProvider($h, ['WP_ENV' => 'staging']), null);
+});
+
+cas('http-auth:setup : 401 dû au provider HttpLogin actif, avertissement qui le nomme, question maintenue', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-legacy-actif');
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);", "Config::define('ENABLED_HTTP_LOGIN', false);");
+    httpAuthCurlTest(['401']);
+    entree([], true, ['n']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('provider nommé', $sortie, 'HttpLoginServiceProvider');
+    contient('fichier cité', $sortie, 'config/environments/staging.php');
+    contient('marche à suivre', $sortie, 'passer ENABLED_HTTP_LOGIN à false');
+    absent('pas d\'avertissement générique', $sortie, 'mu-plugin');
+    contient('question posée', $sortie, 'Installer quand même ?');
+    verifie('« non » : aucune écriture', httpAuthEcrituresHorsSonde(), []);
+
+    // -n : l'avertissement, sans question.
+    $h = httpAuthHoteSetup('http-auth-legacy-actif-n');
+    Shell::reinitialiser();
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+    httpAuthCurlTest(['401']);
+    entree([], false, []);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('-n : provider nommé', $sortie, 'HttpLoginServiceProvider');
+    absent('-n : pas de question', $sortie, 'Installer quand même ?');
+    verifie('-n : aucune écriture', httpAuthEcrituresHorsSonde(), []);
+});
+
+cas('http-auth:setup : provider HttpLogin présent, valeur illisible, avertissement générique complété', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-legacy-inconnu');
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', WP_ENV === 'staging');");
+    httpAuthCurlTest(['401']);
+    entree([], true, ['n']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('avertissement générique', $sortie, 'une authentification est peut-être en place');
+    contient('provider présent, valeur illisible', $sortie, 'valeur de ENABLED_HTTP_LOGIN n\'a pas pu être lue');
+    contient('fichier cité', $sortie, 'config/environments/staging.php');
+});
+
+cas('http-auth:setup : provider HttpLogin inactif ou absent, avertissement générique seul', static function (): void {
+    foreach (['inactif' => "Config::define('ENABLED_HTTP_LOGIN', false);", 'absent' => null] as $libelle => $ligne) {
+        $h = httpAuthHoteSetup('http-auth-legacy-' . $libelle);
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+
+        if ($ligne !== null) {
+            httpAuthLoginTest($ligne);
+        }
+
+        httpAuthCurlTest(['401']);
+        entree([], true, ['n']);
+        sortie();
+
+        tache('http-auth:setup', $h);
+        $sortie = sortie();
+        contient("$libelle : avertissement générique", $sortie, 'mu-plugin');
+        absent("$libelle : provider non nommé", $sortie, 'HttpLogin');
+    }
+});
+
+cas('http-auth:setup : site qui ne répond pas 401, provider jamais cherché', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-legacy-200');
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+    httpAuthCurlTest(['200', '401']);
+    entree([], true, ['y']);
+
+    tache('http-auth:setup', $h);
+    aucuneCommande('aucune lecture du provider', '#HttpLoginServiceProvider#');
+});
+
+cas('http-auth:setup : vérification non concluante, le provider HttpLogin actif est nommé', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-legacy-verif');
+    httpAuthEnvTest();
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+    httpAuthCurlTest(['401'], '401', '401');
+    entree([], true, ['y', 'y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('non concluant', $sortie, 'Vérification non concluante : le provider HttpLoginServiceProvider de horizon-tools répond déjà 401');
+    contient('fichier cité', $sortie, 'passer ENABLED_HTTP_LOGIN à false dans config/environments/staging.php');
+    absent('pas d\'ancienne protection anonyme', $sortie, 'ancienne protection PHP');
+    vrai('bloc conservé', strpos((string) httpAuthEcritTest(httpAuthCheminsTest($h)[0]), '# BEGIN Horizon HTTP auth') === 0);
+});
+
+cas('deploy:http-auth : provider HttpLogin actif, avertissement de double authentification après la réinjection', static function (): void {
+    foreach (['réinjecté' => false, 'bloc identique' => true] as $libelle => $identique) {
+        $h = httpAuthHoteDeploy('http-auth-deploy-legacy-' . ($identique ? 'identique' : 'ecrit'));
+        $bloc = httpAuthBlock('/srv/' . $h->getAlias() . '/shared/.htpasswd', 'Accès restreint', [], ['/.well-known/acme-challenge/']);
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+        httpAuthHtpasswdPresentTest($h);
+        httpAuthHtaccessDeployTest($h, null, $identique ? $bloc : "# BEGIN WordPress\n");
+        httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+        sortie();
+
+        tache('deploy:http-auth', $h);
+        $sortie = sortie();
+        contient("$libelle : avertissement", $sortie, 'Double authentification');
+        contient("$libelle : marche à suivre", $sortie, 'passer ENABLED_HTTP_LOGIN à false dans config/environments/staging.php');
+        vrai("$libelle : après la réinjection", strpos($sortie, 'Bloc d\'authentification HTTP') < strpos($sortie, 'Double authentification'));
+    }
+});
+
+cas('deploy:http-auth : provider HttpLogin inactif, absent ou illisible, aucun avertissement ni échec', static function (): void {
+    $variantes = [
+        'inactif' => "Config::define('ENABLED_HTTP_LOGIN', false);",
+        'absent' => null,
+        'lecture en échec' => new \RuntimeException('Connection closed'),
+    ];
+
+    foreach ($variantes as $libelle => $reponse) {
+        $h = httpAuthHoteDeploy('http-auth-deploy-legacy-' . substr(md5($libelle), 0, 6));
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+        httpAuthHtpasswdPresentTest($h);
+
+        if ($reponse instanceof \Throwable) {
+            Shell::quand('#HttpLoginServiceProvider\.php#', $reponse);
+        } elseif ($reponse !== null) {
+            httpAuthLoginTest($reponse);
+        }
+
+        sortie();
+        tache('deploy:http-auth', $h);
+        $sortie = sortie();
+        absent("$libelle : pas d'avertissement", $sortie, 'Double authentification');
+        contient("$libelle : bloc réinjecté", $sortie, 'réinjecté');
+    }
+});
+
+cas('deploy:http-auth : production ou http_auth faux, provider jamais cherché', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-legacy-prod');
+    httpAuthEnvTest("WP_ENV=production\nWP_HOME=https://www.site.test");
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthLoginTest("Config::define('ENABLED_HTTP_LOGIN', true);");
+
+    tache('deploy:http-auth', $h);
+    aucuneCommande('production : aucune lecture du provider', '#HttpLoginServiceProvider#');
+
+    $h = httpAuthHoteDeploy('http-auth-deploy-legacy-inactif', ['http_auth' => false]);
+    Shell::reinitialiser();
+    tache('deploy:http-auth', $h);
+    verifie('http_auth faux : aucune commande', Shell::commandes(), []);
+});
