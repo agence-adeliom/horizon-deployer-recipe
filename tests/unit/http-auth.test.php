@@ -464,3 +464,61 @@ cas('httpAuthProbe : suppression du dossier en échec, avertissement sans masque
     }, \RuntimeException::class, 'Permission denied');
     contient('avertissement après l\'exception', sortie(), 'laissé en place');
 });
+
+/** Saisie scriptée : rend les réponses dans l'ordre et note les questions posées. */
+function httpAuthSaisieTest(array $reponses, array &$questions): callable
+{
+    return static function (string $question) use (&$reponses, &$questions): string {
+        $questions[] = $question;
+
+        if ($reponses === []) {
+            throw new \LogicException("Question non prévue : $question");
+        }
+
+        return array_shift($reponses);
+    };
+}
+
+cas('httpAuthAskPassword : saisie vide, mot de passe généré', static function (): void {
+    $questions = [];
+    $resultat = httpAuthAskPassword(httpAuthSaisieTest([''], $questions));
+    verifie('généré', $resultat['generated'], true);
+    vrai('24 caractères de l\'alphabet', preg_match('/^[a-hjkmnp-zA-HJKLMNP-Z2-9]{24}$/', $resultat['password']) === 1);
+    verifie('une seule question', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) : ']);
+});
+
+cas('httpAuthAskPassword : deux saisies identiques', static function (): void {
+    $questions = [];
+    verifie('résultat', httpAuthAskPassword(httpAuthSaisieTest(['abc', 'abc'], $questions)), ['password' => 'abc', 'generated' => false]);
+    verifie('questions', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) : ', 'Confirmez le mot de passe : ']);
+});
+
+cas('httpAuthAskPassword : saisies différentes, avertissement et nouvel essai', static function (): void {
+    sortie();
+    $questions = [];
+    verifie('résultat', httpAuthAskPassword(httpAuthSaisieTest(['abc', 'abd', 'xyz', 'xyz'], $questions)), ['password' => 'xyz', 'generated' => false]);
+    verifie('quatre questions', count($questions), 4);
+    contient('avertissement', sortie(), 'Les deux saisies diffèrent, recommencez.');
+});
+
+cas('httpAuthAskPassword : trois écarts, exception', static function (): void {
+    $questions = [];
+    leve('exception', static function () use (&$questions): void {
+        httpAuthAskPassword(httpAuthSaisieTest(['a', 'b', 'c', 'd', 'e', 'f'], $questions));
+    }, \RuntimeException::class, 'Les mots de passe saisis diffèrent.');
+    verifie('six questions', count($questions), 6);
+});
+
+cas('httpAuthAskPassword : saut de ligne refusé, compté comme un écart', static function (): void {
+    sortie();
+    $questions = [];
+    verifie('résultat', httpAuthAskPassword(httpAuthSaisieTest(["a\nb", "c\rd", 'xyz', 'xyz'], $questions)), ['password' => 'xyz', 'generated' => false]);
+    verifie('pas de confirmation demandée pour une saisie refusée', count($questions), 4);
+    contient('avertissement', sortie(), 'saut de ligne');
+
+    $questions = [];
+    leve('trois refus : exception', static function () use (&$questions): void {
+        httpAuthAskPassword(httpAuthSaisieTest(["a\n", "\rb", "c\r\n"], $questions));
+    }, \RuntimeException::class, 'Les mots de passe saisis diffèrent.');
+    verifie('trois questions', count($questions), 3);
+});

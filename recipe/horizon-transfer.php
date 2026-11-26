@@ -4218,6 +4218,41 @@ function httpAuthGeneratePassword(): string
 }
 
 /**
+ * Mot de passe saisi deux fois, en saisie masquée, ou généré si la première saisie est vide.
+ * Trois essais : une confirmation différente ou un saut de ligne (refusé plus loin par
+ * httpAuthHttpStatus()) compte pour un écart. $askHidden remplace askHiddenResponse() dans
+ * les tests, celle-ci refusant un flux sans TTY.
+ *
+ * @return array{password: string, generated: bool}
+ * @throws \RuntimeException trois écarts de suite
+ */
+function httpAuthAskPassword(?callable $askHidden = null): array
+{
+    $askHidden = $askHidden ?? 'Deployer\askHiddenResponse';
+
+    for ($attempt = 0; $attempt < 3; $attempt++) {
+        $password = (string) $askHidden('Mot de passe HTTP (laisser vide pour en générer un) : ');
+
+        if ($password === '') {
+            return ['password' => httpAuthGeneratePassword(), 'generated' => true];
+        }
+
+        if (strpbrk($password, "\r\n") !== false) {
+            warning('Le mot de passe ne peut contenir de saut de ligne, recommencez.');
+            continue;
+        }
+
+        if ((string) $askHidden('Confirmez le mot de passe : ') === $password) {
+            return ['password' => $password, 'generated' => false];
+        }
+
+        warning('Les deux saisies diffèrent, recommencez.');
+    }
+
+    throw new \RuntimeException('Les mots de passe saisis diffèrent.');
+}
+
+/**
  * Ligne du .htpasswd, hash bcrypt calculé en local : seul le hash part vers le serveur, le
  * mot de passe en clair n'apparaît dans aucune commande.
  *
