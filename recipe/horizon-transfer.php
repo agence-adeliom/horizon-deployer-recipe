@@ -4422,6 +4422,8 @@ function httpAuthWriteFile(Host $env, string $path, string $content, string $mod
 /**
  * Code HTTP de $url, interrogée par curl depuis l'hôte (en local si $env vaut null) ;
  * null si curl échoue ou n'obtient aucune réponse. Les redirections ne sont pas suivies.
+ * `-q`, premier argument, écarte le ~/.curlrc de l'utilisateur·rice : un `-L` ou un `--fail`
+ * qui s'y trouverait fausserait les codes.
  *
  * Les identifiants passent par un fichier de configuration curl temporaire, en droits 600
  * et supprimé après l'appel, jamais par la commande (affichée en -vvv). Ils ne sont admis
@@ -4444,7 +4446,7 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
     }
 
     $config = null;
-    $command = "curl -sS -o /dev/null -w '%{http_code}' --max-time 20";
+    $command = "curl -q -sS -o /dev/null -w '%{http_code}' --max-time 20";
 
     try {
         if ($withCredentials) {
@@ -4617,24 +4619,6 @@ task('http-auth:setup', static function (): void {
         throw error("WP_HOME introuvable dans shared/.env de « $label » : URL du site inconnue. Rien n'a été écrit.");
     }
 
-    // 4. Protection existante, vue depuis le poste local : depuis le serveur, la requête
-    // passerait par l'exception d'IP d'un bloc déjà posé.
-    $status = httpAuthHttpStatus(null, $url);
-    $alreadyProtected = $status === 401;
-
-    if ($status === null) {
-        warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
-    } elseif ($status === 401) {
-        warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
-
-        // En -n, pas de question : l'étape 5 décrit ce que la tâche ferait.
-        if (input()->isInteractive() && !transferConfirm('Installer quand même ?', false)) {
-            info('Installation abandonnée : rien n\'a été écrit.');
-
-            return;
-        }
-    }
-
     $htpasswdPath = transferResolvePath($env, '{{http_auth_htpasswd}}');
     // Racine publique de la release, et non le chemin du .htaccess résolu : partagé, celui-ci
     // désigne shared/, hors du dossier servi.
@@ -4646,6 +4630,41 @@ task('http-auth:setup', static function (): void {
         httpAuthBlock($htpasswdPath, (string) get('http_auth_realm'), (array) get('http_auth_allow_ips'), (array) get('http_auth_except_paths'));
     } catch (\InvalidArgumentException $e) {
         throw error($e->getMessage() . ' Rien n\'a été écrit.');
+    }
+
+    // 4. Protection existante, vue depuis le poste local : depuis le serveur, la requête
+    // passerait par l'exception d'IP d'un bloc déjà posé.
+    $status = httpAuthHttpStatus(null, $url);
+    // Protection autre que le bloc Horizon (mu-plugin, provider Acorn), qui survivra au
+    // remplacement du bloc : seule elle rend la vérification finale non concluante.
+    $alreadyProtected = false;
+
+    if ($status === null) {
+        warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
+    } elseif ($status === 401) {
+        $liveHtaccessPath = httpAuthHtaccessPath($env, '{{current_path}}');
+        $liveHtaccess = httpAuthReadFile($env, $liveHtaccessPath);
+        $ownBlock = false;
+
+        try {
+            $ownBlock = $liveHtaccess !== null && httpAuthSplitBlock($liveHtaccess) !== null;
+        } catch (\UnexpectedValueException $e) {
+            // Bloc mal formé : traité comme une protection inconnue, refusé plus bas.
+        }
+
+        if ($ownBlock) {
+            info("$url répond déjà 401 : le bloc Horizon de $liveHtaccessPath est en place. Il sera remplacé, avec les IP à jour.");
+        } else {
+            $alreadyProtected = true;
+            warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
+
+            // En -n, pas de question : l'étape 5 décrit ce que la tâche ferait.
+            if (input()->isInteractive() && !transferConfirm('Installer quand même ?', false)) {
+                info('Installation abandonnée : rien n\'a été écrit.');
+
+                return;
+            }
+        }
     }
 
     // 5. Mode non interactif : description, aucune écriture.
@@ -4678,7 +4697,16 @@ task('http-auth:setup', static function (): void {
     }
 
     if ($probe['status'] !== 'ok') {
-        throw error(sprintf('Sonde Apache sans réponse exploitable sur %s (code %s) : authentification HTTP non vérifiable. Rien n\'a été écrit.', $url, $probe['code'] ?? 'aucun'));
+        // Une redirection vient le plus souvent d'un WP_HOME en http:// que le vhost renvoie
+        // vers https://, ou d'un www manquant.
+        $redirected = $probe['code'] !== null && $probe['code'] >= 300 && $probe['code'] <= 399;
+
+        throw error(sprintf(
+            'Sonde Apache sans réponse exploitable sur %s (code %s) : authentification HTTP non vérifiable.%s Rien n\'a été écrit.',
+            $url,
+            $probe['code'] ?? 'aucun',
+            $redirected ? " Le site redirige : vérifier que WP_HOME de shared/.env donne l'URL finale du site (https, www)." : ''
+        ));
     }
 
     if ($probe['ip'] === null) {
@@ -4781,8 +4809,21 @@ task('http-auth:setup', static function (): void {
 
         // 11. Vérification depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
         $without = httpAuthHttpStatus(null, $url);
+        // IP servies sans identifiants hors IP locales : le poste qui lance dep peut en faire
+        // partie (réseau du bureau, IP du serveur s'il y tourne). Un 200 ou un 30x sans
+        // identifiants ne prouve alors rien : le bloc, appliqué selon la sonde, est conservé.
+        $openIps = array_values(array_diff(array_unique(array_map('trim', array_map('strval', $ips))), ['127.0.0.1', '::1']));
+        $open = $without !== null && ($without === 200 || ($without >= 300 && $without <= 399));
 
-        if ($without !== 401) {
+        if ($open && $openIps !== []) {
+            warning(sprintf(
+                'Vérification non concluante : sans identifiants, %s répond %d depuis ce poste. Le bloc autorise sans identifiants l\'IP du serveur (%s) et celles de http_auth_allow_ips (%s). Ce poste utilise peut-être l\'une de ces IP. Bloc conservé. Tester dans un navigateur depuis un autre réseau, par exemple le partage de connexion d\'un téléphone. Le site doit y demander des identifiants.',
+                $url,
+                $without,
+                $probe['ip'] ?? 'non détectée',
+                (array) get('http_auth_allow_ips') !== [] ? implode(', ', (array) get('http_auth_allow_ips')) : 'aucune'
+            ));
+        } elseif ($without !== 401) {
             $failure = sprintf('sans identifiants, %s répond %s (401 attendu)', $url, $without ?? 'rien');
         } elseif ($password !== null) {
             $with = httpAuthHttpStatus(null, $url, $user, $password);
