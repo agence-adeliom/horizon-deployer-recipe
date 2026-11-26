@@ -229,6 +229,7 @@ cas('httpAuthWriteFile : contenu en base64, temporaire à côté de la cible, dr
     contient('temporaire à côté', $appel['commande'] ?? '', escapeshellarg('/srv/s/web/.htaccess.horizon-tmp'));
     contient('mv sur la cible', $appel['commande'] ?? '', 'mv -f ' . escapeshellarg('/srv/s/web/.htaccess.horizon-tmp') . ' ' . escapeshellarg('/srv/s/web/.htaccess'));
     verifie('sur l\'hôte', $appel['env'] ?? null, $h->getAlias());
+    contient('pipefail', $appel['commande'] ?? '', 'set -o pipefail; ');
 
     leve('droits invalides', static function () use ($h): void {
         httpAuthWriteFile($h, '/srv/s/web/.htaccess', 'x', '644; rm -rf /');
@@ -328,6 +329,18 @@ cas('httpAuthHttpStatus : identifiants dans un fichier de configuration local, j
         httpAuthHttpStatus($h, 'https://site.test/', 'adeliom', 'x');
     }, \LogicException::class);
     verifie('aucune commande', Shell::commandes(), []);
+
+    $refus = ['identifiant avec saut de ligne' => ["a\nb", 'x'], 'identifiant avec retour chariot' => ["a\rb", 'x'], 'mot de passe avec saut de ligne' => ['adeliom', "x\ny"], 'mot de passe avec retour chariot' => ['adeliom', "x\ry"]];
+
+    foreach ($refus as $libelle => $identifiants) {
+        Shell::reinitialiser();
+        $avant = glob(sys_get_temp_dir() . '/horizon-curl-*');
+        leve($libelle, static function () use ($identifiants): void {
+            httpAuthHttpStatus(null, 'https://site.test/', $identifiants[0], $identifiants[1]);
+        }, \InvalidArgumentException::class);
+        verifie("$libelle : aucune commande", Shell::commandes(), []);
+        verifie("$libelle : aucun fichier", glob(sys_get_temp_dir() . '/horizon-curl-*'), $avant);
+    }
 });
 
 cas('httpAuthProbe : statut selon le code HTTP, dossier toujours supprimé', static function (): void {
@@ -346,7 +359,8 @@ cas('httpAuthProbe : statut selon le code HTTP, dossier toujours supprimé', sta
         uneCommande("$code : dossier supprimé", '/rm -rf .*horizon-http-auth-/');
 
         if ($statut === 'ok') {
-            uneCommande('ok : IP lue depuis le serveur', '#^curl -fsS .*https://site\.test/horizon-http-auth-[0-9a-f]{12}/#');
+            $appel = uneCommande('ok : IP lue depuis le serveur', '#^curl -fsS .*https://site\.test/horizon-http-auth-[0-9a-f]{12}/#');
+            verifie('ok : curl lancé sur l\'hôte', $appel['env'] ?? null, $h->getAlias());
         } else {
             aucuneCommande("$code : pas de curl depuis le serveur", '/^curl -fsS /');
         }
@@ -414,6 +428,39 @@ cas('httpAuthProbe : fichiers de la sonde sur le disque, puis supprimés (réel)
     contient('.htaccess : utilisateur valide', $vu['htaccess'] ?? '', 'Require valid-user');
     verifie('.htpasswd vide', $vu['htpasswd'] ?? null, '');
     verifie('index.php', $vu['index'] ?? null, "<?php echo \$_SERVER['REMOTE_ADDR'];\n");
-    verifie('.htaccess vidé avant le curl du serveur', $vu['htaccess_apres'] ?? null, '');
+    verifie('accès ouvert avant le curl du serveur (auth héritée neutralisée)', $vu['htaccess_apres'] ?? null, "Require all granted\n");
     verifie('dossier supprimé', glob("$racine/horizon-http-auth-*"), []);
+});
+
+cas('httpAuthProbe : racine publique qui n\'est pas un chemin absolu résolu, refusée sans commande', static function (): void {
+    $h = hote('http-auth-sonde-racine');
+
+    foreach (['web' => 'relatif', '~/www' => 'en « ~ »', '{{current_path}}/web' => 'placeholder non résolu', '' => 'vide'] as $racine => $libelle) {
+        Shell::reinitialiser();
+        leve("racine $libelle", static function () use ($h, $racine): void {
+            httpAuthProbe($h, (string) $racine, 'https://site.test');
+        }, \InvalidArgumentException::class);
+        verifie("racine $libelle : aucune commande", Shell::commandes(), []);
+    }
+});
+
+cas('httpAuthProbe : suppression du dossier en échec, avertissement sans masquer le résultat ni l\'exception', static function (): void {
+    $h = hote('http-auth-sonde-rm');
+    sortie();
+    Shell::quand('/^curl -sS -o /', '401', 'local');
+    Shell::quand('/^curl -fsS /', '203.0.113.10');
+    Shell::quand('/^rm -rf /', new \RuntimeException('Device busy'));
+
+    verifie('résultat conservé', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ip' => '203.0.113.10']);
+    $sortie = sortie();
+    contient('avertissement', $sortie, 'laissé en place');
+    vrai('dossier nommé', preg_match('#/srv/s/current/web/horizon-http-auth-[0-9a-f]{12}#', $sortie) === 1);
+
+    Shell::reinitialiser();
+    Shell::quand('/base64 -d/', new \RuntimeException('Permission denied'));
+    Shell::quand('/^rm -rf /', new \RuntimeException('Device busy'));
+    leve('exception d\'origine conservée', static function () use ($h): void {
+        httpAuthProbe($h, '/srv/s/current/web', 'https://site.test');
+    }, \RuntimeException::class, 'Permission denied');
+    contient('avertissement après l\'exception', sortie(), 'laissé en place');
 });

@@ -4345,7 +4345,7 @@ function httpAuthWriteFile(Host $env, string $path, string $content, string $mod
     $tmp = escapeshellarg($path . '.horizon-tmp');
 
     transferRun($env, sprintf(
-        '{ printf %%s %s | base64 -d > %s && chmod %s %s && mv -f %s %s; } || { rm -f %s; exit 1; }',
+        '{ set -o pipefail; printf %%s %s | base64 -d > %s && chmod %s %s && mv -f %s %s; } || { rm -f %s; exit 1; }',
         escapeshellarg(base64_encode($content)),
         $tmp,
         $mode,
@@ -4365,6 +4365,8 @@ function httpAuthWriteFile(Host $env, string $path, string $content, string $mod
  * qu'en local : le mot de passe en clair ne doit pas aller sur le serveur.
  *
  * @throws \LogicException identifiants demandés pour un hôte distant
+ * @throws \InvalidArgumentException saut de ligne dans l'identifiant ou le mot de passe (il
+ *         casserait le fichier de configuration curl)
  */
 function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?string $password = null): ?int
 {
@@ -4372,6 +4374,10 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
 
     if ($withCredentials && $env !== null) {
         throw new \LogicException('Les identifiants de l\'authentification HTTP ne quittent pas le poste local : curl doit être lancé en local.');
+    }
+
+    if ($withCredentials && strpbrk((string) $user . (string) $password, "\r\n") !== false) {
+        throw new \InvalidArgumentException('Saut de ligne dans l\'identifiant ou le mot de passe de l\'authentification HTTP.');
     }
 
     $config = null;
@@ -4411,7 +4417,9 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
  * avec un .htaccess qui exige une authentification, un .htpasswd vide et un index.php qui
  * affiche l'adresse du client. Il est interrogé depuis le poste local :
  *
- *  - 401 : `ok`. Le .htaccess est alors vidé et l'index.php interrogé depuis le serveur :
+ *  - 401 : `ok`. Le .htaccess passe alors à `Require all granted` (une authentification
+ *    héritée d'un .htaccess parent, site déjà protégé, ne doit pas répondre 401 à la place
+ *    de l'index.php), qui est interrogé depuis le serveur :
  *    l'adresse affichée est celle qu'Apache voit pour les requêtes du serveur vers lui-même
  *    (`ip`, null si la sortie n'est pas une IP ou si curl échoue) ;
  *  - 200 : `ignored` (Nginx, ou AllowOverride sans AuthConfig) ;
@@ -4420,14 +4428,26 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
  *
  * Le .htaccess de la sonde est un vrai bloc (httpAuthBlock()), avec RequireAny et une
  * exception en `Require expr` : une directive non prise en charge y produit le même 500 que
- * sur le site. Le dossier est supprimé dans tous les cas.
+ * sur le site. Le dossier est supprimé dans tous les cas ; si la suppression échoue, un
+ * avertissement le signale, sans masquer le résultat ni l'exception d'origine.
  *
  * @return array{status: string, code: ?int, ip: ?string}
+ * @throws \InvalidArgumentException $webRoot qui n'est pas un chemin absolu résolu
  */
 function httpAuthProbe(Host $env, string $webRoot, string $url): array
 {
+    if (strpos($webRoot, '/') !== 0 || strpos($webRoot, '{{') !== false) {
+        throw new \InvalidArgumentException("Racine publique de la sonde invalide (chemin absolu résolu attendu) : $webRoot");
+    }
+
     $name = 'horizon-http-auth-' . bin2hex(random_bytes(6));
     $dir = rtrim($webRoot, '/') . '/' . $name;
+
+    // Garde-fou du rm -rf final : jamais d'autre chemin que le dossier de la sonde.
+    if (preg_match('/^horizon-http-auth-[0-9a-f]{12}$/', basename($dir)) !== 1) {
+        throw new \InvalidArgumentException("Dossier de sonde invalide : $dir");
+    }
+
     $probeUrl = rtrim($url, '/') . '/' . $name . '/';
     $htaccess = httpAuthBlock($dir . '/.htpasswd', 'Horizon', [], ['/.well-known/acme-challenge/']);
     $result = ['status' => 'unreachable', 'code' => null, 'ip' => null];
@@ -4444,7 +4464,7 @@ function httpAuthProbe(Host $env, string $webRoot, string $url): array
         $result['status'] = $code !== null && isset($statuses[$code]) ? $statuses[$code] : 'unreachable';
 
         if ($result['status'] === 'ok') {
-            httpAuthWriteFile($env, "$dir/.htaccess", '', '644');
+            httpAuthWriteFile($env, "$dir/.htaccess", "Require all granted\n", '644');
 
             try {
                 $ip = trim(transferRun($env, 'curl -fsS --max-time 20 ' . escapeshellarg($probeUrl)));
@@ -4454,9 +4474,11 @@ function httpAuthProbe(Host $env, string $webRoot, string $url): array
             }
         }
     } finally {
-        // Garde-fou : jamais de rm -rf sur un autre chemin que celui de la sonde.
-        if (strpos($dir, '/horizon-http-auth-') !== false) {
+        // Un échec ici ne doit masquer ni le résultat ni l'exception en cours.
+        try {
             transferRun($env, 'rm -rf ' . escapeshellarg($dir));
+        } catch (\Throwable $e) {
+            warning("Dossier de la sonde laissé en place, à supprimer à la main : $dir");
         }
     }
 
