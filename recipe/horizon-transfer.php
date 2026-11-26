@@ -4281,6 +4281,188 @@ function httpAuthProductionRefusal(array $values, bool $protected): ?string
     return $message;
 }
 
+/**
+ * Chemin réel du .htaccess de l'authentification HTTP sur l'hôte. $root vaut
+ * '{{current_path}}' ou '{{release_path}}', résolu dans le contexte de l'hôte (« ~/ »
+ * compris). `readlink -f` suit les liens : un .htaccess partagé désigne le fichier de
+ * shared/, celui qu'il faut réécrire. Fichier absent (`readlink -f` de BSD ne rend alors
+ * rien, contrairement à celui de GNU) ou readlink manquant : dossier résolu par
+ * `cd && pwd -P`. Dossier manquant : chemin non résolu.
+ */
+function httpAuthHtaccessPath(Host $env, string $root): string
+{
+    $path = transferResolvePath($env, $root . '/{{http_auth_htaccess}}');
+    $real = trim(transferRun($env, sprintf(
+        'readlink -f %s 2>/dev/null || (cd %s 2>/dev/null && printf "%%s/%%s\n" "$(pwd -P)" %s) || true',
+        escapeshellarg($path),
+        escapeshellarg(dirname($path)),
+        escapeshellarg(basename($path))
+    )));
+
+    return $real !== '' ? $real : $path;
+}
+
+/**
+ * Contenu d'un fichier de l'hôte, null s'il n'existe pas. Transmis en base64 : la sortie
+ * des commandes perd ses blancs de fin, ce qui altérerait un fichier sans saut de ligne
+ * final ou en CRLF.
+ *
+ * @throws \RuntimeException sortie illisible
+ */
+function httpAuthReadFile(Host $env, string $path): ?string
+{
+    $quoted = escapeshellarg($path);
+    $output = transferRun($env, "if [ -f $quoted ]; then echo +dep; base64 < $quoted; fi");
+
+    if (strpos(ltrim($output), '+dep') !== 0) {
+        return null;
+    }
+
+    $content = base64_decode((string) preg_replace('/\s+/', '', substr(ltrim($output), 4)), true);
+
+    if ($content === false) {
+        throw new \RuntimeException("Lecture de $path impossible : contenu base64 invalide.");
+    }
+
+    return $content;
+}
+
+/**
+ * Écrit un fichier de l'hôte d'un seul coup : contenu passé en base64 (aucun échappement
+ * à craindre), écrit dans `<cible>.horizon-tmp` à côté de la cible, droits posés, puis
+ * `mv` sur la cible. Le temporaire est supprimé si une étape échoue.
+ *
+ * @param string $mode droits en octal, « 644 » par exemple
+ * @throws \InvalidArgumentException droits qui ne sont pas un nombre octal
+ */
+function httpAuthWriteFile(Host $env, string $path, string $content, string $mode): void
+{
+    if (preg_match('/^[0-7]{3,4}$/', $mode) !== 1) {
+        throw new \InvalidArgumentException("Droits invalides : $mode");
+    }
+
+    $target = escapeshellarg($path);
+    $tmp = escapeshellarg($path . '.horizon-tmp');
+
+    transferRun($env, sprintf(
+        '{ printf %%s %s | base64 -d > %s && chmod %s %s && mv -f %s %s; } || { rm -f %s; exit 1; }',
+        escapeshellarg(base64_encode($content)),
+        $tmp,
+        $mode,
+        $tmp,
+        $tmp,
+        $target,
+        $tmp
+    ));
+}
+
+/**
+ * Code HTTP de $url, interrogée par curl depuis l'hôte (en local si $env vaut null) ;
+ * null si curl échoue ou n'obtient aucune réponse. Les redirections ne sont pas suivies.
+ *
+ * Les identifiants passent par un fichier de configuration curl temporaire, en droits 600
+ * et supprimé après l'appel, jamais par la commande (affichée en -vvv). Ils ne sont admis
+ * qu'en local : le mot de passe en clair ne doit pas aller sur le serveur.
+ *
+ * @throws \LogicException identifiants demandés pour un hôte distant
+ */
+function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?string $password = null): ?int
+{
+    $withCredentials = $user !== null || $password !== null;
+
+    if ($withCredentials && $env !== null) {
+        throw new \LogicException('Les identifiants de l\'authentification HTTP ne quittent pas le poste local : curl doit être lancé en local.');
+    }
+
+    $config = null;
+    $command = "curl -sS -o /dev/null -w '%{http_code}' --max-time 20";
+
+    try {
+        if ($withCredentials) {
+            $config = tempnam(sys_get_temp_dir(), 'horizon-curl-');
+
+            if ($config === false) {
+                throw new \RuntimeException('Fichier de configuration curl impossible à créer.');
+            }
+
+            // Droits restreints avant d'y écrire le mot de passe.
+            chmod($config, 0600);
+            file_put_contents($config, 'user = "' . addcslashes((string) $user . ':' . (string) $password, '"\\') . "\"\n");
+            $command .= ' -K ' . escapeshellarg($config);
+        }
+
+        try {
+            $output = trim(transferRun($env, $command . ' ' . escapeshellarg($url)));
+        } catch (\Throwable $e) {
+            return null;
+        }
+    } finally {
+        if (is_string($config) && is_file($config)) {
+            unlink($config);
+        }
+    }
+
+    return preg_match('/^[1-5][0-9]{2}$/', $output) === 1 ? (int) $output : null;
+}
+
+/**
+ * Sonde Apache : le serveur applique-t-il un .htaccess d'authentification ? Un dossier
+ * `horizon-http-auth-<aléa>` est créé sous $webRoot (chemin résolu de la racine publique),
+ * avec un .htaccess qui exige une authentification, un .htpasswd vide et un index.php qui
+ * affiche l'adresse du client. Il est interrogé depuis le poste local :
+ *
+ *  - 401 : `ok`. Le .htaccess est alors vidé et l'index.php interrogé depuis le serveur :
+ *    l'adresse affichée est celle qu'Apache voit pour les requêtes du serveur vers lui-même
+ *    (`ip`, null si la sortie n'est pas une IP ou si curl échoue) ;
+ *  - 200 : `ignored` (Nginx, ou AllowOverride sans AuthConfig) ;
+ *  - 500 : `error` (directives refusées : Apache 2.2, module manquant) ;
+ *  - aucune réponse ou autre code : `unreachable`.
+ *
+ * Le .htaccess de la sonde est un vrai bloc (httpAuthBlock()), avec RequireAny et une
+ * exception en `Require expr` : une directive non prise en charge y produit le même 500 que
+ * sur le site. Le dossier est supprimé dans tous les cas.
+ *
+ * @return array{status: string, code: ?int, ip: ?string}
+ */
+function httpAuthProbe(Host $env, string $webRoot, string $url): array
+{
+    $name = 'horizon-http-auth-' . bin2hex(random_bytes(6));
+    $dir = rtrim($webRoot, '/') . '/' . $name;
+    $probeUrl = rtrim($url, '/') . '/' . $name . '/';
+    $htaccess = httpAuthBlock($dir . '/.htpasswd', 'Horizon', [], ['/.well-known/acme-challenge/']);
+    $result = ['status' => 'unreachable', 'code' => null, 'ip' => null];
+
+    try {
+        transferRun($env, 'mkdir ' . escapeshellarg($dir));
+        httpAuthWriteFile($env, "$dir/.htpasswd", '', '644');
+        httpAuthWriteFile($env, "$dir/index.php", "<?php echo \$_SERVER['REMOTE_ADDR'];\n", '644');
+        httpAuthWriteFile($env, "$dir/.htaccess", $htaccess, '644');
+
+        $code = httpAuthHttpStatus(null, $probeUrl);
+        $statuses = [401 => 'ok', 200 => 'ignored', 500 => 'error'];
+        $result['code'] = $code;
+        $result['status'] = $code !== null && isset($statuses[$code]) ? $statuses[$code] : 'unreachable';
+
+        if ($result['status'] === 'ok') {
+            httpAuthWriteFile($env, "$dir/.htaccess", '', '644');
+
+            try {
+                $ip = trim(transferRun($env, 'curl -fsS --max-time 20 ' . escapeshellarg($probeUrl)));
+                $result['ip'] = filter_var($ip, FILTER_VALIDATE_IP) !== false ? $ip : null;
+            } catch (\Throwable $e) {
+                // IP inconnue : le bloc s'en passe, http_auth_allow_ips permet de la fournir.
+            }
+        }
+    } finally {
+        // Garde-fou : jamais de rm -rf sur un autre chemin que celui de la sonde.
+        if (strpos($dir, '/horizon-http-auth-') !== false) {
+            transferRun($env, 'rm -rf ' . escapeshellarg($dir));
+        }
+    }
+
+    return $result;
+}
+
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
 // deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la
