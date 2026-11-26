@@ -56,7 +56,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 // donc la redéclaration est fatale avant même qu'un `if (defined(...)) return;`
 // n'ait pu s'exécuter. La constante ci-dessous sert donc de marqueur de version,
 // utile pour tester la présence du recipe depuis un deploy.php.
-define('HORIZON_TRANSFER_RECIPE', '1.9.2');
+define('HORIZON_TRANSFER_RECIPE', '1.10.0');
 
 /*
 |--------------------------------------------------------------------------
@@ -5106,6 +5106,8 @@ if (Deployer::get()->tasks->has('deploy:symlink')) {
     before('deploy:symlink', 'deploy:db-backup');
     // Un échec de la réinjection interrompt le déploiement avant la bascule : mettre en
     // ligne une préproduction sans protection serait une régression silencieuse.
+    // Les `before` s'empilent en tête (array_unshift) : deploy:http-auth, déclarée après
+    // deploy:db-backup, passe donc AVANT elle.
     before('deploy:symlink', 'deploy:http-auth');
 }
 
