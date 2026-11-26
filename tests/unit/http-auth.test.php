@@ -378,12 +378,14 @@ cas('httpAuthProbe : statut selon le code HTTP, dossier toujours supprimé', sta
         $resultat = httpAuthProbe($h, '/srv/s/current/web', 'https://site.test');
         verifie("$code : statut", $resultat['status'], $statut);
         verifie("$code : code", $resultat['code'], $code === '' ? null : (int) $code);
-        verifie("$code : IP", $resultat['ip'], $statut === 'ok' ? '203.0.113.10' : null);
+        verifie("$code : IP", $resultat['ips'], $statut === 'ok' ? ['203.0.113.10'] : []);
         uneCommande("$code : dossier supprimé", '/rm -rf .*horizon-http-auth-/');
 
         if ($statut === 'ok') {
-            $appel = uneCommande('ok : IP lue depuis le serveur', '#^curl -fsS .*https://site\.test/horizon-http-auth-[0-9a-f]{12}/#');
-            verifie('ok : curl lancé sur l\'hôte', $appel['env'] ?? null, $h->getAlias());
+            foreach (['-4', '-6'] as $famille) {
+                $appel = uneCommande("ok : IP lue depuis le serveur en $famille", '#^curl -fsS ' . $famille . ' .*https://site\.test/horizon-http-auth-[0-9a-f]{12}/#');
+                verifie("ok : curl $famille lancé sur l'hôte", $appel['env'] ?? null, $h->getAlias());
+            }
         } else {
             aucuneCommande("$code : pas de curl depuis le serveur", '/^curl -fsS /');
         }
@@ -395,13 +397,13 @@ cas('httpAuthProbe : curl distant en échec ou sortie qui n\'est pas une IP', st
     Shell::quand('/^curl -q -sS -o /', '401', 'local');
     Shell::quand('/^curl -fsS /', new \RuntimeException('curl: (22) 403'));
 
-    verifie('exception : ok sans IP', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ip' => null]);
+    verifie('exception : ok sans IP', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ips' => []]);
     uneCommande('exception : dossier supprimé', '/rm -rf .*horizon-http-auth-/');
 
     Shell::reinitialiser();
     Shell::quand('/^curl -q -sS -o /', '401', 'local');
     Shell::quand('/^curl -fsS /', '<html>Erreur</html>');
-    verifie('pas une IP : ok sans IP', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ip' => null]);
+    verifie('pas une IP : ok sans IP', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ips' => []]);
 
     Shell::reinitialiser();
     Shell::quand('/^curl -q -sS -o /', '401', 'local');
@@ -410,6 +412,31 @@ cas('httpAuthProbe : curl distant en échec ou sortie qui n\'est pas une IP', st
         httpAuthProbe($h, '/srv/s/current/web', 'https://site.test');
     }, \RuntimeException::class, 'Permission denied');
     uneCommande('écriture impossible : dossier supprimé', '/rm -rf .*horizon-http-auth-/');
+});
+
+cas('httpAuthProbe : IPv4 et IPv6 mesurées depuis le serveur, famille absente ignorée, doublon retiré', static function (): void {
+    $absente = new \RuntimeException('curl: (7) Failed to connect');
+    $variantes = [
+        'deux familles' => ["203.0.113.10\n", '2001:db8::10', ['203.0.113.10', '2001:db8::10']],
+        'IPv4 seule' => ['203.0.113.10', $absente, ['203.0.113.10']],
+        'IPv6 seule' => [$absente, '2001:db8::10', ['2001:db8::10']],
+        'aucune' => [$absente, $absente, []],
+        'sortie non IP ignorée' => ['<html>Erreur</html>', '2001:db8::10', ['2001:db8::10']],
+        'même adresse' => ['203.0.113.10', '203.0.113.10', ['203.0.113.10']],
+    ];
+
+    foreach ($variantes as $libelle => [$v4, $v6, $attendu]) {
+        $h = hote('http-auth-sonde-familles');
+        Shell::reinitialiser();
+        Shell::quand('/^curl -q -sS -o /', '401', 'local');
+        Shell::quand('/^curl -fsS -4 /', $v4);
+        Shell::quand('/^curl -fsS -6 /', $v6);
+
+        verifie("$libelle : résultat", httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ips' => $attendu]);
+        uneCommande("$libelle : requête IPv4", '#^curl -fsS -4 --max-time 20 \'https://site\.test/horizon-http-auth-[0-9a-f]{12}/\'$#');
+        uneCommande("$libelle : requête IPv6", '#^curl -fsS -6 --max-time 20 \'https://site\.test/horizon-http-auth-[0-9a-f]{12}/\'$#');
+        uneCommande("$libelle : dossier supprimé", '/rm -rf .*horizon-http-auth-/');
+    }
 });
 
 cas('httpAuthProbe : URL sans double barre (barre finale, sous-dossier)', static function (): void {
@@ -444,7 +471,7 @@ cas('httpAuthProbe : fichiers de la sonde sur le disque, puis supprimés (réel)
     });
 
     $resultat = httpAuthProbe($h, $racine, 'https://site.test');
-    verifie('résultat', $resultat, ['status' => 'ok', 'code' => 401, 'ip' => '203.0.113.10']);
+    verifie('résultat', $resultat, ['status' => 'ok', 'code' => 401, 'ips' => ['203.0.113.10']]);
     verifie('un dossier de sonde', $vu['dossiers'] ?? null, 1);
     contient('.htaccess exige une authentification', $vu['htaccess'] ?? '', "AuthType Basic\n");
     contient('.htaccess désigne le .htpasswd de la sonde', $vu['htaccess'] ?? '', '/.htpasswd"');
@@ -474,7 +501,7 @@ cas('httpAuthProbe : suppression du dossier en échec, avertissement sans masque
     Shell::quand('/^curl -fsS /', '203.0.113.10');
     Shell::quand('/^rm -rf /', new \RuntimeException('Device busy'));
 
-    verifie('résultat conservé', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ip' => '203.0.113.10']);
+    verifie('résultat conservé', httpAuthProbe($h, '/srv/s/current/web', 'https://site.test'), ['status' => 'ok', 'code' => 401, 'ips' => ['203.0.113.10']]);
     $sortie = sortie();
     contient('avertissement', $sortie, 'laissé en place');
     vrai('dossier nommé', preg_match('#/srv/s/current/web/horizon-http-auth-[0-9a-f]{12}#', $sortie) === 1);
@@ -818,6 +845,47 @@ cas('http-auth:setup : IP de la sonde puis http_auth_allow_ips, .htaccess créé
     aucuneCommande('pas de stat sur un fichier absent', '/^stat /');
     absent('mot de passe saisi non affiché', sortie(), 'secret');
     absent('mot de passe saisi absent des commandes', implode("\n", Shell::commandes()), 'secret');
+});
+
+cas('http-auth:setup : IPv4 et IPv6 du serveur dans le bloc et le récapitulatif', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deux-ip', ['http_auth_allow_ips' => ['198.51.100.7']]);
+    httpAuthEnvTest();
+    Shell::quand('/^curl -fsS -6 /', "2001:db8::10\n");
+    httpAuthCurlTest(['200', '401']);
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('deux IP du serveur, puis http_auth_allow_ips', (string) httpAuthEcritTest(httpAuthCheminsTest($h)[0]), 'Require ip 127.0.0.1 ::1 203.0.113.10 2001:db8::10 198.51.100.7' . "\n");
+    contient('récapitulatif', $sortie, 'IP détectées pour le serveur : 203.0.113.10, 2001:db8::10');
+    absent('pas d\'avertissement d\'IP manquante', $sortie, 'non détectée');
+
+    // Aucune IP : avertissement, récapitulatif « aucune ».
+    $h = httpAuthHoteSetup('http-auth-aucune-ip');
+    Shell::reinitialiser();
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401'], '401', '200', null);
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('avertissement', $sortie, 'Aucune IP du serveur détectée');
+    contient('récapitulatif', $sortie, 'IP détectées pour le serveur : aucune');
+    contient('bloc sans IP du serveur', (string) httpAuthEcritTest(httpAuthCheminsTest($h)[0]), 'Require ip 127.0.0.1 ::1' . "\n");
+});
+
+cas('http-auth:setup : 200 sans identifiants, IPv4 et IPv6 citées dans l\'avertissement non concluant', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deux-ip-non-concluant');
+    httpAuthEnvTest();
+    Shell::quand('/^curl -fsS -6 /', '2001:db8::10');
+    httpAuthCurlTest(['200', '200']);
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    contient('IP citées', sortie(), 'les IP du serveur (203.0.113.10, 2001:db8::10)');
 });
 
 cas('http-auth:setup : .htpasswd existant conservé, renvoi vers http-auth:update', static function (): void {

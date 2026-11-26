@@ -4484,9 +4484,12 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
  *
  *  - 401 : `ok`. Le .htaccess passe alors à `Require all granted` (une authentification
  *    héritée d'un .htaccess parent, site déjà protégé, ne doit pas répondre 401 à la place
- *    de l'index.php), qui est interrogé depuis le serveur :
- *    l'adresse affichée est celle qu'Apache voit pour les requêtes du serveur vers lui-même
- *    (`ip`, null si la sortie n'est pas une IP ou si curl échoue) ;
+ *    de l'index.php), qui est interrogé depuis le serveur, une fois en IPv4 (`curl -4`) et
+ *    une fois en IPv6 (`curl -6`) : un serveur doté des deux familles s'adresse à lui-même
+ *    par l'une ou l'autre selon le programme (curl préfère IPv6, WP-Cron peut passer par
+ *    IPv4). Les adresses affichées sont celles qu'Apache voit pour ces requêtes (`ips`,
+ *    sans doublon ; une famille absente, une sortie qui n'est pas une IP ou un curl en
+ *    échec n'y ajoutent rien) ;
  *  - 200 : `ignored` (Nginx, ou AllowOverride sans AuthConfig) ;
  *  - 500 : `error` (directives refusées : Apache 2.2, module manquant) ;
  *  - aucune réponse ou autre code : `unreachable`.
@@ -4496,7 +4499,7 @@ function httpAuthHttpStatus(?Host $env, string $url, ?string $user = null, ?stri
  * sur le site. Le dossier est supprimé dans tous les cas ; si la suppression échoue, un
  * avertissement le signale, sans masquer le résultat ni l'exception d'origine.
  *
- * @return array{status: string, code: ?int, ip: ?string}
+ * @return array{status: string, code: ?int, ips: list<string>}
  * @throws \InvalidArgumentException $webRoot qui n'est pas un chemin absolu résolu
  */
 function httpAuthProbe(Host $env, string $webRoot, string $url): array
@@ -4515,7 +4518,7 @@ function httpAuthProbe(Host $env, string $webRoot, string $url): array
 
     $probeUrl = rtrim($url, '/') . '/' . $name . '/';
     $htaccess = httpAuthBlock($dir . '/.htpasswd', 'Horizon', [], ['/.well-known/acme-challenge/']);
-    $result = ['status' => 'unreachable', 'code' => null, 'ip' => null];
+    $result = ['status' => 'unreachable', 'code' => null, 'ips' => []];
 
     try {
         transferRun($env, 'mkdir ' . escapeshellarg($dir));
@@ -4531,11 +4534,18 @@ function httpAuthProbe(Host $env, string $webRoot, string $url): array
         if ($result['status'] === 'ok') {
             httpAuthWriteFile($env, "$dir/.htaccess", "Require all granted\n", '644');
 
-            try {
-                $ip = trim(transferRun($env, 'curl -fsS --max-time 20 ' . escapeshellarg($probeUrl)));
-                $result['ip'] = filter_var($ip, FILTER_VALIDATE_IP) !== false ? $ip : null;
-            } catch (\Throwable $e) {
-                // IP inconnue : le bloc s'en passe, http_auth_allow_ips permet de la fournir.
+            foreach (['-4', '-6'] as $family) {
+                try {
+                    $ip = trim(transferRun($env, "curl -fsS $family --max-time 20 " . escapeshellarg($probeUrl)));
+                } catch (\Throwable $e) {
+                    // Famille absente ou IP inconnue : le bloc s'en passe, http_auth_allow_ips
+                    // permet de la fournir.
+                    continue;
+                }
+
+                if (filter_var($ip, FILTER_VALIDATE_IP) !== false && !in_array($ip, $result['ips'], true)) {
+                    $result['ips'][] = $ip;
+                }
             }
         }
     } finally {
@@ -4625,7 +4635,7 @@ task('http-auth:setup', static function (): void {
     $servedHtaccess = transferResolvePath($env, '{{current_path}}/{{http_auth_htaccess}}');
 
     // Valeurs de l'inventaire contrôlées avant toute question, -n compris : le bloc final,
-    // avec l'IP de la sonde, est recalculé plus bas.
+    // avec les IP de la sonde, est recalculé plus bas.
     try {
         httpAuthBlock($htpasswdPath, (string) get('http_auth_realm'), (array) get('http_auth_allow_ips'), (array) get('http_auth_except_paths'));
     } catch (\InvalidArgumentException $e) {
@@ -4709,8 +4719,8 @@ task('http-auth:setup', static function (): void {
         ));
     }
 
-    if ($probe['ip'] === null) {
-        warning('IP du serveur non détectée : ses requêtes vers le site (WP-Cron, santé du site) demanderont des identifiants. La déclarer dans http_auth_allow_ips au besoin.');
+    if ($probe['ips'] === []) {
+        warning('Aucune IP du serveur détectée : ses requêtes vers le site (WP-Cron, santé du site) demanderont des identifiants. Déclarer ses IP dans http_auth_allow_ips au besoin.');
     }
 
     // 8. Mot de passe : un .htpasswd existant est conservé sans question.
@@ -4741,7 +4751,7 @@ task('http-auth:setup', static function (): void {
 
     // Bloc et nouveau .htaccess calculés avant toute écriture : une valeur refusée ou un bloc
     // mal formé arrête la tâche sans rien avoir modifié.
-    $ips = array_merge($probe['ip'] !== null ? [$probe['ip']] : [], (array) get('http_auth_allow_ips'));
+    $ips = array_merge($probe['ips'], (array) get('http_auth_allow_ips'));
     $block = httpAuthBlock($htpasswdPath, (string) get('http_auth_realm'), $ips, (array) get('http_auth_except_paths'));
     $htaccessPath = httpAuthHtaccessPath($env, '{{current_path}}');
     $original = httpAuthReadFile($env, $htaccessPath);
@@ -4817,10 +4827,10 @@ task('http-auth:setup', static function (): void {
 
         if ($open && $openIps !== []) {
             warning(sprintf(
-                'Vérification non concluante : sans identifiants, %s répond %d depuis ce poste. Le bloc autorise sans identifiants l\'IP du serveur (%s) et celles de http_auth_allow_ips (%s). Ce poste utilise peut-être l\'une de ces IP. Bloc conservé. Tester dans un navigateur depuis un autre réseau, par exemple le partage de connexion d\'un téléphone. Le site doit y demander des identifiants.',
+                'Vérification non concluante : sans identifiants, %s répond %d depuis ce poste. Le bloc autorise sans identifiants les IP du serveur (%s) et celles de http_auth_allow_ips (%s). Ce poste utilise peut-être l\'une de ces IP. Bloc conservé. Tester dans un navigateur depuis un autre réseau, par exemple le partage de connexion d\'un téléphone. Le site doit y demander des identifiants.',
                 $url,
                 $without,
-                $probe['ip'] ?? 'non détectée',
+                $probe['ips'] !== [] ? implode(', ', $probe['ips']) : 'aucune détectée',
                 (array) get('http_auth_allow_ips') !== [] ? implode(', ', (array) get('http_auth_allow_ips')) : 'aucune'
             ));
         } elseif ($without !== 401) {
@@ -4855,7 +4865,7 @@ task('http-auth:setup', static function (): void {
     info("Authentification HTTP installée sur « $label ».");
     writeln("   URL : $url");
     writeln("   Identifiant : $user");
-    writeln('   IP détectée pour le serveur : ' . ($probe['ip'] ?? 'aucune'));
+    writeln('   IP détectées pour le serveur : ' . ($probe['ips'] !== [] ? implode(', ', $probe['ips']) : 'aucune'));
 
     if ($generated) {
         writeln("   Mot de passe : $password");
@@ -5099,8 +5109,8 @@ task('deploy:http-auth', static function (): void {
         return;
     }
 
-    // 4. IP du serveur, connue seulement par la sonde de http-auth:setup : relue dans le bloc
-    // de la release en ligne. Premier déploiement ou bloc absent : aucune.
+    // 4. IP du serveur (IPv4 et IPv6), connues seulement par la sonde de http-auth:setup :
+    // relues dans le bloc de la release en ligne. Premier déploiement ou bloc absent : aucune.
     $currentPath = httpAuthHtaccessPath($env, '{{current_path}}');
     $current = httpAuthReadFile($env, $currentPath);
     $ips = [];
@@ -5108,7 +5118,7 @@ task('deploy:http-auth', static function (): void {
     try {
         $ips = $current !== null ? httpAuthBlockIps($current) : [];
     } catch (\UnexpectedValueException $e) {
-        warning("$currentPath : " . $e->getMessage() . ' IP du serveur non reprise : seules celles de http_auth_allow_ips sont autorisées sans identifiants.');
+        warning("$currentPath : " . $e->getMessage() . ' IP du serveur non reprises : seules celles de http_auth_allow_ips sont autorisées sans identifiants.');
     }
 
     // Une valeur refusée (IP invalide de http_auth_allow_ips, par exemple) donnerait une 500
