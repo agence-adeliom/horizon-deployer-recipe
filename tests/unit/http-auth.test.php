@@ -1521,3 +1521,282 @@ cas('http-auth:update : AuthUserFile du bloc différent de http_auth_htpasswd, r
     verifie('aucune saisie', $questions, []);
     httpAuthAucuneEcritureUpdate('AuthUserFile différent');
 });
+
+/*
+ * Tâche cachée deploy:http-auth (réinjection du bloc dans la nouvelle release).
+ */
+
+/** Hôte prêt pour deploy:http-auth : http_auth activé, release 2 en préparation. */
+function httpAuthHoteDeploy(string $alias, array $config = []): \Deployer\Host\Host
+{
+    $h = hote($alias, $config);
+    $h->set('http_auth', $config['http_auth'] ?? true);
+    $h->set('release_path', '/srv/' . $h->getAlias() . '/releases/2');
+
+    return $h;
+}
+
+/** .htpasswd présent ou non, pour le test d'existence de deploy:http-auth. */
+function httpAuthHtpasswdPresentTest(\Deployer\Host\Host $h, bool $present = true): void
+{
+    if ($present) {
+        Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg('/srv/' . $h->getAlias() . '/shared/.htpasswd'), '#') . ' \]; then echo \+true#', '+true');
+    }
+}
+
+/** Contenu des .htaccess de current et de la release (null : absent). */
+function httpAuthHtaccessDeployTest(\Deployer\Host\Host $h, ?string $current, ?string $release): void
+{
+    $chemins = [
+        '/srv/' . $h->getAlias() . '/current/web/.htaccess' => $current,
+        '/srv/' . $h->getAlias() . '/releases/2/web/.htaccess' => $release,
+    ];
+
+    foreach ($chemins as $chemin => $contenu) {
+        if ($contenu !== null) {
+            Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($chemin), '#') . ' \]; then echo \+dep#', "+dep\n" . base64_encode($contenu));
+        }
+    }
+}
+
+cas('deploy:http-auth : http_auth faux, aucune commande', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-inactif', ['http_auth' => false]);
+    tache('deploy:http-auth', $h);
+    verifie('aucune commande', Shell::commandes(), []);
+});
+
+cas('deploy:http-auth : production, avertissement sans écriture, déploiement poursuivi', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-prod-env');
+    httpAuthEnvTest("WP_ENV=production\nWP_HOME=https://www.site.test");
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, httpAuthBlock('/srv/x/.htpasswd', 'r', [], []), "# BEGIN WordPress\n# END WordPress\n");
+    sortie();
+
+    tache('deploy:http-auth', $h);
+    contient('avertissement', sortie(), 'WP_ENV=production');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+    aucuneCommande('aucune lecture de .htaccess', '/\.htaccess/');
+});
+
+cas('deploy:http-auth : .htpasswd absent, avertissement sans écriture', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-sans-htpasswd');
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h, false);
+    sortie();
+
+    tache('deploy:http-auth', $h);
+    $sortie = sortie();
+    contient('avertissement', $sortie, '/shared/.htpasswd');
+    contient('renvoi vers setup', $sortie, 'http-auth:setup');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+    aucuneCommande('aucune lecture de .htaccess', '/\.htaccess/');
+    aucuneCommande('test hors de current (absent au premier déploiement)', '/^cd /');
+});
+
+cas('deploy:http-auth : IP du bloc de current reprise, avec http_auth_allow_ips, droits conservés', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-ip', ['http_auth_allow_ips' => ['198.51.100.7']]);
+    $htpasswd = '/srv/' . $h->getAlias() . '/shared/.htpasswd';
+    $release = '/srv/' . $h->getAlias() . '/releases/2/web/.htaccess';
+    $wp = "# BEGIN WordPress\n# END WordPress\n";
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, httpAuthBlock($htpasswd, 'Accès restreint', ['203.0.113.10'], []) . "\n" . $wp, $wp);
+    Shell::quand('/^stat -c %a /', '640');
+    entree([], false, []);
+
+    tache('deploy:http-auth', $h);
+    verifie('bloc réinjecté dans la release', httpAuthEcritTest($release), httpAuthBlock($htpasswd, 'Accès restreint', ['203.0.113.10', '198.51.100.7'], ['/.well-known/acme-challenge/']) . "\n" . $wp);
+    uneCommande('droits conservés', '/chmod 640 /');
+    aucuneCommande('current jamais écrit', '/base64 -d > .*current/');
+    aucuneCommande('.htpasswd jamais écrit', '/base64 -d > .*\.htpasswd/');
+    aucuneCommande('aucune sonde ni curl', '/horizon-http-auth-|curl /');
+});
+
+cas('deploy:http-auth : premier déploiement, .htaccess de release absent, créé en 644', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-premier');
+    $htpasswd = '/srv/' . $h->getAlias() . '/shared/.htpasswd';
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+
+    tache('deploy:http-auth', $h);
+    verifie('bloc sans IP du serveur', httpAuthEcritTest('/srv/' . $h->getAlias() . '/releases/2/web/.htaccess'), httpAuthBlock($htpasswd, 'Accès restreint', [], ['/.well-known/acme-challenge/']));
+    uneCommande('créé en 644', '/chmod 644 /');
+    aucuneCommande('droits non lus', '/^stat /');
+});
+
+cas('deploy:http-auth : bloc identique dans la release, aucune écriture', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-identique');
+    $bloc = httpAuthBlock('/srv/' . $h->getAlias() . '/shared/.htpasswd', 'Accès restreint', ['203.0.113.10'], ['/.well-known/acme-challenge/']);
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, $bloc, $bloc . "\n# BEGIN WordPress\n");
+
+    tache('deploy:http-auth', $h);
+    aucuneCommande('aucune écriture', '/base64 -d/');
+});
+
+cas('deploy:http-auth : bloc de current mal formé, avertissement, IP de l\'inventaire seules', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-current-mal-forme', ['http_auth_allow_ips' => ['198.51.100.7']]);
+    $htpasswd = '/srv/' . $h->getAlias() . '/shared/.htpasswd';
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, "# BEGIN Horizon HTTP auth\nRequire ip 203.0.113.10\n", '');
+    sortie();
+
+    tache('deploy:http-auth', $h);
+    contient('avertissement', sortie(), '/current/web/.htaccess');
+    verifie('bloc réinjecté sans l\'IP du bloc mal formé', httpAuthEcritTest('/srv/' . $h->getAlias() . '/releases/2/web/.htaccess'), httpAuthBlock($htpasswd, 'Accès restreint', ['198.51.100.7'], ['/.well-known/acme-challenge/']));
+});
+
+cas('deploy:http-auth : bloc de la release mal formé, erreur sans écriture', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-release-mal-forme');
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, null, "# BEGIN Horizon HTTP auth\nx\n");
+
+    leve('erreur', static function () use ($h): void {
+        tache('deploy:http-auth', $h);
+    }, \Throwable::class, '/releases/2/web/.htaccess');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+});
+
+cas('deploy:http-auth : écriture en échec, exception propagée', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-ecriture-ko');
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    Shell::quand('/base64 -d > /', new \RuntimeException('Disque plein'));
+    sortie();
+
+    leve('exception d\'origine', static function () use ($h): void {
+        tache('deploy:http-auth', $h);
+    }, \RuntimeException::class, 'Disque plein');
+    contient('avertissement explicite', sortie(), 'avant la bascule');
+});
+
+cas('deploy:http-auth : de bout en bout sur le disque, IP de current reprise (réel)', static function (): void {
+    $racine = dossierTemporaire();
+    mkdir("$racine/releases/1/web", 0777, true);
+    mkdir("$racine/releases/2/web", 0777, true);
+    mkdir("$racine/shared", 0777, true);
+    symlink("$racine/releases/1", "$racine/current");
+    file_put_contents("$racine/shared/.env", "WP_ENV='staging'\nWP_HOME='https://staging.site.test'\n");
+    file_put_contents("$racine/shared/.htpasswd", "adeliom:\$2y\$10\$abc\n");
+    $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
+    file_put_contents("$racine/releases/1/web/.htaccess", httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', ['203.0.113.10'], ['/.well-known/acme-challenge/']) . "\n" . $wp);
+    file_put_contents("$racine/releases/2/web/.htaccess", $wp);
+    chmod("$racine/releases/2/web/.htaccess", 0640);
+
+    $h = hoteLocal('http-auth-deploy-reel', ['deploy_path' => $racine, 'http_auth' => true, 'release_path' => "$racine/releases/2"]);
+    Shell::$reel = true;
+
+    tache('deploy:http-auth', $h);
+    verifie('bloc réinjecté', file_get_contents("$racine/releases/2/web/.htaccess"), httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', ['203.0.113.10'], ['/.well-known/acme-challenge/']) . "\n" . $wp);
+    verifie('droits conservés', fileperms("$racine/releases/2/web/.htaccess") & 0777, 0640);
+    verifie('.htpasswd intact', file_get_contents("$racine/shared/.htpasswd"), "adeliom:\$2y\$10\$abc\n");
+
+    // Premier déploiement : ni current ni .htaccess dans la release.
+    unlink("$racine/current");
+    unlink("$racine/releases/2/web/.htaccess");
+    tache('deploy:http-auth', $h);
+    verifie('premier déploiement : bloc seul', file_get_contents("$racine/releases/2/web/.htaccess"), httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', [], ['/.well-known/acme-challenge/']));
+});
+
+/*
+ * Tâche http-auth:remove.
+ */
+
+cas('http-auth:remove : bloc retiré sur le disque, .htpasswd conservé, avertissement si http_auth vaut true (réel)', static function (): void {
+    $racine = dossierTemporaire();
+    mkdir("$racine/releases/1/web", 0777, true);
+    mkdir("$racine/shared/web", 0777, true);
+    symlink("$racine/releases/1", "$racine/current");
+    file_put_contents("$racine/shared/.htpasswd", "adeliom:\$2y\$10\$abc\n");
+    $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
+    // .htaccess partagé : le bloc est retiré du fichier de shared/, le lien reste en place.
+    file_put_contents("$racine/shared/web/.htaccess", httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', [], []) . "\n" . $wp);
+    chmod("$racine/shared/web/.htaccess", 0640);
+    symlink("$racine/shared/web/.htaccess", "$racine/releases/1/web/.htaccess");
+
+    $h = hoteLocal('http-auth-remove-reel', ['deploy_path' => $racine, 'http_auth' => true]);
+    Shell::$reel = true;
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:remove', $h);
+    verifie('bloc retiré, reste intact', file_get_contents("$racine/shared/web/.htaccess"), $wp);
+    vrai('lien de la release intact', is_link("$racine/releases/1/web/.htaccess"));
+    verifie('droits conservés', fileperms("$racine/shared/web/.htaccess") & 0777, 0640);
+    verifie('.htpasswd conservé', file_get_contents("$racine/shared/.htpasswd"), "adeliom:\$2y\$10\$abc\n");
+    contient('avertissement http_auth', sortie(), 'http_auth vaut encore true : le prochain déploiement remettra la protection. Passez-le à false dans .inventory.yaml.');
+
+    // Fichier ne contenant que le bloc : conservé, vide.
+    file_put_contents("$racine/shared/web/.htaccess", httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', [], []));
+    $h2 = hoteLocal('http-auth-remove-reel-vide', ['deploy_path' => $racine]);
+    entree([], true, ['y']);
+    sortie();
+    tache('http-auth:remove', $h2);
+    verifie('fichier conservé, vide', file_get_contents("$racine/shared/web/.htaccess"), '');
+    absent('pas d\'avertissement sans http_auth', sortie(), 'http_auth vaut encore true');
+});
+
+cas('http-auth:remove : -n, description sans écriture', static function (): void {
+    $h = hote('http-auth-remove-n');
+    httpAuthInstallationTest($h);
+    sortie();
+
+    tache('http-auth:remove', $h);
+    $sortie = sortie();
+    contient('mode non interactif', $sortie, 'Mode non interactif');
+    contient('.htaccess décrit', $sortie, '/srv/' . $h->getAlias() . '/current/web/.htaccess');
+    httpAuthAucuneEcritureUpdate('-n');
+});
+
+cas('http-auth:remove : confirmation refusée, et fin d\'entrée sans TTY, sans écriture', static function (): void {
+    foreach (['refus' => ['n'], 'eof' => []] as $nom => $reponses) {
+        $h = hote('http-auth-remove-' . $nom);
+        Shell::reinitialiser();
+        httpAuthInstallationTest($h);
+        entree([], true, $reponses);
+
+        tache('http-auth:remove', $h);
+        httpAuthAucuneEcritureUpdate($nom);
+    }
+});
+
+cas('http-auth:remove : sans bloc ni .htaccess, information sans écriture ni question', static function (): void {
+    foreach (['sans-bloc' => "# BEGIN WordPress\n# END WordPress\n", 'sans-htaccess' => ''] as $nom => $htaccess) {
+        $h = hote('http-auth-remove-' . $nom);
+        Shell::reinitialiser();
+        httpAuthInstallationTest($h, null, $htaccess);
+        entree([], true, ['y']);
+        sortie();
+
+        tache('http-auth:remove', $h);
+        $sortie = sortie();
+        contient("$nom : information", $sortie, 'Aucun bloc');
+        absent("$nom : aucune question", $sortie, 'Retirer l\'authentification HTTP');
+        httpAuthAucuneEcritureUpdate($nom);
+    }
+});
+
+cas('http-auth:remove : bloc mal formé, erreur sans écriture', static function (): void {
+    $h = hote('http-auth-remove-mal-forme');
+    httpAuthInstallationTest($h, null, "# BEGIN Horizon HTTP auth\nAuthType Basic\n");
+    entree([], true, ['y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:remove', $h);
+    }, \Throwable::class, 'Rien n\'a été écrit');
+    httpAuthAucuneEcritureUpdate('mal formé');
+});
+
+cas('http-auth:remove : sans garde-fou production', static function (): void {
+    $h = hote('http-auth-remove-prod');
+    [$htaccess] = httpAuthInstallationTest($h);
+    httpAuthEnvTest("WP_ENV=production\nWP_HOME=https://www.site.test");
+    entree([], true, ['y']);
+
+    tache('http-auth:remove', $h);
+    verifie('bloc retiré', httpAuthEcritTest($htaccess), "# BEGIN WordPress\n# END WordPress\n");
+    aucuneCommande('shared/.env non lu', '/^grep -E /');
+});

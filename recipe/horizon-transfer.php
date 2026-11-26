@@ -4954,6 +4954,132 @@ task('http-auth:update', static function (): void {
     }
 });
 
+desc('Retire le bloc d\'authentification HTTP du .htaccess de la release en ligne (le .htpasswd est conservé) : dep http-auth:remove staging');
+task('http-auth:remove', static function (): void {
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // Pas de garde-fou production : retirer une protection posée par erreur doit rester possible.
+    $htaccessPath = httpAuthHtaccessPath($env, '{{current_path}}');
+    $original = httpAuthReadFile($env, $htaccessPath);
+
+    try {
+        $parts = $original !== null ? httpAuthSplitBlock($original) : null;
+    } catch (\UnexpectedValueException $e) {
+        throw error("$htaccessPath : " . $e->getMessage() . ' Rien n\'a été écrit.');
+    }
+
+    if ($original === null || $parts === null) {
+        info("Aucun bloc d'authentification HTTP dans $htaccessPath : rien à retirer.");
+
+        return;
+    }
+
+    $htpasswdPath = transferResolvePath($env, '{{http_auth_htpasswd}}');
+
+    // Mode non interactif : description, aucune écriture.
+    if (!input()->isInteractive()) {
+        warning("Mode non interactif (-n) : rien n'est écrit sur « $label ». Sans -n, la tâche :");
+        writeln("   - Retire le bloc d'authentification HTTP de $htaccessPath.");
+        writeln("   - Conserve $htpasswdPath, pour une réactivation.");
+
+        return;
+    }
+
+    // Confirmation, défaut « non » (voir transferConfirm()).
+    if (!transferConfirm("Retirer l'authentification HTTP de « $label » ?", false)) {
+        info('Retrait abandonné : rien n\'a été écrit.');
+
+        return;
+    }
+
+    // Fichier conservé même vide, droits conservés ; le .htpasswd n'est pas touché.
+    httpAuthWriteFile($env, $htaccessPath, httpAuthRemoveBlock($original), httpAuthFileMode($env, $htaccessPath, '644'));
+    info("Authentification HTTP retirée de « $label » ($htaccessPath). $htpasswdPath est conservé pour une réactivation.");
+
+    if ((bool) get('http_auth')) {
+        warning('http_auth vaut encore true : le prochain déploiement remettra la protection. Passez-le à false dans .inventory.yaml.');
+    }
+});
+
+// Réinjection du bloc dans chaque nouvelle release : un .htaccess versionné remplace à chaque
+// déploiement celui de la release précédente, sans le bloc.
+desc('Réinjecte le bloc d\'authentification HTTP dans la nouvelle release (avant deploy:symlink)');
+task('deploy:http-auth', static function (): void {
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // 1. Réglage : sans http_auth, aucune commande distante.
+    if (!(bool) get('http_auth')) {
+        return;
+    }
+
+    // 2. Garde-fou production, sans error() : le déploiement d'une production ne doit pas
+    // échouer pour un réglage d'inventaire. Rien n'est écrit.
+    $refusal = httpAuthProductionRefusal(transferHostEnvironmentValues($env), transferIsProtected($env));
+
+    if ($refusal !== null) {
+        warning("$refusal Bloc non réinjecté dans la nouvelle release de « $label ».");
+
+        return;
+    }
+
+    // 3. Installation jamais faite. Test hors de {{current_path}} (transferTest() s'y place),
+    // absent au premier déploiement.
+    $htpasswdPath = transferResolvePath($env, '{{http_auth_htpasswd}}');
+
+    if (trim(transferRun($env, 'if [ -f ' . escapeshellarg($htpasswdPath) . ' ]; then echo +true; fi')) !== '+true') {
+        warning("$htpasswdPath introuvable sur « $label » : authentification HTTP jamais installée, la nouvelle release ne sera pas protégée. L'installer par dep http-auth:setup $label.");
+
+        return;
+    }
+
+    // 4. IP du serveur, connue seulement par la sonde de http-auth:setup : relue dans le bloc
+    // de la release en ligne. Premier déploiement ou bloc absent : aucune.
+    $currentPath = httpAuthHtaccessPath($env, '{{current_path}}');
+    $current = httpAuthReadFile($env, $currentPath);
+    $ips = [];
+
+    try {
+        $ips = $current !== null ? httpAuthBlockIps($current) : [];
+    } catch (\UnexpectedValueException $e) {
+        warning("$currentPath : " . $e->getMessage() . ' IP du serveur non reprise : seules celles de http_auth_allow_ips sont autorisées sans identifiants.');
+    }
+
+    $block = httpAuthBlock(
+        $htpasswdPath,
+        (string) get('http_auth_realm'),
+        array_merge($ips, (array) get('http_auth_allow_ips')),
+        (array) get('http_auth_except_paths')
+    );
+
+    // 5. Bloc inséré dans le .htaccess de la release, droits conservés (644 s'il est créé).
+    $releasePath = httpAuthHtaccessPath($env, '{{release_path}}');
+    $original = httpAuthReadFile($env, $releasePath);
+
+    try {
+        $htaccess = httpAuthInsertBlock($original ?? '', $block);
+    } catch (\UnexpectedValueException $e) {
+        throw error("$releasePath : " . $e->getMessage() . ' Déploiement interrompu avant la bascule : la release en ligne reste en place.');
+    }
+
+    if ($htaccess === $original) {
+        info("Bloc d'authentification HTTP déjà présent et identique dans $releasePath : non réécrit.");
+
+        return;
+    }
+
+    try {
+        httpAuthWriteFile($env, $releasePath, $htaccess, $original !== null ? httpAuthFileMode($env, $releasePath, '644') : '644');
+    } catch (\Throwable $e) {
+        warning("Bloc d'authentification HTTP non écrit dans $releasePath : déploiement interrompu avant la bascule, la release en ligne reste en place.");
+
+        throw $e;
+    }
+
+    info("Bloc d'authentification HTTP réinjecté dans $releasePath.");
+})->hidden();
+
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
 // deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la
@@ -4978,6 +5104,9 @@ if (Deployer::get()->tasks->has('deploy')) {
 // de problème ; un échec d'export interrompt le déploiement avant la bascule.
 if (Deployer::get()->tasks->has('deploy:symlink')) {
     before('deploy:symlink', 'deploy:db-backup');
+    // Un échec de la réinjection interrompt le déploiement avant la bascule : mettre en
+    // ligne une préproduction sans protection serait une régression silencieuse.
+    before('deploy:symlink', 'deploy:http-auth');
 }
 
 // En cas d'échec, on supprime les répertoires temporaires de tous les environnements.

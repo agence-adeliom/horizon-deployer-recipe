@@ -63,12 +63,12 @@ cas('valeurs par défaut', static function (): void {
 cas('tâches déclarées, visibles ou cachées, once', static function (): void {
     $taches = Deployer::get()->tasks;
 
-    foreach (array('db:pull', 'uploads:pull', 'db:push', 'uploads:push', 'build:check', 'db:backup', 'wp:update-db', 'roles:check', 'roles:status') as $nom) {
+    foreach (array('db:pull', 'uploads:pull', 'db:push', 'uploads:push', 'build:check', 'db:backup', 'wp:update-db', 'roles:check', 'roles:status', 'http-auth:setup', 'http-auth:update', 'http-auth:remove') as $nom) {
         vrai("$nom visible", $taches->has($nom) && !$taches->get($nom)->isHidden());
         vrai("$nom décrite", $taches->has($nom) && (string) $taches->get($nom)->getDescription() !== '');
     }
 
-    foreach (array('transfer:cleanup', 'deploy:db-backup') as $nom) {
+    foreach (array('transfer:cleanup', 'deploy:db-backup', 'deploy:http-auth') as $nom) {
         vrai("$nom cachée", $taches->has($nom) && $taches->get($nom)->isHidden());
     }
 
@@ -81,7 +81,7 @@ cas('points d\'accroche sur dep deploy', static function (): void {
     $taches = Deployer::get()->tasks;
 
     verifie('avant deploy : build:check puis roles:check', $taches->get('deploy')->getBefore(), array('build:check', 'roles:check'));
-    verifie('avant deploy:symlink : sauvegarde', $taches->get('deploy:symlink')->getBefore(), array('deploy:db-backup'));
+    verifie('avant deploy:symlink : authentification HTTP et sauvegarde', $taches->get('deploy:symlink')->getBefore(), array('deploy:http-auth', 'deploy:db-backup'));
     verifie('après deploy:success : wp:update-db puis roles:status', $taches->get('deploy:success')->getAfter(), array('wp:update-db', 'roles:status'));
     verifie('rien sur deploy:unlock', array($taches->get('deploy:unlock')->getBefore(), $taches->get('deploy:unlock')->getAfter()), array(array(), array()));
 });
