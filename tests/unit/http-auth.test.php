@@ -923,3 +923,215 @@ cas('http-auth:setup : site déjà protégé, identifiants en 500 : retrait et e
     }, \Throwable::class, '200 ou 30x attendu');
     uneCommande('.htaccess retiré', '#^rm -f #');
 });
+
+/*
+ * Remise en état de http-auth:setup après la première écriture.
+ */
+
+/** Chemins de l'hôte de test : [.htaccess, .htpasswd]. */
+function httpAuthCheminsTest(\Deployer\Host\Host $h): array
+{
+    return ['/srv/' . $h->getAlias() . '/current/web/.htaccess', '/srv/' . $h->getAlias() . '/shared/.htpasswd'];
+}
+
+/** Sortie qui lève une exception, une seule fois, à l'écriture d'un message contenant $marqueur. */
+final class SortieQuiLeve extends \Symfony\Component\Console\Output\BufferedOutput
+{
+    /** @var string */
+    public $marqueur = '';
+
+    protected function doWrite(string $message, bool $newline): void
+    {
+        if ($this->marqueur !== '' && strpos($message, $this->marqueur) !== false) {
+            $this->marqueur = '';
+
+            throw new \RuntimeException('Sortie en échec pendant la vérification');
+        }
+
+        parent::doWrite($message, $newline);
+    }
+}
+
+cas('http-auth:setup : vérification en échec, .htpasswd créé supprimé, message fidèle', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-nettoyage');
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    $wp = "# BEGIN WordPress\nRewriteEngine On\n# END WordPress\n";
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode($wp));
+    entree([], true, ['y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    $message = $e !== null ? $e->getMessage() : '';
+    contient('.htaccess remis', $message, "Le .htaccess d'origine ($htaccess) est remis en place.");
+    contient('.htpasswd supprimé', $message, "Le .htpasswd créé ($htpasswd) est supprimé.");
+    uneCommande('rm du .htpasswd', '#^rm -f ' . preg_quote(escapeshellarg($htpasswd), '#') . '$#');
+    verifie('.htaccess d\'origine réécrit', httpAuthEcritTest($htaccess), $wp);
+});
+
+cas('http-auth:setup : vérification en échec, .htpasswd existant jamais supprimé', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-nettoyage-existant', [], []);
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htpasswd), '#') . ' \]#', "+dep\n" . base64_encode("adeliom:\$2y\$10\$abc\n"));
+    entree([], true, ['y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    contient('.htaccess créé supprimé', $e !== null ? $e->getMessage() : '', "Le .htaccess créé ($htaccess) est supprimé.");
+    absent('.htpasswd non cité', $e !== null ? $e->getMessage() : '', '.htpasswd');
+    aucuneCommande('.htpasswd intact', '#^rm -f ' . preg_quote(escapeshellarg($htpasswd), '#') . '#');
+});
+
+cas('http-auth:setup : bloc identique déjà présent, vérification en échec : rien n\'est prétendu remis', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-identique', [], []);
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htpasswd), '#') . ' \]#', "+dep\n" . base64_encode("adeliom:\$2y\$10\$abc\n"));
+    $original = httpAuthBlock($htpasswd, 'Accès restreint', ['203.0.113.10'], ['/.well-known/acme-challenge/']);
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode($original));
+    entree([], true, ['y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    contient('.htaccess non modifié', $e !== null ? $e->getMessage() : '', 'Le .htaccess n\'a pas été modifié.');
+    absent('pas de « remis en place »', $e !== null ? $e->getMessage() : '', 'remis en place');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+});
+
+cas('http-auth:setup : remise en état impossible, message qui le dit', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-remise-ko');
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode("# WordPress\n"));
+    $ecritures = 0;
+    Shell::quand('#base64 -d > ' . preg_quote(escapeshellarg($htaccess . '.horizon-tmp'), '#') . '#', static function () use (&$ecritures): string {
+        if (++$ecritures > 1) {
+            throw new \RuntimeException('Disque plein');
+        }
+
+        return '';
+    });
+    entree([], true, ['y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    contient('échec de la remise signalé', $e !== null ? $e->getMessage() : '', "Le .htaccess ($htaccess) n'a pas pu être remis en état : à vérifier à la main.");
+    absent('pas de « remis en place »', $e !== null ? $e->getMessage() : '', 'remis en place');
+    contient('.htpasswd tout de même supprimé', $e !== null ? $e->getMessage() : '', "Le .htpasswd créé ($htpasswd) est supprimé.");
+});
+
+cas('http-auth:setup : exception à l\'écriture du .htaccess, .htpasswd créé supprimé, exception relancée', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-exception-ecriture');
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    Shell::quand('#base64 -d > ' . preg_quote(escapeshellarg($htaccess . '.horizon-tmp'), '#') . '#', new \RuntimeException('Permission denied'));
+    entree([], true, ['y']);
+    sortie();
+
+    leve('exception d\'origine', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \RuntimeException::class, 'Permission denied');
+    $sortie = sortie();
+    contient('interruption signalée', $sortie, 'Installation interrompue.');
+    contient('.htpasswd supprimé', $sortie, "Le .htpasswd créé ($htpasswd) est supprimé.");
+    uneCommande('rm du .htpasswd', '#^rm -f ' . preg_quote(escapeshellarg($htpasswd), '#') . '$#');
+    aucuneCommande('pas de vérification', '/^curl -sS -o .* -K /');
+});
+
+cas('http-auth:setup : exception pendant la vérification, .htaccess remis octet pour octet, .htpasswd supprimé', static function (): void {
+    // L'avertissement « non concluante » de l'étape 11 lève : toute exception après la première
+    // écriture doit remettre les fichiers en état.
+    $h = httpAuthHoteSetup('http-auth-exception-verif');
+    [$htaccess, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401'], '401', '401');
+    $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htaccess), '#') . ' \]#', "+dep\n" . base64_encode($wp));
+    entree([], true, ['y', 'y']);
+
+    $deployer = Deployer::get();
+    $sortie = new SortieQuiLeve(\Symfony\Component\Console\Output\OutputInterface::VERBOSITY_NORMAL, false);
+    $sortie->marqueur = 'Vérification non concluante';
+    unset($deployer['output']);
+    $deployer['output'] = static function () use ($sortie) {
+        return $sortie;
+    };
+
+    try {
+        leve('exception relancée', static function () use ($h): void {
+            tache('http-auth:setup', $h);
+        }, \RuntimeException::class, 'Sortie en échec pendant la vérification');
+    } finally {
+        unset($deployer['output']);
+        $deployer['output'] = static function () {
+            return $GLOBALS[SORTIE];
+        };
+    }
+
+    uneCommande('vérification lancée', '/^curl -sS -o .* -K /');
+    verifie('.htaccess d\'origine réécrit octet pour octet', httpAuthEcritTest($htaccess), $wp);
+    uneCommande('rm du .htpasswd', '#^rm -f ' . preg_quote(escapeshellarg($htpasswd), '#') . '$#');
+    contient('remise en état signalée', $sortie->fetch(), "Le .htaccess d'origine ($htaccess) est remis en place.");
+});
+
+cas('http-auth:setup : -n sur un site qui répond 401, description sans question', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-n-401');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('avertissement 401', $sortie, 'répond déjà 401');
+    contient('description', $sortie, 'Sans -n, la tâche :');
+    absent('pas de question ignorée', $sortie, 'question ignorée');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+});
+
+cas('http-auth:setup : .htpasswd sans identifiant lisible, refus et renvoi vers http-auth:update', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-htpasswd-vide', [], [], $questions);
+    [, $htpasswd] = httpAuthCheminsTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($htpasswd), '#') . ' \]#', "+dep\n" . base64_encode("\n"));
+    entree([], true, ['y']);
+
+    leve('refus', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, 'http-auth:update');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+    verifie('aucune saisie', $questions, []);
+});
+
+/** Espion : ne doit jamais être appelé par la tâche. */
+function httpAuthSaisieEspion(string $question): string
+{
+    $GLOBALS['http_auth_espion'] = $question;
+
+    return 'piege';
+}
+
+cas('http-auth:setup : http_auth_password_asker qui n\'est pas une closure, ignoré', static function (): void {
+    unset($GLOBALS['http_auth_espion']);
+    $h = hote('http-auth-asker-chaine', ['http_auth' => true, 'http_auth_password_asker' => 'Deployer\httpAuthSaisieEspion']);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    entree([], true, ['y']);
+
+    leve('saisie masquée réelle, impossible sans TTY', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    });
+    vrai('chaîne jamais appelée', !isset($GLOBALS['http_auth_espion']));
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+});

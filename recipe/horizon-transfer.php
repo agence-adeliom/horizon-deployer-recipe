@@ -4587,7 +4587,8 @@ task('http-auth:setup', static function (): void {
     } elseif ($status === 401) {
         warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
 
-        if (!transferConfirm('Installer quand même ?', false)) {
+        // En -n, pas de question : l'étape 5 décrit ce que la tâche ferait.
+        if (input()->isInteractive() && !transferConfirm('Installer quand même ?', false)) {
             info('Installation abandonnée : rien n\'a été écrit.');
 
             return;
@@ -4644,7 +4645,12 @@ task('http-auth:setup', static function (): void {
     $existing = httpAuthReadFile($env, $htpasswdPath);
 
     if ($existing !== null) {
-        $user = httpAuthHtpasswdUser($existing) ?? '';
+        $user = httpAuthHtpasswdUser($existing);
+
+        if ($user === null) {
+            throw error("$htpasswdPath existe mais ne contient aucun identifiant lisible : authentification HTTP non installée. Le remplacer par dep http-auth:update $label. Rien n'a été écrit.");
+        }
+
         info(sprintf('%s existe déjà (identifiant « %s ») : conservé. Pour changer les identifiants : dep http-auth:update %s', $htpasswdPath, $user, $label));
 
         if ($user !== (string) get('http_auth_user')) {
@@ -4655,7 +4661,8 @@ task('http-auth:setup', static function (): void {
         // la fonction de saisie passée à httpAuthAskPassword() (Deployer évalue une closure
         // stockée en configuration), askHiddenResponse() refusant une entrée sans TTY.
         $asker = has('http_auth_password_asker') ? get('http_auth_password_asker') : null;
-        $asked = httpAuthAskPassword(is_callable($asker) ? $asker : null);
+        // Closure exigée : une chaîne de l'inventaire (« system ») ne doit jamais être appelée.
+        $asked = httpAuthAskPassword($asker instanceof \Closure ? $asker : null);
         $password = $asked['password'];
         $generated = $asked['generated'];
         $htpasswdLine = httpAuthHtpasswdLine($user, $password);
@@ -4669,58 +4676,95 @@ task('http-auth:setup', static function (): void {
     $original = httpAuthReadFile($env, $htaccessPath);
     $htaccess = httpAuthInsertBlock($original ?? '', $block);
 
-    // 9. .htpasswd, 10. bloc du .htaccess (droits du fichier existant conservés).
-    if ($htpasswdLine !== null) {
-        httpAuthWriteFile($env, $htpasswdPath, $htpasswdLine, '644');
-    }
-
+    // 9. .htpasswd, 10. bloc du .htaccess (droits du fichier existant conservés), 11.
+    // vérification. Tout échec à partir de la première écriture remet les fichiers en état :
+    // .htaccess d'origine réécrit octet pour octet (ou supprimé s'il a été créé), .htpasswd
+    // supprimé s'il a été créé par cette exécution (un .htpasswd existant n'est jamais touché).
+    // Un .htpasswd laissé en place garderait un mot de passe jamais affiché, et un nouveau
+    // setup le conserverait sans pouvoir le vérifier.
     $written = $htaccess !== $original;
-    $mode = $original !== null ? httpAuthFileMode($env, $htaccessPath, '644') : '644';
+    $mode = '644';
+    $htpasswdCreated = false;
+    $htaccessTouched = false;
+    $rollback = static function () use ($env, $htpasswdPath, $htaccessPath, $original, &$mode, &$htpasswdCreated, &$htaccessTouched): string {
+        $report = [];
 
-    if ($written) {
-        httpAuthWriteFile($env, $htaccessPath, $htaccess, $mode);
-    } else {
-        info("Bloc déjà présent et identique dans $htaccessPath : non réécrit.");
-    }
-
-    // 11. Vérification depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
-    $without = httpAuthHttpStatus(null, $url);
-    $failure = null;
-
-    if ($without !== 401) {
-        $failure = sprintf('sans identifiants, %s répond %s (401 attendu)', $url, $without ?? 'rien');
-    } elseif ($password !== null) {
-        $with = httpAuthHttpStatus(null, $url, $user, $password);
-
-        if ($with === null || ($with !== 200 && ($with < 300 || $with > 399))) {
-            if ($alreadyProtected && $with === 401) {
-                // Protection détectée à l'étape 4 : l'autre couche (mu-plugin, provider Acorn)
-                // répond 401 à tout le monde, la vérification ne peut pas conclure. La sonde a
-                // déjà prouvé qu'Apache applique le bloc : il est conservé.
-                warning("Vérification non concluante : une autre protection répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis retirer l'ancienne protection PHP du projet.");
-            } else {
-                $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
-            }
-        }
-    } else {
-        info('Mot de passe du .htpasswd existant inconnu : vérification avec identifiants sautée.');
-    }
-
-    if ($failure !== null) {
-        if ($written) {
+        if ($htaccessTouched) {
             try {
                 if ($original === null) {
                     transferRun($env, 'rm -f ' . escapeshellarg($htaccessPath));
+                    $report[] = "Le .htaccess créé ($htaccessPath) est supprimé.";
                 } else {
                     httpAuthWriteFile($env, $htaccessPath, $original, $mode);
+                    $report[] = "Le .htaccess d'origine ($htaccessPath) est remis en place.";
                 }
             } catch (\Throwable $e) {
-                warning("Impossible de remettre le .htaccess d'origine ($htaccessPath) : à vérifier à la main.");
+                $report[] = "Le .htaccess ($htaccessPath) n'a pas pu être remis en état : à vérifier à la main.";
+                writeln('   ' . $e->getMessage());
+            }
+        } else {
+            $report[] = 'Le .htaccess n\'a pas été modifié.';
+        }
+
+        if ($htpasswdCreated) {
+            try {
+                transferRun($env, 'rm -f ' . escapeshellarg($htpasswdPath));
+                $report[] = "Le .htpasswd créé ($htpasswdPath) est supprimé.";
+            } catch (\Throwable $e) {
+                $report[] = "Le .htpasswd créé ($htpasswdPath) n'a pas pu être supprimé : à supprimer à la main.";
                 writeln('   ' . $e->getMessage());
             }
         }
 
-        throw error("Vérification en échec : $failure. Le .htaccess d'origine est remis en place.");
+        return implode(' ', $report);
+    };
+
+    $failure = null;
+
+    try {
+        if ($htpasswdLine !== null) {
+            // Marqué avant l'écriture : le fichier n'existait pas, le supprimer est sans risque.
+            $htpasswdCreated = true;
+            httpAuthWriteFile($env, $htpasswdPath, $htpasswdLine, '644');
+        }
+
+        if ($written) {
+            $mode = $original !== null ? httpAuthFileMode($env, $htaccessPath, '644') : '644';
+            $htaccessTouched = true;
+            httpAuthWriteFile($env, $htaccessPath, $htaccess, $mode);
+        } else {
+            info("Bloc déjà présent et identique dans $htaccessPath : non réécrit.");
+        }
+
+        // 11. Vérification depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
+        $without = httpAuthHttpStatus(null, $url);
+
+        if ($without !== 401) {
+            $failure = sprintf('sans identifiants, %s répond %s (401 attendu)', $url, $without ?? 'rien');
+        } elseif ($password !== null) {
+            $with = httpAuthHttpStatus(null, $url, $user, $password);
+
+            if ($with === null || ($with !== 200 && ($with < 300 || $with > 399))) {
+                if ($alreadyProtected && $with === 401) {
+                    // Protection détectée à l'étape 4 : l'autre couche (mu-plugin, provider
+                    // Acorn) répond 401 à tout le monde, la vérification ne peut pas conclure.
+                    // La sonde a déjà prouvé qu'Apache applique le bloc : il est conservé.
+                    warning("Vérification non concluante : une autre protection répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis retirer l'ancienne protection PHP du projet.");
+                } else {
+                    $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
+                }
+            }
+        } else {
+            info('Mot de passe du .htpasswd existant inconnu : vérification avec identifiants sautée.');
+        }
+    } catch (\Throwable $e) {
+        warning('Installation interrompue. ' . $rollback());
+
+        throw $e;
+    }
+
+    if ($failure !== null) {
+        throw error("Vérification en échec : $failure. " . $rollback());
     }
 
     // 12. Récapitulatif. Le mot de passe généré n'est affiché qu'ici, une seule fois.
