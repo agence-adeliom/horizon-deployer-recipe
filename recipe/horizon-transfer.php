@@ -178,6 +178,31 @@ set('build_check_paths', static fn(): array => has('theme') ? ['web/app/themes/{
 // chaque nouveau dump. 0 pour ne jamais en supprimer.
 set('transfer_backup_keep', 10);
 
+// Authentification HTTP des préproductions (http-auth:setup, http-auth:update,
+// http-auth:remove et la réinjection au déploiement) : bloc balisé en tête du .htaccess,
+// identifiants dans un .htpasswd hors de la racine publique. À activer hôte par hôte dans
+// l'inventaire (http_auth: true) ; refusée sur un hôte que WordPress considère en production.
+set('http_auth', false);
+
+// Identifiant écrit dans le .htpasswd par http-auth:setup, et proposé par http-auth:update.
+set('http_auth_user', 'adeliom');
+
+// Texte affiché par le navigateur dans la fenêtre d'identification (AuthName).
+set('http_auth_realm', 'Accès restreint');
+
+// .htaccess qui reçoit le bloc, relatif à la release.
+set('http_auth_htaccess', 'web/.htaccess');
+
+// .htpasswd sur le serveur, hors de la racine publique.
+set('http_auth_htpasswd', '{{deploy_path}}/shared/.htpasswd');
+
+// Préfixes d'URL servis sans authentification (renouvellement Let's Encrypt, webhooks…).
+set('http_auth_except_paths', ['/.well-known/acme-challenge/']);
+
+// IP servies sans authentification, en plus de 127.0.0.1, ::1 et de l'IP détectée pour le
+// serveur (requêtes du site vers lui-même).
+set('http_auth_allow_ips', []);
+
 // Options PHP passées au wp-cli.phar installé par le recipe. Par défaut, masque les
 // notices de dépréciation : sous PHP 8+, une bibliothèque ancienne du projet en émet à
 // chaque appel WP-CLI, avant même que WordPress ne règle error_reporting, et noie la
@@ -4012,6 +4037,220 @@ task('roles:status', static function (): void {
         }
     }
 });
+
+/**
+ * Bloc d'authentification HTTP du .htaccess, marqueurs compris, terminé par un saut de
+ * ligne. Sont servis sans authentification : 127.0.0.1, ::1 et $ips (sans doublon, sur une
+ * seule ligne `Require ip`), puis chaque préfixe d'URL de $exceptPaths (une ligne
+ * `Require expr` par préfixe, échappé pour l'expression régulière). Fonction pure.
+ *
+ * @param string   $htpasswdPath chemin absolu du .htpasswd sur le serveur
+ * @param string[] $ips
+ * @param string[] $exceptPaths
+ */
+function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $exceptPaths): string
+{
+    $allowed = ['127.0.0.1', '::1'];
+
+    foreach ($ips as $ip) {
+        $ip = trim((string) $ip);
+
+        if ($ip !== '' && !in_array($ip, $allowed, true)) {
+            $allowed[] = $ip;
+        }
+    }
+
+    $lines = [
+        '# BEGIN Horizon HTTP auth',
+        '# Géré par horizon-deployer-recipe (http-auth:setup). Ne pas modifier à la main.',
+        'AuthType Basic',
+        'AuthName "' . str_replace(['\\', '"'], ['\\\\', '\\"'], $realm) . '"',
+        'AuthUserFile ' . $htpasswdPath,
+        '<RequireAny>',
+        '    Require ip ' . implode(' ', $allowed),
+    ];
+
+    foreach ($exceptPaths as $path) {
+        $lines[] = '    Require expr %{REQUEST_URI} =~ m#^' . preg_quote((string) $path, '#') . '#';
+    }
+
+    $lines[] = '    Require valid-user';
+    $lines[] = '</RequireAny>';
+    $lines[] = '# END Horizon HTTP auth';
+
+    return implode("\n", $lines) . "\n";
+}
+
+/**
+ * Découpe un .htaccess autour du bloc d'authentification HTTP. Les lignes gardent leur fin
+ * (CRLF compris) et ne sont comparées aux marqueurs qu'une fois celle-ci retirée : le reste
+ * du fichier est rendu octet pour octet. Fonction pure.
+ *
+ * @return ?array{0: string, 1: string, 2: string} texte avant le bloc, bloc, texte après ;
+ *         null sans bloc
+ * @throws \UnexpectedValueException bloc mal formé (marqueur seul, ordre inversé, deux blocs) :
+ *         modifié à la main, il ne doit pas être réécrit à l'aveugle
+ */
+function httpAuthSplitBlock(string $htaccess): ?array
+{
+    $lines = preg_split('/(?<=\n)/', $htaccess, -1, PREG_SPLIT_NO_EMPTY);
+    $begins = [];
+    $ends = [];
+
+    foreach ($lines as $i => $line) {
+        if (trim($line) === '# BEGIN Horizon HTTP auth') {
+            $begins[] = $i;
+        } elseif (trim($line) === '# END Horizon HTTP auth') {
+            $ends[] = $i;
+        }
+    }
+
+    if ($begins === [] && $ends === []) {
+        return null;
+    }
+
+    if (count($begins) !== 1 || count($ends) !== 1 || $ends[0] < $begins[0]) {
+        throw new \UnexpectedValueException('Bloc « Horizon HTTP auth » mal formé dans le .htaccess (marqueur seul, ordre inversé ou bloc en double) : à corriger à la main.');
+    }
+
+    return [
+        implode('', array_slice($lines, 0, $begins[0])),
+        implode('', array_slice($lines, $begins[0], $ends[0] - $begins[0] + 1)),
+        implode('', array_slice($lines, $ends[0] + 1)),
+    ];
+}
+
+/**
+ * .htaccess sans le bloc d'authentification HTTP ni la ligne vide qui le suit. Sans bloc,
+ * le texte est rendu tel quel. Fonction pure.
+ *
+ * @throws \UnexpectedValueException bloc mal formé
+ */
+function httpAuthRemoveBlock(string $htaccess): string
+{
+    $parts = httpAuthSplitBlock($htaccess);
+
+    if ($parts === null) {
+        return $htaccess;
+    }
+
+    [$before, , $after] = $parts;
+
+    // Ligne vide qui sépare le bloc du reste du fichier, quelle que soit sa fin de ligne.
+    return $before . preg_replace('/\A[ \t]*\r?\n/', '', $after);
+}
+
+/**
+ * .htaccess avec $block en tête, à la place de l'éventuel bloc existant, séparé du reste
+ * par une ligne vide. Fichier vide (ou ne contenant que le bloc) : $block seul. Fonction pure.
+ *
+ * @throws \UnexpectedValueException bloc mal formé
+ */
+function httpAuthInsertBlock(string $htaccess, string $block): string
+{
+    $rest = httpAuthRemoveBlock($htaccess);
+
+    return $rest === '' ? $block : $block . "\n" . $rest;
+}
+
+/**
+ * IP de la ligne `Require ip` du bloc d'authentification HTTP, hors 127.0.0.1 et ::1, que
+ * httpAuthBlock() ajoute d'office. Sans bloc : []. Fonction pure.
+ *
+ * @return string[]
+ * @throws \UnexpectedValueException bloc mal formé
+ */
+function httpAuthBlockIps(string $htaccess): array
+{
+    $parts = httpAuthSplitBlock($htaccess);
+
+    if ($parts === null || preg_match('/^[ \t]*Require[ \t]+ip[ \t]+(.+)$/m', $parts[1], $m) !== 1) {
+        return [];
+    }
+
+    return array_values(array_diff(preg_split('/\s+/', trim($m[1]), -1, PREG_SPLIT_NO_EMPTY), ['127.0.0.1', '::1']));
+}
+
+/**
+ * Mot de passe de 24 caractères, sans caractères ambigus (i, l, o, I, O, 0, 1) ni
+ * caractères spéciaux, pour une saisie facile sur mobile. random_int() puise dans le
+ * générateur cryptographique du système.
+ */
+function httpAuthGeneratePassword(): string
+{
+    $alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    $password = '';
+
+    for ($i = 0; $i < 24; $i++) {
+        $password .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+    }
+
+    return $password;
+}
+
+/**
+ * Ligne du .htpasswd, hash bcrypt calculé en local : seul le hash part vers le serveur, le
+ * mot de passe en clair n'apparaît dans aucune commande.
+ *
+ * @throws \InvalidArgumentException identifiant vide ou contenant « : » ou un saut de ligne
+ */
+function httpAuthHtpasswdLine(string $user, string $password): string
+{
+    if ($user === '' || strpbrk($user, ":\r\n") !== false) {
+        throw new \InvalidArgumentException('Identifiant invalide : il ne peut être vide ni contenir « : » ou un saut de ligne.');
+    }
+
+    return $user . ':' . password_hash($password, PASSWORD_BCRYPT) . "\n";
+}
+
+/**
+ * Identifiant de la première ligne non vide d'un .htpasswd, null s'il n'en a aucune.
+ * Fonction pure.
+ */
+function httpAuthHtpasswdUser(string $content): ?string
+{
+    foreach (preg_split('/\R/', $content) as $line) {
+        if (trim($line) !== '') {
+            return explode(':', trim($line), 2)[0];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Garde-fou production des tâches http-auth : message de refus, ou null pour continuer.
+ * Refus si WordPress considère l'hôte en production (type lu comme pour roles:check), ou
+ * si le type est introuvable sur un hôte protégé. Fonction pure.
+ *
+ * @param array<string, string> $values sortie de transferHostEnvironmentValues()
+ * @param bool                  $protected transferIsProtected() de l'hôte
+ */
+function httpAuthProductionRefusal(array $values, bool $protected): ?string
+{
+    $type = transferEnvironmentType($values);
+
+    if ($type === null) {
+        return $protected
+            ? 'Type d\'environnement introuvable dans shared/.env (ni WP_ENVIRONMENT_TYPE ni WP_ENV) sur un hôte protégé : authentification HTTP refusée par précaution.'
+            : null;
+    }
+
+    if ($type !== 'production') {
+        return null;
+    }
+
+    // Variable qui a décidé du type, comme dans transferEnvironmentType().
+    $name = ($values['WP_ENVIRONMENT_TYPE'] ?? '') !== '' || !isset($values['WP_ENV']) ? 'WP_ENVIRONMENT_TYPE' : 'WP_ENV';
+    $value = $values[$name];
+    $message = "WordPress considère cet hôte comme une production ($name=$value dans shared/.env) : authentification HTTP refusée.";
+
+    if ($value !== 'production') {
+        $message .= " Pour une préproduction, déclarer $name=staging dans shared/.env.";
+    }
+
+    return $message;
+}
 
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
