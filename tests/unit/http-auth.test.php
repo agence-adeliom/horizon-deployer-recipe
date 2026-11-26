@@ -484,13 +484,13 @@ cas('httpAuthAskPassword : saisie vide, mot de passe généré', static function
     $resultat = httpAuthAskPassword(httpAuthSaisieTest([''], $questions));
     verifie('généré', $resultat['generated'], true);
     vrai('24 caractères de l\'alphabet', preg_match('/^[a-hjkmnp-zA-HJKLMNP-Z2-9]{24}$/', $resultat['password']) === 1);
-    verifie('une seule question', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) : ']);
+    verifie('une seule question', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) :']);
 });
 
 cas('httpAuthAskPassword : deux saisies identiques', static function (): void {
     $questions = [];
     verifie('résultat', httpAuthAskPassword(httpAuthSaisieTest(['abc', 'abc'], $questions)), ['password' => 'abc', 'generated' => false]);
-    verifie('questions', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) : ', 'Confirmez le mot de passe : ']);
+    verifie('questions', $questions, ['Mot de passe HTTP (laisser vide pour en générer un) :', 'Confirmez le mot de passe :']);
 });
 
 cas('httpAuthAskPassword : saisies différentes, avertissement et nouvel essai', static function (): void {

@@ -4222,6 +4222,8 @@ function httpAuthGeneratePassword(): string
  * Trois essais : une confirmation différente ou un saut de ligne (refusé plus loin par
  * httpAuthHttpStatus()) compte pour un écart. $askHidden remplace askHiddenResponse() dans
  * les tests, celle-ci refusant un flux sans TTY.
+ * Symfony supprime les espaces en début et en fin de saisie masquée : ils ne font pas
+ * partie du mot de passe.
  *
  * @return array{password: string, generated: bool}
  * @throws \RuntimeException trois écarts de suite
@@ -4231,7 +4233,7 @@ function httpAuthAskPassword(?callable $askHidden = null): array
     $askHidden = $askHidden ?? 'Deployer\askHiddenResponse';
 
     for ($attempt = 0; $attempt < 3; $attempt++) {
-        $password = (string) $askHidden('Mot de passe HTTP (laisser vide pour en générer un) : ');
+        $password = (string) $askHidden('Mot de passe HTTP (laisser vide pour en générer un) :');
 
         if ($password === '') {
             return ['password' => httpAuthGeneratePassword(), 'generated' => true];
@@ -4242,7 +4244,7 @@ function httpAuthAskPassword(?callable $askHidden = null): array
             continue;
         }
 
-        if ((string) $askHidden('Confirmez le mot de passe : ') === $password) {
+        if ((string) $askHidden('Confirmez le mot de passe :') === $password) {
             return ['password' => $password, 'generated' => false];
         }
 
