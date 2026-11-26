@@ -229,9 +229,10 @@ cas('rolesCheckExpected : lecture sans exécution, refus d\'une déclaration inv
  * Type d'environnement, comme wp_get_environment_type() sous Bedrock.
  */
 
-cas('rolesCheckEnvironmentType', static function (): void {
+cas('transferEnvironmentType', static function (): void {
     $environnements = array(
         'aucune variable' => array(array(), null),
+        'WP_HOME seule' => array(array('WP_HOME' => 'https://exemple.test'), null),
         'WP_ENV production' => array(array('WP_ENV' => 'production'), 'production'),
         'WP_ENV staging' => array(array('WP_ENV' => 'staging'), 'staging'),
         'WP_ENV development' => array(array('WP_ENV' => 'development'), 'development'),
@@ -243,21 +244,21 @@ cas('rolesCheckEnvironmentType', static function (): void {
     );
 
     foreach ($environnements as $libelle => $cas) {
-        verifie("environnement ($libelle)", rolesCheckEnvironmentType($cas[0]), $cas[1]);
+        verifie("environnement ($libelle)", transferEnvironmentType($cas[0]), $cas[1]);
     }
 });
 
-cas('rolesCheckHostEnvironmentValues : commande en lecture seule sur shared/.env', static function (): void {
+cas('transferHostEnvironmentValues : commande en lecture seule sur shared/.env', static function (): void {
     $h = hote('prod-env');
     Shell::quand('/^grep/', "+dep-env:WP_ENV=staging\n+dep-env:export WP_ENVIRONMENT_TYPE='local' # commentaire\n+dep-env:WP_ENV=production");
 
-    verifie('première occurrence de chaque variable', rolesCheckHostEnvironmentValues($h), array('WP_ENV' => 'staging', 'WP_ENVIRONMENT_TYPE' => 'local'));
+    verifie('première occurrence de chaque variable', transferHostEnvironmentValues($h), array('WP_ENV' => 'staging', 'WP_ENVIRONMENT_TYPE' => 'local'));
     $appel = uneCommande('grep sur shared/.env', '/^grep -E /');
     contient('chemin résolu dans le contexte de l\'hôte', $appel['commande'] ?? '', escapeshellarg('/srv/' . $h->getAlias() . '/shared/.env'));
     verifie('exécutée sur l\'hôte', $appel['env'] ?? null, $h->getAlias());
 });
 
-cas('rolesCheckHostEnvironmentValues : vrai grep sur un .env (quotes, export, vide, commentaire)', static function (): void {
+cas('transferHostEnvironmentValues : vrai grep sur un .env (quotes, export, vide, commentaire)', static function (): void {
     $racine = dossierTemporaire();
     mkdir("$racine/shared");
     file_put_contents("$racine/shared/.env", implode("\n", array(
@@ -266,18 +267,20 @@ cas('rolesCheckHostEnvironmentValues : vrai grep sur un .env (quotes, export, vi
         '  export WP_ENV="preprod"',
         'WP_ENV=production',
         "WP_ENVIRONMENT_TYPE=''",
-        'WP_HOME=https://exemple.test',
+        "WP_HOME='https://staging.exemple.test'",
+        'WP_HOME=https://autre.test',
     )) . "\n");
     $h = hote('prod-env-reel', array('deploy_path' => $racine));
     Shell::$reel = true;
 
-    verifie('valeurs lues', rolesCheckHostEnvironmentValues($h), array('WP_ENV' => 'preprod', 'WP_ENVIRONMENT_TYPE' => ''));
+    verifie('valeurs lues', transferHostEnvironmentValues($h), array('WP_ENV' => 'preprod', 'WP_ENVIRONMENT_TYPE' => '', 'WP_HOME' => 'https://staging.exemple.test'));
+    verifie('WP_HOME lu, première occurrence', transferHostEnvironmentValues($h)['WP_HOME'] ?? null, 'https://staging.exemple.test');
 
     unlink("$racine/shared/.env");
-    verifie('fichier absent : aucune variable', rolesCheckHostEnvironmentValues($h), array());
+    verifie('fichier absent : aucune variable', transferHostEnvironmentValues($h), array());
 });
 
-cas('rolesCheckHostEnvironmentValues : deploy_path en « ~/ » (mutualisé), vrai grep', static function (): void {
+cas('transferHostEnvironmentValues : deploy_path en « ~/ » (mutualisé), vrai grep', static function (): void {
     $home = dossierTemporaire();
     mkdir("$home/sites/exemple/shared", 0777, true);
     file_put_contents("$home/sites/exemple/shared/.env", "WP_ENV='staging'\n");
@@ -285,7 +288,7 @@ cas('rolesCheckHostEnvironmentValues : deploy_path en « ~/ » (mutualisé), vra
     Shell::quand('/^printf %s "\$HOME"$/', $home);
     Shell::$reel = true;
 
-    verifie('« ~ » développé avant les guillemets', rolesCheckHostEnvironmentValues($h), array('WP_ENV' => 'staging'));
+    verifie('« ~ » développé avant les guillemets', transferHostEnvironmentValues($h), array('WP_ENV' => 'staging'));
     $appel = uneCommande('grep sur le chemin absolu', '/^grep -E /');
     contient('chemin sans « ~ »', $appel['commande'] ?? '', escapeshellarg("$home/sites/exemple/shared/.env"));
 });

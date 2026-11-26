@@ -61,7 +61,7 @@ Le recipe fournit un défaut pour `bin/wp` (WP-CLI distant, téléchargé à la 
 `{{deploy_path}}/.dep/wp-cli.phar`). Pour le surcharger, redéfinissez-le **après** le
 `require_once`.
 
-Le recipe modifie le comportement de `dep deploy` à cinq endroits, chacun désarmable :
+Le recipe modifie le comportement de `dep deploy` à six endroits, chacun désarmable :
 
 - il **vérifie avant tout que le code local est exactement le commit déployé**, les assets
   étant buildés en local (voir [Garde-fou du build local](#garde-fou-du-build-local)) ;
@@ -76,7 +76,12 @@ Le recipe modifie le comportement de `dep deploy` à cinq endroits, chacun désa
   la production avant le déploiement** (`roles:check`) et **affiche l'état de leur
   synchro à la fin** (`roles:status`), voir
   [Contrôle des rôles adeliom-roles](#contrôle-des-rôles-adeliom-roles) ;
-  `set('roles_check', false)` les désarme. Sans ce mu-plugin, rien ne change.
+  `set('roles_check', false)` les désarme. Sans ce mu-plugin, rien ne change ;
+- il **réinjecte le bloc d'authentification HTTP dans chaque nouvelle release**, juste
+  avant la bascule du symlink. Seules les préproductions dont l'inventaire porte
+  `http_auth: true` sont concernées (voir
+  [Authentification HTTP des préproductions](#authentification-http-des-préproductions)).
+  Sans cette clé, `false` par défaut, rien ne change.
 
 Ajoutez à votre `.gitignore` :
 
@@ -99,6 +104,9 @@ Ajoutez à votre `.gitignore` :
 | `dep roles:check <hôte>` | - | Compare les rôles de l'hôte à l'empreinte attendue par le mu-plugin `adeliom-roles`, avant sa première application. Lancée d'elle-même avant `deploy`, après `build:check`, sur la production (type d'environnement lu dans `shared/.env` comme le fait Bedrock, à défaut un hôte protégé). Sans effet sans ce mu-plugin |
 | `dep roles:status <hôte>` | - | Affiche `wp adeliom-roles status`. Lancée d'elle-même après `deploy:success`. Sans effet sans ce mu-plugin |
 | `dep db:backup <hôte>` | — | Dumpe la base de l'hôte dans `{{transfer_backup_dir}}`, nommée d'après sa release, et ne garde que les `{{transfer_backup_keep}}` derniers dumps. Lancée d'elle-même juste avant `deploy:symlink` |
+| `dep http-auth:setup <hôte>` | - | Installe l'authentification HTTP (bloc en tête du `.htaccess`, `.htpasswd` dans `shared/`) sur une préproduction dont l'inventaire porte `http_auth: true`. Refusée sur un hôte que WordPress considère en production. Le bloc est ensuite réinjecté à chaque déploiement, avant `deploy:symlink` |
+| `dep http-auth:update <hôte>` | - | Change l'identifiant et le mot de passe d'une authentification HTTP déjà installée. Seul le `.htpasswd` est réécrit |
+| `dep http-auth:remove <hôte>` | - | Retire le bloc du `.htaccess` de la release en ligne. Le `.htpasswd` est conservé pour une réactivation |
 
 Un « environnement » est soit `local`, soit l'alias d'un hôte Deployer.
 
@@ -377,6 +385,253 @@ Les deux tâches restent lançables à la main :
 dep roles:check production
 dep roles:status production
 ```
+
+### Authentification HTTP des préproductions
+
+Une préproduction protégée par un mu-plugin ou un provider Acorn ne l'est que pour les
+requêtes servies par PHP. Les médias, les assets et tout fichier statique restent
+accessibles à qui connaît leur URL. Le recipe installe donc une authentification HTTP au
+niveau d'Apache, avec des identifiants propres à chaque préproduction. Un bloc balisé va en
+tête du `.htaccess`, et les identifiants dans un `.htpasswd` hors de la racine publique.
+
+Pour l'installer :
+
+1. Poser `http_auth: true` sur l'hôte dans `.inventory.yaml`. La clé est désactivée par
+   défaut, et se règle hôte par hôte :
+
+   ```yaml
+   hosts:
+     staging:
+       http_auth: true
+     recette:
+       http_auth: true
+       http_auth_user: client
+       http_auth_except_paths: ['/.well-known/acme-challenge/', '/wp-json/gf/v2/webhooks/']
+   ```
+
+2. Lancer `dep http-auth:setup staging`, puis répondre aux questions.
+3. Ranger l'URL, l'identifiant et le mot de passe dans l'entrée Bitwarden de la
+   préproduction. Un mot de passe généré n'est affiché qu'une fois.
+
+Le mot de passe n'apparaît jamais dans l'inventaire ni dans le dépôt.
+
+`http-auth:setup` procède dans cet ordre :
+
+- Sans `http_auth: true`, elle indique la clé à poser et s'arrête sans erreur, sans appel
+  au serveur.
+- Elle refuse un hôte que WordPress considère en production (voir le garde-fou plus bas).
+- Elle lit `WP_HOME` dans `shared/.env`. Sans cette variable, elle s'arrête sans rien
+  écrire.
+- Elle interroge le site sans identifiants, depuis le poste local. Une réponse 401 signale
+  une protection déjà en place : avertissement, puis `Installer quand même ? [y/N]`. En
+  `-n`, cette question n'est pas posée. Si le `.htaccess` en ligne contient déjà le bloc
+  Horizon, la tâche affiche une ligne d'information, sans avertissement ni question. Ce
+  bloc sera remplacé, avec les IP à jour. Si le provider HttpLogin de horizon-tools est
+  actif, l'avertissement le nomme (voir « Site déjà protégé en PHP »). Derrière le bloc
+  Horizon, ce provider actif donne une seconde ligne d'information, toujours sans question.
+  La vérification finale ne peut alors pas conclure.
+- En `-n`, elle décrit ce qu'elle ferait et s'arrête. Le `.htaccess` décrit est le fichier
+  réellement modifié : celui de `shared/` si la release n'en contient qu'un lien.
+- Elle demande confirmation, avec « non » pour réponse par défaut.
+- Une sonde vérifie qu'Apache applique un `.htaccess` d'authentification. Si elle reçoit
+  une redirection, le message invite à vérifier `WP_HOME` dans `shared/.env` (http au lieu
+  de https, www manquant).
+- Elle demande le mot de passe, sauf si le `.htpasswd` existe déjà.
+- Elle refuse un `.htpasswd` existant sans identifiant lisible, et renvoie vers
+  `http-auth:update` pour le remplacer. Rien n'est alors écrit.
+- Elle écrit le `.htpasswd`, puis le bloc en tête du `.htaccess` de la release en ligne.
+  Si ce fichier est un lien vers `shared/`, c'est le fichier de `shared/` qui est modifié.
+- Elle vérifie le résultat depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
+  En cas d'échec, les fichiers retrouvent leur état d'origine et la tâche échoue. Une
+  exception est décrite plus bas (« Vérification depuis une IP autorisée »).
+- Elle affiche l'URL, l'identifiant, les IP détectées pour le serveur et, s'il a été
+  généré, le mot de passe.
+
+**Mot de passe.** Il est saisi deux fois, en saisie masquée. Après trois saisies qui
+diffèrent, la tâche s'arrête. Une saisie vide fait générer un mot de passe de 24
+caractères. Il ne contient ni caractère ambigu (`0`, `O`, `1`, `l`…) ni caractère spécial,
+pour une saisie facile sur mobile. Symfony supprime les espaces en début et en fin de saisie
+masquée, qui ne font donc pas partie du mot de passe. Le hash bcrypt est calculé sur le
+poste local, et seul ce hash part vers le serveur. Le mot de passe en clair n'apparaît dans
+aucune commande, même en `-vvv`.
+
+**`.htpasswd` déjà présent.** `setup` le conserve sans poser de question et indique
+l'identifiant qu'il contient. Un identifiant différent de `http_auth_user` donne un
+avertissement. Faute de connaître le mot de passe, la vérification avec identifiants est
+sautée. Pour changer les identifiants, utiliser `http-auth:update`.
+
+**Site déjà protégé en PHP.** Si le site répond déjà 401 (mu-plugin, provider Acorn), la
+tâche demande confirmation avant d'installer. L'ancienne protection répond ensuite 401
+même avec les bons identifiants, et la vérification finale ne peut pas conclure. La tâche
+conserve alors le bloc, puisque la sonde a prouvé qu'Apache l'applique, et affiche un
+avertissement. Il reste à tester le site dans un navigateur avec les nouveaux identifiants.
+Il faut ensuite retirer l'ancienne protection du projet, par un commit dans son dépôt.
+Tant que les deux coexistent, le navigateur demande deux fois des identifiants.
+
+**Provider HttpLogin de horizon-tools.** Le paquet `agence-adeliom/horizon-tools`
+enregistre toujours le provider Acorn `HttpLoginServiceProvider`. Celui-ci répond 401
+depuis PHP si la constante `ENABLED_HTTP_LOGIN` est vraie. Quand le site répond déjà 401,
+`setup` cherche ce provider dans la release en ligne, sans exécuter le code du projet. La
+tâche lit la valeur de `ENABLED_HTTP_LOGIN` dans `config/environments/<WP_ENV>.php`, puis
+dans `config/application.php`. Le fichier d'environnement l'emporte, comme dans Bedrock.
+Sans `WP_ENV`, c'est `production.php`, que Bedrock charge alors. Une valeur `env('NOM')`
+est lue dans `shared/.env` et convertie comme le fait `env()` dans Bedrock. Seuls `false`,
+`0`, une valeur vide et `null` désactivent le provider. `no`, `off`, `(false)` ou `empty`
+le laissent donc actif. Une variable absente prend le défaut littéral placé après `??`,
+par exemple `false` dans `env('NOM') ?? false`. Sans défaut, la valeur est inconnue, car
+une variable d'environnement du serveur peut aussi la fournir. Si le provider est actif,
+l'avertissement le nomme et cite le fichier à modifier. Après l'installation, il faut y
+passer `ENABLED_HTTP_LOGIN` à `false`, commiter, puis déployer. Si la valeur n'a pas pu
+être lue, l'avertissement générique le signale. À chaque déploiement, `deploy:http-auth`
+lit la release déployée. La tâche avertit d'une double authentification tant que le
+provider y reste actif, sans jamais faire échouer le déploiement.
+
+**Vérification depuis une IP autorisée.** Le bloc sert sans identifiants les IP détectées
+pour le serveur et celles de `http_auth_allow_ips`. Le poste qui lance `dep` peut avoir
+l'une de ces IP, par exemple celle du bureau. Le site lui répond alors 200 ou 30x sans
+identifiants, ce qui ne prouve rien. Dans ce cas, la tâche conserve le bloc et affiche un
+avertissement qui cite ces IP. Il reste à tester le site dans un navigateur depuis un autre
+réseau, par exemple le partage de connexion d'un téléphone. Sans autre IP que
+`127.0.0.1` et `::1`, la vérification reste stricte.
+
+**Sonde Apache.** L'en-tête `Server` ne dit pas de façon fiable si le serveur honore un
+`.htaccess` d'authentification, et les mutualisés la masquent souvent. La tâche le vérifie
+donc par l'effet. Elle crée dans la racine publique un dossier `horizon-http-auth-<aléa>/`
+qui exige une authentification, puis l'interroge depuis le poste local :
+
+- 401 : Apache applique les directives, l'installation continue ;
+- 200 : le `.htaccess` est ignoré (Nginx, ou `AllowOverride` sans `AuthConfig`), refus ;
+- 500 : les directives sont refusées (Apache 2.2, module manquant), refus ;
+- aucune réponse ou autre code : refus.
+
+Après un 401, la sonde lève l'exigence d'authentification et interroge son `index.php`
+depuis le serveur, une fois en IPv4 (`curl -4`) et une fois en IPv6 (`curl -6`). Un
+serveur doté des deux familles s'adresse en effet à lui-même par l'une ou par l'autre,
+selon le programme. Les adresses affichées sont celles qu'Apache voit pour les requêtes du
+site vers lui-même (WP-Cron, santé du site). Le bloc les autorise toutes sans identifiants.
+Une famille absente est ignorée. Le dossier de la sonde est supprimé dans tous les cas, et
+un refus n'écrit rien d'autre.
+
+Le bloc écrit en tête du `.htaccess` ressemble à ceci :
+
+```apache
+# BEGIN Horizon HTTP auth
+# Géré par horizon-deployer-recipe (http-auth:setup). Ne pas modifier à la main.
+AuthType Basic
+AuthName "Accès restreint"
+AuthUserFile "/srv/staging/shared/.htpasswd"
+<RequireAny>
+    Require ip 127.0.0.1 ::1 203.0.113.10 2001:db8::10
+    Require expr %{REQUEST_URI} =~ m#^/\.well-known/acme-challenge/#
+    Require valid-user
+</RequireAny>
+# END Horizon HTTP auth
+```
+
+Le reste du fichier est conservé octet pour octet, fins de ligne CRLF comprises. Un
+`.htaccess` absent est créé avec le seul bloc. Un bloc retouché à la main peut devenir mal
+formé (marqueur seul, ordre inversé, bloc en double). Il n'est alors jamais réécrit : la
+tâche s'arrête et demande de le corriger.
+
+**Exceptions.** `http_auth_except_paths` liste les préfixes d'URL servis sans
+authentification. Le défaut, `/.well-known/acme-challenge/`, laisse passer le
+renouvellement des certificats Let's Encrypt. On y ajoute par exemple l'URL d'un webhook
+appelé par un service tiers. Chaque préfixe devient une ligne `Require expr`, échappée pour
+l'expression régulière. `http_auth_allow_ips` ajoute des IP servies sans authentification.
+Une valeur qui casserait le `.htaccess` est refusée avant toute écriture. Sont refusés un
+saut de ligne, `#` dans un préfixe, `\` dans le realm et `"` dans le chemin du
+`.htpasswd`. Apache répondrait sinon par une erreur 500 sur tout le site.
+
+Chaque élément de `http_auth_allow_ips` est une seule adresse : IPv4, IPv6 ou adresse
+partielle (`10.1`), avec un masque éventuel (`/24`). Une liste séparée par des virgules, un
+nom d'hôte ou une chaîne vide sont refusés. `http-auth:setup` refuse avant toute question.
+Au déploiement, `deploy:http-auth` fait échouer le déploiement avant la bascule.
+
+**IP du serveur.** Derrière un proxy (Cloudflare, frontal d'hébergeur), une IP détectée peut
+être celle du proxy. Le récapitulatif les affiche pour cette raison, et
+`http_auth_allow_ips` permet de corriger. Les déploiements reprennent les IP du bloc en
+ligne, seul endroit où les IP détectées par la sonde sont conservées. Une IP retirée de
+`http_auth_allow_ips` garde donc son accès jusqu'au prochain `dep http-auth:setup`.
+
+**Garde-fou production.** `http-auth:setup` et `http-auth:update` refusent un hôte que
+WordPress considère en production. Le type d'environnement se lit dans `shared/.env`,
+comme pour `roles:check`. Un `WP_ENV=preprod` donne donc le type `production` et bloque
+aussi : le message invite à déclarer `WP_ENV=staging`. Si ni `WP_ENVIRONMENT_TYPE` ni
+`WP_ENV` ne figure dans le fichier, la tâche refuse un hôte protégé (`transfer_protected`).
+Ailleurs, elle continue avec une ligne d'information.
+
+**À chaque déploiement.** Un `.htaccess` versionné est remplacé à chaque déploiement par la
+version du dépôt, sans le bloc. La tâche cachée `deploy:http-auth` réinjecte donc le bloc
+dans la nouvelle release, juste avant `deploy:symlink`. Elle ne pose aucune question, ne
+touche pas au `.htpasswd` et ne relance pas la sonde.
+
+- Sans `http_auth: true`, elle ne fait rien, sans appel au serveur.
+- En production, elle n'écrit rien et affiche un avertissement. Le déploiement continue.
+- Sans `.htpasswd` (installation jamais faite), elle avertit que la release ne sera pas
+  protégée, et n'écrit rien.
+- Un bloc identique déjà présent n'est pas réécrit.
+- Si le provider HttpLogin de horizon-tools est actif dans la release déployée, elle
+  avertit d'une double authentification et cite le fichier où passer `ENABLED_HTTP_LOGIN`
+  à `false`. Le déploiement qui fait ce changement n'affiche donc plus l'avertissement.
+  Cette détection ne fait jamais échouer le déploiement.
+- **Un échec de la réinjection fait échouer le déploiement**, avant la bascule. Mettre en
+  ligne une préproduction sans protection serait une régression silencieuse.
+
+Si le `.htaccess` de la release est un lien vers `shared/`, la réinjection écrit dans le
+fichier en ligne, avant la bascule. Un changement de realm, d'exceptions, de chemin du
+`.htpasswd` ou d'IP s'applique alors au site en ligne dès cette étape. Un bloc identique
+n'entraîne aucune écriture.
+
+**Changer les identifiants.** `dep http-auth:update staging` remplace l'identifiant et le
+mot de passe. Le bloc désigne le `.htpasswd` par son chemin, qui ne change pas : seul le
+`.htpasswd` est réécrit, sans sonde.
+
+- Elle refuse sans installation existante (`.htpasswd` ou bloc absent) et renvoie vers
+  `http-auth:setup`.
+- Elle refuse si l'`AuthUserFile` du bloc diffère de `http_auth_htpasswd` (réglage modifié
+  depuis l'installation). Relancer `http-auth:setup` aligne le bloc.
+- Elle refuse si un `.htpasswd.bak` est présent. Cette copie, laissée par une exécution
+  interrompue, est la seule trace des identifiants précédents. Il faut la remettre en place
+  ou la supprimer à la main, puis relancer la tâche.
+- Elle applique le garde-fou production, comme `setup`.
+- En `-n`, elle affiche l'identifiant actuel et s'arrête.
+- Elle demande l'identifiant, avec `http_auth_user` pour réponse proposée. Une autre
+  réponse rappelle de mettre à jour `.inventory.yaml`. Un identifiant vide ou contenant `:`
+  est redemandé, trois fois au plus.
+- Elle demande le mot de passe comme `setup`, puis confirmation, avec « non » par défaut.
+- Elle copie l'ancien fichier en `.htpasswd.bak`, écrit le nouveau, puis vérifie le site
+  avec les nouveaux identifiants (200 ou 30x attendu). En cas d'échec, l'ancien fichier est
+  remis en place et la tâche échoue. En cas de succès, la copie est supprimée.
+- Le récapitulatif affiche le mot de passe s'il a été généré, avec la consigne de mettre à
+  jour l'entrée Bitwarden. Un mot de passe saisi n'est jamais affiché.
+
+**Retirer la protection.** `dep http-auth:remove staging` retire le bloc du `.htaccess` de
+la release en ligne. Le fichier reste en place, même vide. Le `.htpasswd` est conservé
+pour une réactivation. La tâche demande confirmation et n'écrit rien en `-n`. Elle n'a pas
+de garde-fou production, pour qu'une protection posée par erreur reste facile à retirer.
+Si `http_auth` vaut encore `true`, le prochain déploiement remettra la protection. Il faut
+donc passer la clé à `false` dans l'inventaire.
+
+Limites connues :
+
+- **Nginx** : non pris en charge. La sonde le détecte et la tâche refuse.
+- **Mots de passe d'application WordPress** : ils passent eux aussi par l'en-tête
+  `Authorization: Basic`, en conflit avec l'authentification HTTP. Une intégration qui en
+  dépend doit passer par `http_auth_except_paths` ou `http_auth_allow_ips`.
+- **Proxy en frontal** : une IP détectée peut être celle du proxy (voir plus haut).
+- **IPv4 et IPv6** : la sonde mesure les deux familles depuis le serveur. Une famille que le
+  serveur ne joint pas sur sa propre URL (DNS sans enregistrement, pare-feu) n'est pas
+  détectée. Ses IP se déclarent alors dans `http_auth_allow_ips`.
+- **Protection existante en PHP** : la tâche ne la retire pas. Ce retrait se fait par un
+  commit dans le dépôt du projet. Seul le provider HttpLogin de horizon-tools est reconnu.
+  Sa valeur n'est lue que sous les formes `true`, `false` et `env('NOM')`, avec un défaut
+  littéral éventuel. Toute autre forme donne l'avertissement générique.
+- **Variable d'environnement du serveur** : une variable qui surchargerait `shared/.env`
+  n'est pas vue par le garde-fou production.
+- **`dep rollback`** : revenir à une release antérieure à `http-auth:setup` remet en ligne
+  la préproduction sans protection. Le bloc n'existe en effet que dans les releases
+  installées ou déployées depuis. Un `.htaccess` partagé n'est pas concerné. Après un tel
+  rollback, relancer `dep http-auth:setup <hôte>`.
 
 ## Sûreté
 
@@ -680,6 +935,13 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `transfer_reuse_window` | `3600` | Fenêtre, en secondes, pendant laquelle un dump ou une archive déjà présent à la racine est proposé à la réutilisation. `0` pour ne jamais le proposer |
 | `roles_check` | `true` | Lance `roles:check` avant `deploy` et `roles:status` après `deploy:success`. À `false`, les deux tâches ne font rien, même lancées à la main. Sans effet pour un projet sans mu-plugin `adeliom-roles` |
 | `roles_check_file` | `web/app/mu-plugins/adeliom-roles/roles.php`, ou `wp-content/mu-plugins/adeliom-roles/roles.php` s'il est le seul présent | Déclaration `roles.php` du mu-plugin `adeliom-roles`, relative à la racine du projet. Le chargeur testé par `roles:status` dans la release en ligne s'en déduit (`adeliom-roles.php` à côté du dossier) |
+| `http_auth` | `false` | Active l'authentification HTTP de l'hôte : `http-auth:setup` et la réinjection du bloc à chaque déploiement. À poser dans l'inventaire, hôte par hôte. Sans effet sur un hôte que WordPress considère en production |
+| `http_auth_user` | `adeliom` | Identifiant écrit dans le `.htpasswd` par `http-auth:setup`, et réponse proposée par `http-auth:update` |
+| `http_auth_realm` | `Accès restreint` | Texte affiché par le navigateur dans la fenêtre d'identification (`AuthName`). Sans `\` ni saut de ligne |
+| `http_auth_htaccess` | `web/.htaccess` | `.htaccess` qui reçoit le bloc, relatif à la release. Pour un WordPress classique : `.htaccess` |
+| `http_auth_htpasswd` | `{{deploy_path}}/shared/.htpasswd` | `.htpasswd` sur le serveur, hors de la racine publique |
+| `http_auth_except_paths` | `['/.well-known/acme-challenge/']` | Préfixes d'URL servis sans authentification (renouvellement Let's Encrypt, webhooks). Sans `#` ni saut de ligne |
+| `http_auth_allow_ips` | `[]` | IP servies sans authentification, en plus de `127.0.0.1`, `::1` et des IP détectées pour le serveur. Une adresse ou un réseau par élément (`203.0.113.10`, `10.1`, `198.51.100.0/24`) |
 | `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
 | `transfer_wp_php_args` | `-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'` | Options PHP du `wp-cli.phar` installé par le recipe : masque par défaut les notices de dépréciation qu'une bibliothèque ancienne émet à chaque appel WP-CLI sous PHP 8+. `''` pour garder la configuration PHP du serveur. Sans effet quand `wp` est trouvé dans le PATH |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |
@@ -755,7 +1017,14 @@ Exemple ci-dessus : projets Horizon utilisant le champ « Texte chiffré » avec
   serait vide — c'est vrai du `recipe/common.php` nu, mais la plupart des projets y
   accrochent `deploy:unlock` et des actions de récupération.
 - **Ordre des accroches avant `deploy`.** Deployer empile les `before()` en tête de liste :
-  `roles:check` est donc déclarée avant `build:check` pour passer après elle.
+  `roles:check` est donc déclarée avant `build:check` pour passer après elle. De même,
+  avant `deploy:symlink`, `deploy:http-auth` est déclarée après `deploy:db-backup` et passe
+  donc avant elle.
+- **Mot de passe HTTP hors des commandes.** Le hash bcrypt du `.htpasswd` est calculé en
+  local, et seul ce hash est envoyé au serveur. Les vérifications avec identifiants tournent
+  en local : `curl` les lit dans un fichier de configuration temporaire en droits `600`,
+  supprimé après l'appel. Aucune commande, même affichée en `-vvv`, ne contient le mot de
+  passe en clair.
 - **Production selon `WP_ENV`, pas selon l'alias.** `roles:check` lit le type
   d'environnement dans `shared/.env` de l'hôte et le normalise comme Bedrock puis
   `wp_get_environment_type()` (valeur vide ou non standard = `production`), et ne retombe
@@ -781,7 +1050,7 @@ php tests/run.php rsync roles  # seulement tests/unit/rsync.test.php et roles.te
 
 Toutes les fonctions et tâches du recipe ont des tests unitaires, rangés par domaine dans
 `tests/unit/` : rôles, réécriture d'URLs, multisite, base et collations, rsync, sauvegardes, état et
-répertoires de travail, environnements et questions, `build:check`, WP-CLI, uploads, déclarations
+répertoires de travail, environnements et questions, `build:check`, WP-CLI, uploads, authentification HTTP, déclarations
 (options, défauts, points d'accroche) et scénarios des quatre tâches de transfert. Ils chargent le vrai
 Deployer et le recipe entier ; seules les commandes shell sont interceptées et vérifiées comme chaînes,
 et exécutées pour de vrai quand c'est local et sans risque (rsync 3, gzip, grep, git entre dossiers
