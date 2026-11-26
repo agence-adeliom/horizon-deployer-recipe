@@ -4522,6 +4522,211 @@ function httpAuthProbe(Host $env, string $webRoot, string $url): array
     return $result;
 }
 
+/**
+ * Garde-fou production des tâches http-auth, appliqué à l'hôte : lit shared/.env, lève
+ * error() avec le message de httpAuthProductionRefusal() en cas de refus, et signale par une
+ * ligne d'information un type introuvable sur un hôte non protégé.
+ *
+ * @return array<string, string> valeurs de transferHostEnvironmentValues() (WP_HOME compris)
+ */
+function httpAuthGuard(Host $env): array
+{
+    $values = transferHostEnvironmentValues($env);
+    $refusal = httpAuthProductionRefusal($values, transferIsProtected($env));
+
+    if ($refusal !== null) {
+        throw error($refusal);
+    }
+
+    if (transferEnvironmentType($values) === null) {
+        info(sprintf('Type d\'environnement introuvable dans shared/.env de « %s » (ni WP_ENVIRONMENT_TYPE ni WP_ENV), hôte non protégé : authentification HTTP autorisée.', $env->getAlias()));
+    }
+
+    return $values;
+}
+
+/**
+ * Droits du fichier existant $path sur l'hôte, en octal ; $default s'ils sont illisibles.
+ * `stat -c` (GNU) puis `stat -f` (BSD, macOS).
+ */
+function httpAuthFileMode(Host $env, string $path, string $default): string
+{
+    $quoted = escapeshellarg($path);
+    $mode = trim(transferRun($env, "stat -c %a $quoted 2>/dev/null || stat -f %Lp $quoted 2>/dev/null || true"));
+
+    return preg_match('/^[0-7]{3,4}$/', $mode) === 1 ? $mode : $default;
+}
+
+desc('Installe l\'authentification HTTP (bloc .htaccess + .htpasswd) sur une préproduction dont l\'inventaire porte http_auth: true : dep http-auth:setup staging');
+task('http-auth:setup', static function (): void {
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // 1. Réglage : sans http_auth, aucune commande distante.
+    if (!(bool) get('http_auth')) {
+        info("Authentification HTTP non activée pour « $label » : poser `http_auth: true` sur cet hôte dans .inventory.yaml, puis relancer la tâche.");
+
+        return;
+    }
+
+    // 2. Garde-fou production, 3. URL du site.
+    $values = httpAuthGuard($env);
+    $url = $values['WP_HOME'] ?? '';
+
+    if ($url === '') {
+        throw error("WP_HOME introuvable dans shared/.env de « $label » : URL du site inconnue. Rien n'a été écrit.");
+    }
+
+    // 4. Protection existante, vue depuis le poste local : depuis le serveur, la requête
+    // passerait par l'exception d'IP d'un bloc déjà posé.
+    $status = httpAuthHttpStatus(null, $url);
+
+    if ($status === null) {
+        warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
+    } elseif ($status === 401) {
+        warning("$url répond déjà 401 : une authentification est peut-être en place (mu-plugin, provider Acorn ou bloc existant).");
+
+        if (!transferConfirm('Installer quand même ?', false)) {
+            info('Installation abandonnée : rien n\'a été écrit.');
+
+            return;
+        }
+    }
+
+    $htpasswdPath = transferResolvePath($env, '{{http_auth_htpasswd}}');
+    // Racine publique de la release, et non le chemin du .htaccess résolu : partagé, celui-ci
+    // désigne shared/, hors du dossier servi.
+    $servedHtaccess = transferResolvePath($env, '{{current_path}}/{{http_auth_htaccess}}');
+
+    // 5. Mode non interactif : description, aucune écriture.
+    if (!input()->isInteractive()) {
+        warning("Mode non interactif (-n) : rien n'est écrit sur « $label ». Sans -n, la tâche :");
+        writeln("   - Vérifie par une sonde qu'Apache applique un .htaccess d'authentification.");
+        writeln("   - Écrit $htpasswdPath, s'il n'existe pas encore.");
+        writeln("   - Ajoute le bloc d'authentification en tête de $servedHtaccess.");
+        writeln("   - Vérifie que $url répond 401 sans identifiants.");
+
+        return;
+    }
+
+    // 6. Confirmation, défaut « non » (voir transferConfirm()).
+    if (!transferConfirm("Installer l'authentification HTTP sur « $label » ?", false)) {
+        info('Installation abandonnée : rien n\'a été écrit.');
+
+        return;
+    }
+
+    // 7. Sonde Apache.
+    $probe = httpAuthProbe($env, dirname($servedHtaccess), $url);
+
+    if ($probe['status'] === 'ignored') {
+        throw error("Le serveur de « $label » ignore les .htaccess d'authentification (Nginx, ou AllowOverride sans AuthConfig) : authentification HTTP non prise en charge. Rien n'a été écrit.");
+    }
+
+    if ($probe['status'] === 'error') {
+        throw error("Le serveur de « $label » refuse les directives d'authentification (erreur 500 : Apache 2.2 ou module manquant). Rien n'a été écrit.");
+    }
+
+    if ($probe['status'] !== 'ok') {
+        throw error(sprintf('Sonde Apache sans réponse exploitable sur %s (code %s) : authentification HTTP non vérifiable. Rien n\'a été écrit.', $url, $probe['code'] ?? 'aucun'));
+    }
+
+    if ($probe['ip'] === null) {
+        warning('IP du serveur non détectée : ses requêtes vers le site (WP-Cron, santé du site) demanderont des identifiants. La déclarer dans http_auth_allow_ips au besoin.');
+    }
+
+    // 8. Mot de passe : un .htpasswd existant est conservé sans question.
+    $user = (string) get('http_auth_user');
+    $password = null;
+    $generated = false;
+    $htpasswdLine = null;
+    $existing = httpAuthReadFile($env, $htpasswdPath);
+
+    if ($existing !== null) {
+        $user = httpAuthHtpasswdUser($existing) ?? '';
+        info(sprintf('%s existe déjà (identifiant « %s ») : conservé. Pour changer les identifiants : dep http-auth:update %s', $htpasswdPath, $user, $label));
+
+        if ($user !== (string) get('http_auth_user')) {
+            warning(sprintf('L\'identifiant du .htpasswd (« %s ») diffère de http_auth_user (« %s »).', $user, (string) get('http_auth_user')));
+        }
+    } else {
+        // http_auth_password_asker, réservé aux tests et absent par défaut : closure qui rend
+        // la fonction de saisie passée à httpAuthAskPassword() (Deployer évalue une closure
+        // stockée en configuration), askHiddenResponse() refusant une entrée sans TTY.
+        $asker = has('http_auth_password_asker') ? get('http_auth_password_asker') : null;
+        $asked = httpAuthAskPassword(is_callable($asker) ? $asker : null);
+        $password = $asked['password'];
+        $generated = $asked['generated'];
+        $htpasswdLine = httpAuthHtpasswdLine($user, $password);
+    }
+
+    // Bloc et nouveau .htaccess calculés avant toute écriture : une valeur refusée ou un bloc
+    // mal formé arrête la tâche sans rien avoir modifié.
+    $ips = array_merge($probe['ip'] !== null ? [$probe['ip']] : [], (array) get('http_auth_allow_ips'));
+    $block = httpAuthBlock($htpasswdPath, (string) get('http_auth_realm'), $ips, (array) get('http_auth_except_paths'));
+    $htaccessPath = httpAuthHtaccessPath($env, '{{current_path}}');
+    $original = httpAuthReadFile($env, $htaccessPath);
+    $htaccess = httpAuthInsertBlock($original ?? '', $block);
+
+    // 9. .htpasswd, 10. bloc du .htaccess (droits du fichier existant conservés).
+    if ($htpasswdLine !== null) {
+        httpAuthWriteFile($env, $htpasswdPath, $htpasswdLine, '644');
+    }
+
+    $written = $htaccess !== $original;
+    $mode = $original !== null ? httpAuthFileMode($env, $htaccessPath, '644') : '644';
+
+    if ($written) {
+        httpAuthWriteFile($env, $htaccessPath, $htaccess, $mode);
+    } else {
+        info("Bloc déjà présent et identique dans $htaccessPath : non réécrit.");
+    }
+
+    // 11. Vérification depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
+    $without = httpAuthHttpStatus(null, $url);
+    $failure = null;
+
+    if ($without !== 401) {
+        $failure = sprintf('sans identifiants, %s répond %s (401 attendu)', $url, $without ?? 'rien');
+    } elseif ($password !== null) {
+        $with = httpAuthHttpStatus(null, $url, $user, $password);
+
+        if ($with === null || ($with !== 200 && ($with < 300 || $with > 399))) {
+            $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
+        }
+    } else {
+        info('Mot de passe du .htpasswd existant inconnu : vérification avec identifiants sautée.');
+    }
+
+    if ($failure !== null) {
+        if ($written) {
+            try {
+                if ($original === null) {
+                    transferRun($env, 'rm -f ' . escapeshellarg($htaccessPath));
+                } else {
+                    httpAuthWriteFile($env, $htaccessPath, $original, $mode);
+                }
+            } catch (\Throwable $e) {
+                warning("Impossible de remettre le .htaccess d'origine ($htaccessPath) : à vérifier à la main.");
+                writeln('   ' . $e->getMessage());
+            }
+        }
+
+        throw error("Vérification en échec : $failure. Le .htaccess d'origine est remis en place.");
+    }
+
+    // 12. Récapitulatif. Le mot de passe généré n'est affiché qu'ici, une seule fois.
+    info("Authentification HTTP installée sur « $label ».");
+    writeln("   URL : $url");
+    writeln("   Identifiant : $user");
+    writeln('   IP détectée pour le serveur : ' . ($probe['ip'] ?? 'aucune'));
+
+    if ($generated) {
+        writeln("   Mot de passe : $password");
+        writeln('   Copiez-le dans Bitwarden : il ne sera plus affiché.');
+    }
+});
+
 // deploy:success et non deploy:symlink : la question ne doit pas être posée tant que le
 // verrou de déploiement est tenu, un Ctrl-C dessus laisserait le projet verrouillé.
 // deploy:unlock est écarté pour une autre raison — c'est la commande qu'on lance à la

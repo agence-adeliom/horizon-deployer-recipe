@@ -522,3 +522,363 @@ cas('httpAuthAskPassword : saut de ligne refusé, compté comme un écart', stat
     }, \RuntimeException::class, 'Les mots de passe saisis diffèrent.');
     verifie('trois questions', count($questions), 3);
 });
+
+/*
+ * Tâche http-auth:setup et garde-fou partagé httpAuthGuard.
+ */
+
+/**
+ * Hôte prêt pour http-auth:setup : http_auth activé, shared/.env de staging, saisie du mot de
+ * passe scriptée par http_auth_password_asker (closure qui rend la fonction de saisie).
+ */
+function httpAuthHoteSetup(string $alias, array $config = [], array $saisies = [''], ?array &$questions = null): \Deployer\Host\Host
+{
+    $questions = [];
+    $saisie = httpAuthSaisieTest($saisies, $questions);
+
+    return hote($alias, array_merge([
+        'http_auth' => true,
+        'http_auth_password_asker' => static function () use ($saisie): callable {
+            return $saisie;
+        },
+    ], $config));
+}
+
+/** Réponse du shared/.env : lignes « +dep-env: » de transferHostEnvironmentValues(). */
+function httpAuthEnvTest(string $lignes = "WP_ENV=staging\nWP_HOME=https://staging.site.test"): void
+{
+    Shell::quand('/^grep -E /', implode("\n", array_map(static function (string $ligne): string {
+        return '+dep-env:' . $ligne;
+    }, explode("\n", $lignes))));
+}
+
+/**
+ * Codes des curl locaux : sonde, avec identifiants, puis sans identifiants dans l'ordre
+ * (contrôle initial, vérification finale). Le dernier code sans identifiants se répète.
+ */
+function httpAuthCurlTest(array $sans, string $sonde = '401', string $avec = '200'): void
+{
+    Shell::quand('/^curl -sS -o /', static function (array $appel) use (&$sans, $sonde, $avec): string {
+        if (strpos($appel['commande'], 'horizon-http-auth-') !== false) {
+            return $sonde;
+        }
+
+        if (strpos($appel['commande'], ' -K ') !== false) {
+            return $avec;
+        }
+
+        return count($sans) > 1 ? array_shift($sans) : $sans[0];
+    }, 'local');
+    Shell::quand('/^curl -fsS /', '203.0.113.10');
+}
+
+/** Contenu écrit par httpAuthWriteFile() sur $chemin, null si rien n'y a été écrit. */
+function httpAuthEcritTest(string $chemin): ?string
+{
+    $contenu = null;
+
+    foreach (Shell::commandes() as $commande) {
+        if (strpos($commande, 'base64 -d > ' . escapeshellarg($chemin . '.horizon-tmp')) !== false
+            && preg_match("/^\\{ set -o pipefail; printf %s '([A-Za-z0-9+\\/=]*)'/", $commande, $m) === 1) {
+            $contenu = (string) base64_decode($m[1], true);
+        }
+    }
+
+    return $contenu;
+}
+
+/** Écritures hors du dossier de la sonde. */
+function httpAuthEcrituresHorsSonde(): array
+{
+    return array_values(array_filter(Shell::commandes(), static function (string $commande): bool {
+        return (strpos($commande, 'base64 -d') !== false || strpos($commande, 'rm -f ') !== false)
+            && strpos($commande, 'horizon-http-auth-') === false;
+    }));
+}
+
+cas('httpAuthGuard : refus en production, information si le type est introuvable', static function (): void {
+    $h = hote('http-auth-garde');
+    httpAuthEnvTest("WP_ENV=preprod\nWP_HOME=https://preprod.site.test");
+    leve('preprod refusée', static function () use ($h): void {
+        httpAuthGuard($h);
+    }, \Throwable::class, 'WP_ENV=staging');
+
+    Shell::reinitialiser();
+    httpAuthEnvTest("WP_ENV=staging\nWP_HOME=https://staging.site.test");
+    verifie('staging : valeurs rendues', httpAuthGuard($h), ['WP_ENV' => 'staging', 'WP_HOME' => 'https://staging.site.test']);
+
+    Shell::reinitialiser();
+    sortie();
+    verifie('introuvable, non protégé : poursuite', httpAuthGuard($h), []);
+    contient('introuvable : information', sortie(), 'introuvable');
+
+    $p = hote('http-auth-garde-prod');
+    Shell::reinitialiser();
+    leve('introuvable, protégé : refus', static function () use ($p): void {
+        httpAuthGuard($p);
+    }, \Throwable::class, 'hôte protégé');
+});
+
+cas('http-auth:setup : http_auth faux, aucune commande', static function (): void {
+    $h = hote('http-auth-inactif');
+    sortie();
+    tache('http-auth:setup', $h);
+    verifie('aucune commande', Shell::commandes(), []);
+    contient('clé d\'inventaire citée', sortie(), 'http_auth: true');
+});
+
+cas('http-auth:setup : production refusée, sans écriture', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-prod-env');
+    httpAuthEnvTest("WP_ENV=production\nWP_HOME=https://www.site.test");
+    httpAuthCurlTest(['200']);
+    entree([], true, ['y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, 'WP_ENV=production');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+    aucuneCommande('aucun curl', '/curl /');
+});
+
+cas('http-auth:setup : WP_HOME absent, erreur sans écriture', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-sans-home');
+    httpAuthEnvTest('WP_ENV=staging');
+    entree([], true, ['y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, 'WP_HOME');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+});
+
+cas('http-auth:setup : protection existante (401), « non » sans écriture, « oui » poursuit', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deja');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401']);
+    entree([], true, ['n']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    contient('avertissement', sortie(), 'répond déjà 401');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+    aucuneCommande('pas de sonde', '/horizon-http-auth-/');
+
+    $h = httpAuthHoteSetup('http-auth-deja-oui');
+    Shell::reinitialiser();
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401']);
+    entree([], true, ['y', 'y']);
+    tache('http-auth:setup', $h);
+    uneCommande('sonde lancée', '/mkdir .*horizon-http-auth-/');
+    vrai('.htaccess écrit', httpAuthEcritTest('/srv/' . $h->getAlias() . '/current/web/.htaccess') !== null);
+});
+
+cas('http-auth:setup : -n, description sans écriture', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-n');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('mode non interactif', $sortie, 'Mode non interactif');
+    contient('.htpasswd décrit', $sortie, '/srv/' . $h->getAlias() . '/shared/.htpasswd');
+    contient('.htaccess décrit', $sortie, '/srv/' . $h->getAlias() . '/current/web/.htaccess');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+    aucuneCommande('pas de sonde', '/horizon-http-auth-/');
+});
+
+cas('http-auth:setup : fin d\'entrée sans TTY, défaut « non »', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-eof');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    entree([], true, []);
+
+    tache('http-auth:setup', $h);
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+    aucuneCommande('pas de sonde', '/horizon-http-auth-/');
+});
+
+cas('http-auth:setup : sonde ignorée ou en erreur, refus sans écriture hors sonde', static function (): void {
+    foreach (['200' => 'ignore', '500' => 'refuse'] as $code => $fragment) {
+        $questions = [];
+        $h = httpAuthHoteSetup('http-auth-sonde-' . $code, [], [''], $questions);
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+        httpAuthCurlTest(['200'], (string) $code);
+        entree([], true, ['y']);
+
+        leve("$code : erreur", static function () use ($h): void {
+            tache('http-auth:setup', $h);
+        }, \Throwable::class, $fragment);
+        verifie("$code : aucune écriture hors sonde", httpAuthEcrituresHorsSonde(), []);
+        uneCommande("$code : sonde supprimée", '/rm -rf .*horizon-http-auth-/');
+        verifie("$code : mot de passe non demandé", $questions, []);
+    }
+});
+
+cas('http-auth:setup : parcours complet, mot de passe généré, deploy_path en « ~/ »', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-complet', ['deploy_path' => '~/sites/s'], [''], $questions);
+    Shell::quand('/^printf %s "\$HOME"$/', '/home/compte');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    $wp = "# BEGIN WordPress\nRewriteEngine On\n# END WordPress\n";
+    Shell::quand('#^if \[ -f \'/home/compte/sites/s/current/web/\.htaccess\' \]#', "+dep\n" . base64_encode($wp));
+    Shell::quand('/^stat -c %a /', "640\n");
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+
+    verifie('une saisie', count($questions), 1);
+    vrai('mot de passe affiché', preg_match('/Mot de passe : ([a-hjkmnp-zA-HJKLMNP-Z2-9]{24})\b/', $sortie, $m) === 1);
+    $clair = $m[1] ?? 'introuvable';
+    verifie('affiché une seule fois', substr_count($sortie, $clair), 1);
+    contient('consigne Bitwarden', $sortie, 'Copiez-le dans Bitwarden : il ne sera plus affiché.');
+    contient('URL', $sortie, 'https://staging.site.test');
+    contient('identifiant', $sortie, 'adeliom');
+    contient('IP détectée', $sortie, '203.0.113.10');
+    absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), $clair);
+
+    $htpasswd = httpAuthEcritTest('/home/compte/sites/s/shared/.htpasswd');
+    vrai('.htpasswd écrit', $htpasswd !== null);
+    vrai('hash vérifiable', password_verify($clair, substr(trim((string) $htpasswd), strlen('adeliom:'))));
+    contient('.htpasswd en 644', implode("\n", Shell::commandes()), 'chmod 644 ' . escapeshellarg('/home/compte/sites/s/shared/.htpasswd.horizon-tmp'));
+
+    $htaccess = (string) httpAuthEcritTest('/home/compte/sites/s/current/web/.htaccess');
+    contient('AuthUserFile absolu', $htaccess, 'AuthUserFile "/home/compte/sites/s/shared/.htpasswd"');
+    contient('IP de la sonde', $htaccess, 'Require ip 127.0.0.1 ::1 203.0.113.10');
+    vrai('bloc en tête, reste conservé', substr($htaccess, -strlen("\n" . $wp)) === "\n" . $wp && strpos($htaccess, '# BEGIN Horizon HTTP auth') === 0);
+    contient('droits conservés', implode("\n", Shell::commandes()), 'chmod 640 ' . escapeshellarg('/home/compte/sites/s/current/web/.htaccess.horizon-tmp'));
+
+    $ecritures = httpAuthEcrituresHorsSonde();
+    vrai('.htpasswd avant .htaccess', count($ecritures) === 2 && strpos($ecritures[0], '.htpasswd') !== false && strpos($ecritures[1], '.htaccess') !== false);
+    uneCommande('vérification avec identifiants', '/^curl -sS -o .* -K /');
+    uneCommande('sonde dans la racine publique de la release', '#^mkdir \'/home/compte/sites/s/current/web/horizon-http-auth-[0-9a-f]{12}\'$#');
+});
+
+cas('http-auth:setup : IP de la sonde puis http_auth_allow_ips, .htaccess créé en 644', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-ips', ['http_auth_allow_ips' => ['198.51.100.7']], ['secret', 'secret']);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $chemin = '/srv/' . $h->getAlias() . '/current/web/.htaccess';
+    $htaccess = (string) httpAuthEcritTest($chemin);
+    contient('IP dans l\'ordre', $htaccess, 'Require ip 127.0.0.1 ::1 203.0.113.10 198.51.100.7');
+    verifie('fichier créé : bloc seul', $htaccess, httpAuthBlock('/srv/' . $h->getAlias() . '/shared/.htpasswd', 'Accès restreint', ['203.0.113.10', '198.51.100.7'], ['/.well-known/acme-challenge/']));
+    contient('créé en 644', implode("\n", Shell::commandes()), 'chmod 644 ' . escapeshellarg($chemin . '.horizon-tmp'));
+    aucuneCommande('pas de stat sur un fichier absent', '/^stat /');
+    absent('mot de passe saisi non affiché', sortie(), 'secret');
+    absent('mot de passe saisi absent des commandes', implode("\n", Shell::commandes()), 'secret');
+});
+
+cas('http-auth:setup : .htpasswd existant conservé, renvoi vers http-auth:update', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-existant', [], [], $questions);
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401']);
+    Shell::quand('#^if \[ -f \'/srv/[^\']+/shared/\.htpasswd\' \]#', "+dep\n" . base64_encode("client:\$2y\$10\$abc\n"));
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    verifie('aucune saisie', $questions, []);
+    contient('renvoi vers update', $sortie, 'http-auth:update');
+    contient('identifiant existant signalé', $sortie, 'client');
+    contient('identifiant différent : avertissement', $sortie, 'http_auth_user');
+    verifie('.htpasswd non réécrit', httpAuthEcritTest('/srv/' . $h->getAlias() . '/shared/.htpasswd'), null);
+    vrai('.htaccess écrit', httpAuthEcritTest('/srv/' . $h->getAlias() . '/current/web/.htaccess') !== null);
+    aucuneCommande('pas de vérification avec identifiants', '/ -K /');
+    absent('pas de mot de passe affiché', $sortie, 'Bitwarden');
+});
+
+cas('http-auth:setup : vérification finale en échec, .htaccess d\'origine remis, tâche en erreur', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-verif');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
+    $chemin = '/srv/' . $h->getAlias() . '/current/web/.htaccess';
+    Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($chemin), '#') . ' \]#', "+dep\n" . base64_encode($wp));
+    entree([], true, ['y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    verifie('.htaccess d\'origine réécrit tel quel', httpAuthEcritTest($chemin), $wp);
+
+    $h = httpAuthHoteSetup('http-auth-verif-cree');
+    Shell::reinitialiser();
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200', '401'], '401', '401');
+    entree([], true, ['y']);
+
+    leve('avec identifiants refusés : erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '200 ou 30x attendu');
+    uneCommande('.htaccess créé puis supprimé', '#^rm -f ' . preg_quote(escapeshellarg('/srv/' . $h->getAlias() . '/current/web/.htaccess'), '#') . '$#');
+});
+
+cas('http-auth:setup : de bout en bout sur le disque (réel, curl simulés)', static function (): void {
+    $racine = dossierTemporaire();
+    mkdir("$racine/releases/1/web", 0777, true);
+    mkdir("$racine/shared/web", 0777, true);
+    symlink("$racine/releases/1", "$racine/current");
+    file_put_contents("$racine/shared/.env", "WP_ENV='staging'\nWP_HOME='https://staging.site.test'\n");
+    $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
+    // .htaccess partagé : le bloc va dans shared/, la sonde dans la racine publique de la release.
+    file_put_contents("$racine/shared/web/.htaccess", $wp);
+    chmod("$racine/shared/web/.htaccess", 0640);
+    symlink("$racine/shared/web/.htaccess", "$racine/releases/1/web/.htaccess");
+    $sondes = [];
+
+    $questions = [];
+    $saisie = httpAuthSaisieTest(['mot de "passe"', 'mot de "passe"'], $questions);
+    $h = hoteLocal('http-auth-reel', [
+        'deploy_path' => $racine,
+        'http_auth' => true,
+        'http_auth_password_asker' => static function () use ($saisie): callable {
+            return $saisie;
+        },
+    ]);
+    Shell::$reel = true;
+    $avec = null;
+    Shell::quand('/^curl -sS -o /', static function (array $appel) use ($racine, &$avec, &$sondes): string {
+        if (strpos($appel['commande'], 'horizon-http-auth-') !== false) {
+            $sondes = glob("$racine/releases/1/web/horizon-http-auth-*");
+
+            return '401';
+        }
+
+        if (preg_match("/ -K '([^']+)'/", $appel['commande'], $m) === 1) {
+            $avec = file_get_contents($m[1]);
+
+            return '302';
+        }
+
+        return strpos((string) file_get_contents("$racine/shared/web/.htaccess"), 'AuthType Basic') !== false ? '401' : '200';
+    });
+    Shell::quand('/^curl -fsS /', "203.0.113.10\n");
+    entree([], true, ['y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+
+    $htaccess = (string) file_get_contents("$racine/shared/web/.htaccess");
+    verifie('.htaccess final, dans shared/', $htaccess, httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', ['203.0.113.10'], ['/.well-known/acme-challenge/']) . "\n" . $wp);
+    vrai('lien de la release intact', is_link("$racine/releases/1/web/.htaccess"));
+    verifie('droits du .htaccess conservés', fileperms("$racine/shared/web/.htaccess") & 0777, 0640);
+    verifie('sonde dans la racine publique de la release', count($sondes), 1);
+    $htpasswd = (string) file_get_contents("$racine/shared/.htpasswd");
+    vrai('.htpasswd : identifiant et hash', strpos($htpasswd, 'adeliom:$2y$') === 0 && password_verify('mot de "passe"', substr(trim($htpasswd), 8)));
+    verifie('.htpasswd en 644', fileperms("$racine/shared/.htpasswd") & 0777, 0644);
+    verifie('identifiants de la vérification', $avec, 'user = "adeliom:mot de \\"passe\\""' . "\n");
+    verifie('sonde supprimée', glob("$racine/releases/1/web/horizon-http-auth-*"), []);
+    absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), 'mot de "passe"');
+    contient('récapitulatif', sortie(), 'https://staging.site.test');
+});
