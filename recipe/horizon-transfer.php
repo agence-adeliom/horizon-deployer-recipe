@@ -4648,6 +4648,7 @@ task('http-auth:setup', static function (): void {
     // Protection autre que le bloc Horizon (mu-plugin, provider Acorn), qui survivra au
     // remplacement du bloc : seule elle rend la vérification finale non concluante.
     $alreadyProtected = false;
+    $liveHtaccessPath = null;
 
     if ($status === null) {
         warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
@@ -4677,12 +4678,14 @@ task('http-auth:setup', static function (): void {
         }
     }
 
-    // 5. Mode non interactif : description, aucune écriture.
+    // 5. Mode non interactif : description, aucune écriture. Le chemin décrit est celui du
+    // fichier réellement écrit : un .htaccess partagé désigne shared/, et non la release.
     if (!input()->isInteractive()) {
+        $describedHtaccess = $liveHtaccessPath ?? httpAuthHtaccessPath($env, '{{current_path}}');
         warning("Mode non interactif (-n) : rien n'est écrit sur « $label ». Sans -n, la tâche :");
         writeln("   - Vérifie par une sonde qu'Apache applique un .htaccess d'authentification.");
         writeln("   - Écrit $htpasswdPath, s'il n'existe pas encore.");
-        writeln("   - Ajoute le bloc d'authentification en tête de $servedHtaccess.");
+        writeln("   - Ajoute le bloc d'authentification en tête de $describedHtaccess.");
         writeln("   - Vérifie que $url répond 401 sans identifiants.");
 
         return;

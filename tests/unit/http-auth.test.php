@@ -888,6 +888,21 @@ cas('http-auth:setup : 200 sans identifiants, IPv4 et IPv6 citées dans l\'avert
     contient('IP citées', sortie(), 'les IP du serveur (203.0.113.10, 2001:db8::10)');
 });
 
+cas('http-auth:setup : -n, chemin réel du .htaccess décrit (fichier partagé)', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-n-partage');
+    $partage = '/srv/' . $h->getAlias() . '/shared/web/.htaccess';
+    httpAuthEnvTest();
+    httpAuthCurlTest(['200']);
+    Shell::quand('/^readlink -f /', "$partage\n");
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    contient('fichier réellement écrit', $sortie, "Ajoute le bloc d'authentification en tête de $partage.");
+    absent('pas le lien de la release', $sortie, '/current/web/.htaccess');
+    verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
+});
+
 cas('http-auth:setup : .htpasswd existant conservé, renvoi vers http-auth:update', static function (): void {
     $questions = [];
     $h = httpAuthHoteSetup('http-auth-existant', [], [], $questions);
