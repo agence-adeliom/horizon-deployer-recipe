@@ -85,6 +85,27 @@ cas('httpAuthBlock : valeur qui casserait le .htaccess refusée', static functio
     }
 });
 
+cas('httpAuthBlock : IP contrôlées une à une (IPv4, IPv6, partielle, masque)', static function (): void {
+    $valides = ['203.0.113.10', '2001:db8::1', '::ffff:192.0.2.1', '10.1', '10.1.', '198.51.100.0/24', '10.0.0.0/255.0.0.0', '2001:db8::/32', ' 198.51.100.7 '];
+    contient('formes acceptées par Apache', httpAuthBlock('/p', 'r', $valides, []), '    Require ip 127.0.0.1 ::1 ' . implode(' ', array_map('trim', $valides)) . "\n");
+
+    $refus = [
+        'liste séparée par des virgules' => '203.0.113.10, 198.51.100.2',
+        'liste séparée par une espace' => '203.0.113.10 198.51.100.2',
+        'nom d\'hôte' => 'staging.site.test',
+        'chaîne vide' => '',
+        'espaces seules' => '  ',
+        'sans chiffre' => 'cafe::',
+        'masque invalide' => '10.0.0.0/x',
+    ];
+
+    foreach ($refus as $libelle => $ip) {
+        leve($libelle, static function () use ($ip): void {
+            httpAuthBlock('/p', 'r', ['203.0.113.10', $ip], []);
+        }, \InvalidArgumentException::class, json_encode($ip, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    }
+});
+
 cas('httpAuthInsertBlock : en tête, reste du fichier intact (CRLF, sans saut final)', static function (): void {
     $bloc = httpAuthBlocTest();
     $wp = "# BEGIN WordPress\r\nRewriteEngine On\r\n# END WordPress";
@@ -671,6 +692,24 @@ cas('http-auth:setup : protection existante (401), « non » sans écriture, « 
     tache('http-auth:setup', $h);
     uneCommande('sonde lancée', '/mkdir .*horizon-http-auth-/');
     vrai('.htaccess écrit', httpAuthEcritTest('/srv/' . $h->getAlias() . '/current/web/.htaccess') !== null);
+});
+
+cas('http-auth:setup : IP invalide dans http_auth_allow_ips, refus avant toute question ni sonde', static function (): void {
+    foreach ([true, false] as $interactif) {
+        $questions = [];
+        $h = httpAuthHoteSetup('http-auth-ip-invalide-' . ($interactif ? 'i' : 'n'), ['http_auth_allow_ips' => ['staging.site.test']], [''], $questions);
+        Shell::reinitialiser();
+        httpAuthEnvTest();
+        httpAuthCurlTest(['200']);
+        entree([], $interactif, ['y']);
+
+        leve(($interactif ? 'interactif' : '-n') . ' : erreur', static function () use ($h): void {
+            tache('http-auth:setup', $h);
+        }, \Throwable::class, '"staging.site.test"');
+        aucuneCommande(($interactif ? 'interactif' : '-n') . ' : pas de sonde', '/horizon-http-auth-/');
+        verifie(($interactif ? 'interactif' : '-n') . ' : aucune écriture', httpAuthEcrituresHorsSonde(), []);
+        verifie(($interactif ? 'interactif' : '-n') . ' : mot de passe non demandé', $questions, []);
+    }
 });
 
 cas('http-auth:setup : -n, description sans écriture', static function (): void {
@@ -1657,6 +1696,19 @@ cas('deploy:http-auth : bloc de la release mal formé, erreur sans écriture', s
     leve('erreur', static function () use ($h): void {
         tache('deploy:http-auth', $h);
     }, \Throwable::class, '/releases/2/web/.htaccess');
+    aucuneCommande('aucune écriture', '/base64 -d/');
+});
+
+cas('deploy:http-auth : IP invalide dans http_auth_allow_ips, déploiement interrompu avant la bascule, sans écriture', static function (): void {
+    $h = httpAuthHoteDeploy('http-auth-deploy-ip-invalide', ['http_auth_allow_ips' => ['203.0.113.10, 198.51.100.2']]);
+    httpAuthEnvTest();
+    httpAuthHtpasswdPresentTest($h);
+    httpAuthHtaccessDeployTest($h, null, "# BEGIN WordPress\n# END WordPress\n");
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('deploy:http-auth', $h);
+    }, \Throwable::class, '"203.0.113.10, 198.51.100.2"');
+    contient('bascule évitée', $e !== null ? $e->getMessage() : '', 'avant la bascule');
     aucuneCommande('aucune écriture', '/base64 -d/');
 });
 

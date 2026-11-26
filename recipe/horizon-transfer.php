@@ -4045,7 +4045,11 @@ task('roles:status', static function (): void {
  * `Require expr` par préfixe, échappé pour l'expression régulière). Fonction pure.
  *
  * Une valeur qui casserait la syntaxe du .htaccess est refusée avant toute écriture : Apache
- * répondrait par une erreur 500 sur tout le site.
+ * répondrait par une erreur 500 sur tout le site. Chaque IP est contrôlée à part : une liste
+ * séparée par des virgules, un nom d'hôte ou une chaîne vide donneraient un `Require ip`
+ * invalide. Formes admises : IPv4, IPv6, adresse partielle d'Apache (`10.1`, `10.1.`), suivies
+ * ou non d'un masque (`/24`, `/255.0.0.0`). Contrôle volontairement simple : chiffres
+ * hexadécimaux, « : » et « . », au moins un chiffre décimal.
  *
  * @param string   $htpasswdPath chemin absolu du .htpasswd sur le serveur
  * @param string[] $ips
@@ -4053,7 +4057,8 @@ task('roles:status', static function (): void {
  * @throws \InvalidArgumentException saut de ligne dans une valeur ; « " » dans le chemin ;
  *         « \ » dans $realm (les anciens analyseurs d'Apache ne comprennent que \" entre
  *         guillemets) ; « # » dans un préfixe (délimiteur de l'expression ap_expr, qu'on ne
- *         peut pas échapper de façon fiable, et absent de REQUEST_URI de toute façon)
+ *         peut pas échapper de façon fiable, et absent de REQUEST_URI de toute façon) ;
+ *         IP qui n'a pas la forme d'une adresse ou d'un réseau
  */
 function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $exceptPaths): string
 {
@@ -4079,12 +4084,23 @@ function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $e
         }
     }
 
+    foreach ($ips as $ip) {
+        $trimmed = trim((string) $ip);
+
+        if (preg_match('#^[0-9A-Fa-f:.]+(/[0-9.]+)?$#', $trimmed) !== 1 || preg_match('/[0-9]/', $trimmed) !== 1) {
+            throw new \InvalidArgumentException(sprintf(
+                'IP invalide pour le bloc .htaccess (http_auth_allow_ips ou IP du serveur) : %s. Une seule adresse par élément de la liste : IPv4, IPv6 ou adresse partielle (10.1), avec un masque éventuel (/24).',
+                json_encode((string) $ip, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            ));
+        }
+    }
+
     $allowed = ['127.0.0.1', '::1'];
 
     foreach ($ips as $ip) {
         $ip = trim((string) $ip);
 
-        if ($ip !== '' && !in_array($ip, $allowed, true)) {
+        if (!in_array($ip, $allowed, true)) {
             $allowed[] = $ip;
         }
     }
@@ -4624,6 +4640,14 @@ task('http-auth:setup', static function (): void {
     // désigne shared/, hors du dossier servi.
     $servedHtaccess = transferResolvePath($env, '{{current_path}}/{{http_auth_htaccess}}');
 
+    // Valeurs de l'inventaire contrôlées avant toute question, -n compris : le bloc final,
+    // avec l'IP de la sonde, est recalculé plus bas.
+    try {
+        httpAuthBlock($htpasswdPath, (string) get('http_auth_realm'), (array) get('http_auth_allow_ips'), (array) get('http_auth_except_paths'));
+    } catch (\InvalidArgumentException $e) {
+        throw error($e->getMessage() . ' Rien n\'a été écrit.');
+    }
+
     // 5. Mode non interactif : description, aucune écriture.
     if (!input()->isInteractive()) {
         warning("Mode non interactif (-n) : rien n'est écrit sur « $label ». Sans -n, la tâche :");
@@ -5046,12 +5070,18 @@ task('deploy:http-auth', static function (): void {
         warning("$currentPath : " . $e->getMessage() . ' IP du serveur non reprise : seules celles de http_auth_allow_ips sont autorisées sans identifiants.');
     }
 
-    $block = httpAuthBlock(
-        $htpasswdPath,
-        (string) get('http_auth_realm'),
-        array_merge($ips, (array) get('http_auth_allow_ips')),
-        (array) get('http_auth_except_paths')
-    );
+    // Une valeur refusée (IP invalide de http_auth_allow_ips, par exemple) donnerait une 500
+    // sur tout le site : le déploiement s'arrête avant la bascule.
+    try {
+        $block = httpAuthBlock(
+            $htpasswdPath,
+            (string) get('http_auth_realm'),
+            array_merge($ips, (array) get('http_auth_allow_ips')),
+            (array) get('http_auth_except_paths')
+        );
+    } catch (\InvalidArgumentException $e) {
+        throw error($e->getMessage() . ' Déploiement interrompu avant la bascule : la release en ligne reste en place.');
+    }
 
     // 5. Bloc inséré dans le .htaccess de la release, droits conservés (644 s'il est créé).
     $releasePath = httpAuthHtaccessPath($env, '{{release_path}}');
