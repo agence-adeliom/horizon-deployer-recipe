@@ -119,8 +119,8 @@ Deux suites complémentaires :
 | `httpAuthHttpStatus` | `http-auth` (curl simulé, `-q` en tête, fichier `-K` réel) | Vraie réponse HTTP d'un site protégé | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthProbe` | `http-auth` (fichiers réels en local, curl simulés ; IPv4 et IPv6, famille absente, sortie qui n'est pas une IP, doublon) | Vrai Apache (401), serveur qui ignore le `.htaccess` (200), directives refusées (500), IP vues pour le serveur en IPv4 et en IPv6 | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthLegacyDefinition` | `http-auth` (formes reconnues, commentaires, autres constantes, dernière définition) | | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthLegacyEnvState` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthLegacyProvider` | `http-auth` (fichiers réels en local : paquet absent, ordre application puis environnement, `WP_ENV` absent ou invalide, `env()` ; lecture en échec simulée) | Release d'un vrai projet Horizon au travers de SSH | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthLegacyEnvState` | `http-auth` (conversions d'`env()`, `no` et `off` actifs, défauts littéraux en argument et après `??`) | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthLegacyProvider` | `http-auth` (fichiers réels en local : paquet absent, ordre application puis environnement, `WP_ENV` absent ou vide (`production.php`) ou invalide, `env()` ; racine `{{release_path}}`, lecture en échec simulée) | Release d'un vrai projet Horizon au travers de SSH | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthFileMode` | `http-auth` (par les tâches : droits conservés) | `stat` GNU ou BSD du serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthPasswordAsker` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 
@@ -141,7 +141,7 @@ Deux suites complémentaires :
 | `http-auth:setup` | `http-auth` (fichiers réels en local, curl simulés ; provider HttpLogin actif ou illisible, chemin réel du `.htaccess` en `-n`) | Sonde, `curl` et Apache réels ; question proxifiée vers le master | Non couvert (pas encore de scénario `90-http-auth`) |
 | `http-auth:update` | `http-auth` (fichiers réels en local, curl simulés) | Idem, nouveaux identifiants vérifiés par un vrai Apache | Non couvert (pas encore de scénario `90-http-auth`) |
 | `http-auth:remove` | `http-auth` (fichiers réels en local) | Site réellement déprotégé | Non couvert (pas encore de scénario `90-http-auth`) |
-| `deploy:http-auth` | `http-auth` (fichiers réels en local ; avertissement de double authentification, détection en échec) | Avant `deploy:symlink` d'un vrai déploiement, `.htaccess` versionné ou partagé | Non couvert (pas encore de scénario `90-http-auth`) |
+| `deploy:http-auth` | `http-auth` (fichiers réels en local ; avertissement de double authentification lu dans la release déployée, détection en échec) | Avant `deploy:symlink` d'un vrai déploiement, `.htaccess` versionné ou partagé | Non couvert (pas encore de scénario `90-http-auth`) |
 | `http_auth`, `http_auth_user`, `http_auth_realm`, `http_auth_htaccess`, `http_auth_htpasswd`, `http_auth_except_paths`, `http_auth_allow_ips` | `http-auth` (défauts, surcharges par hôte) | | Non couvert (pas encore de scénario `90-http-auth`) |
 | Points d'accroche et `fail()` | `declarations` | Ordre d'exécution réel dans `dep deploy` | `60-roles` (ordre réel dans `dep deploy`), `30` (`fail()`) |
 | Options, défauts, marqueur de version | `declarations` | | Indirect (`--strategy`, `--checksum`, `--fix-collations`, `--favicon-only`, `--from`, `--to`) |

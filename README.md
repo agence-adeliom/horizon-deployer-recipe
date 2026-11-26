@@ -471,13 +471,17 @@ toujours le provider Acorn `HttpLoginServiceProvider`. Celui-ci répond 401 depu
 constante `ENABLED_HTTP_LOGIN` est vraie. Quand le site répond déjà 401, `setup` cherche ce
 provider dans la release en ligne, sans exécuter le code du projet. Elle lit la valeur de
 `ENABLED_HTTP_LOGIN` dans `config/environments/<WP_ENV>.php`, puis dans
-`config/application.php`. Le fichier d'environnement l'emporte, comme dans Bedrock. Une
-valeur `env('NOM')` est lue dans `shared/.env`. Si le provider est actif, l'avertissement
+`config/application.php`. Le fichier d'environnement l'emporte, comme dans Bedrock. Sans
+`WP_ENV`, c'est `production.php`, que Bedrock charge alors. Une valeur `env('NOM')` est lue
+dans `shared/.env` et convertie comme le fait `env()` : seuls `false`, `0`, une valeur vide,
+`null` et `empty` désactivent le provider. `no` ou `off` le laissent donc actif. Une
+variable absente prend le défaut littéral de l'appel (`env('NOM', false)`,
+`env('NOM') ?? false`). Sans défaut, la valeur est inconnue. Si le provider est actif, l'avertissement
 le nomme et cite le fichier à modifier. Après l'installation, il faut y passer
 `ENABLED_HTTP_LOGIN` à `false`, commiter, puis déployer. Si la valeur n'a pas pu être lue,
-l'avertissement générique le signale. À chaque déploiement, `deploy:http-auth` avertit
-d'une double authentification tant que le provider reste actif, sans jamais faire échouer
-le déploiement.
+l'avertissement générique le signale. À chaque déploiement, `deploy:http-auth` lit la
+release déployée. Elle avertit d'une double authentification tant que le provider y reste
+actif, sans jamais faire échouer le déploiement.
 
 **Vérification depuis une IP autorisée.** Le bloc sert sans identifiants les IP détectées
 pour le serveur et celles de `http_auth_allow_ips`. Le poste qui lance `dep` peut avoir
@@ -563,9 +567,10 @@ touche pas au `.htpasswd` et ne relance pas la sonde.
 - Sans `.htpasswd` (installation jamais faite), elle avertit que la release ne sera pas
   protégée, et n'écrit rien.
 - Un bloc identique déjà présent n'est pas réécrit.
-- Si le provider HttpLogin de horizon-tools est actif dans la release en ligne, elle avertit
-  d'une double authentification et cite le fichier où passer `ENABLED_HTTP_LOGIN` à
-  `false`. Cette détection ne fait jamais échouer le déploiement.
+- Si le provider HttpLogin de horizon-tools est actif dans la release déployée, elle
+  avertit d'une double authentification et cite le fichier où passer `ENABLED_HTTP_LOGIN`
+  à `false`. Le déploiement qui fait ce changement n'affiche donc plus l'avertissement.
+  Cette détection ne fait jamais échouer le déploiement.
 - **Un échec de la réinjection fait échouer le déploiement**, avant la bascule. Mettre en
   ligne une préproduction sans protection serait une régression silencieuse.
 
@@ -616,9 +621,8 @@ Limites connues :
   détectée. Ses IP se déclarent alors dans `http_auth_allow_ips`.
 - **Protection existante en PHP** : la tâche ne la retire pas. Ce retrait se fait par un
   commit dans le dépôt du projet. Seul le provider HttpLogin de horizon-tools est reconnu.
-  Sa valeur n'est lue que sous les formes `true`, `false` et `env('NOM')`. La détection lit
-  la release en ligne : un déploiement qui passe `ENABLED_HTTP_LOGIN` à `false` affiche
-  encore l'avertissement, une dernière fois.
+  Sa valeur n'est lue que sous les formes `true`, `false` et `env('NOM')`, avec un défaut
+  littéral éventuel. Toute autre forme donne l'avertissement générique.
 - **Variable d'environnement du serveur** : une variable qui surchargerait `shared/.env`
   n'est pas vue par le garde-fou production.
 - **`dep rollback`** : revenir à une release antérieure à `http-auth:setup` remet en ligne

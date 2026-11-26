@@ -4608,17 +4608,19 @@ function httpAuthGuard(Host $env): array
  * (sortie de grep, jamais exécutée). Formes reconnues, en début de ligne :
  * `Config::define('ENABLED_HTTP_LOGIN', <valeur>);` (classe éventuellement qualifiée) et
  * `define('ENABLED_HTTP_LOGIN', <valeur>);`, guillemets simples ou doubles, espaces libres,
- * commentaire de fin permis. Valeurs : `true`, `false` (casse libre), `env('NOM')` suivi
- * ou non de `?? …`. Une autre valeur, ou une définition qui n'ouvre pas la ligne (dans un
+ * commentaire de fin permis. Valeurs : `true`, `false` (casse libre), `env('NOM')`, avec
+ * un second argument éventuel (`argument`) et suivi ou non de `?? …` (`coalesce`), tous
+ * deux rendus bruts. Une autre valeur, ou une définition qui n'ouvre pas la ligne (dans un
  * `if`), vaut `unknown`. Les lignes de commentaire sont ignorées. Plusieurs définitions :
  * la dernière l'emporte, comme Config::define(). Fonction pure.
  *
- * @return ?array{form: string, name: ?string} form : 'true', 'false', 'env' (name : la
- *         variable) ou 'unknown' ; null sans définition
+ * @return ?array{form: string, name: ?string, argument: ?string, coalesce: ?string} form :
+ *         'true', 'false', 'env' (name : la variable) ou 'unknown' ; null sans définition
  */
 function httpAuthLegacyDefinition(string $lines): ?array
 {
     $found = null;
+    $none = ['name' => null, 'argument' => null, 'coalesce' => null];
 
     foreach (preg_split('/\R/', $lines) as $line) {
         $line = trim($line);
@@ -4631,14 +4633,19 @@ function httpAuthLegacyDefinition(string $lines): ?array
             $value = $m[2];
 
             if (preg_match('/^(true|false)$/i', $value, $bool) === 1) {
-                $found = ['form' => strtolower($bool[1]), 'name' => null];
-            } elseif (preg_match('/^env\s*\(\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\)(?:\s*\?\?.+)?$/i', $value, $variable) === 1) {
-                $found = ['form' => 'env', 'name' => $variable[2]];
+                $found = ['form' => strtolower($bool[1])] + $none;
+            } elseif (preg_match('/^env\s*\(\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:,\s*([^()]*?)\s*)?\)(?:\s*\?\?\s*(.+))?$/i', $value, $variable) === 1) {
+                $found = [
+                    'form' => 'env',
+                    'name' => $variable[2],
+                    'argument' => ($variable[3] ?? '') !== '' ? $variable[3] : null,
+                    'coalesce' => ($variable[4] ?? '') !== '' ? trim($variable[4]) : null,
+                ];
             } else {
-                $found = ['form' => 'unknown', 'name' => null];
+                $found = ['form' => 'unknown'] + $none;
             }
         } elseif (preg_match('/define\s*\(\s*([\'"])ENABLED_HTTP_LOGIN\1/i', $line) === 1) {
-            $found = ['form' => 'unknown', 'name' => null];
+            $found = ['form' => 'unknown'] + $none;
         }
     }
 
@@ -4646,36 +4653,82 @@ function httpAuthLegacyDefinition(string $lines): ?array
 }
 
 /**
- * État du provider HttpLogin selon la valeur d'une variable de shared/.env lue par env() :
- * true, 1, yes, on (casse libre) donnent `active` ; false, 0, no, off ou une valeur vide
- * donnent `inactive` ; une variable absente ($value null) ou une autre valeur, `unknown`.
- * Fonction pure.
+ * État du provider HttpLogin pour `env('NOM', $argument) ?? $coalesce`, $value étant la
+ * valeur brute de NOM dans shared/.env (null : variable absente). Le provider teste la
+ * constante en booléen PHP. env() de Bedrock (oscarotero/env) ne convertit que true,
+ * false, null, empty (entre parenthèses ou non, casse libre) et les entiers : `no` ou
+ * `off` restent des chaînes non vides, donc vraies. Variable absente : le second argument,
+ * sinon null. Résultat null : la valeur de `??`. Ces défauts ne comptent que s'ils sont
+ * littéraux (true, false, null, entier, chaîne entre guillemets) ; sinon `unknown`, comme
+ * une variable absente sans défaut. Fonction pure.
+ *
+ * @return string `active`, `inactive` ou `unknown`
  */
-function httpAuthLegacyEnvState(?string $value): string
+function httpAuthLegacyEnvState(?string $value, ?string $argument = null, ?string $coalesce = null): string
 {
-    if ($value === null) {
+    // [littéral reconnu, valeur PHP].
+    $literal = static function (string $code): array {
+        if (preg_match('/^(true|false|null)$/i', $code, $m) === 1) {
+            return [true, ['true' => true, 'false' => false, 'null' => null][strtolower($m[1])]];
+        }
+
+        if (preg_match('/^-?[0-9]+$/', $code) === 1) {
+            return [true, (int) $code];
+        }
+
+        if (preg_match('/^(?:\'([^\'\\\\]*)\'|"([^"\\\\$]*)")$/', $code, $m) === 1) {
+            return [true, ($m[1] ?? '') . ($m[2] ?? '')];
+        }
+
+        return [false, null];
+    };
+
+    if ($value !== null) {
+        $lower = strtolower($value);
+        $converted = ['true' => true, '(true)' => true, 'false' => false, '(false)' => false, 'null' => null, '(null)' => null, 'empty' => '', '(empty)' => ''];
+
+        if (array_key_exists($lower, $converted)) {
+            $result = $converted[$lower];
+        } elseif (ctype_digit($value)) {
+            $result = (int) $value;
+        } else {
+            $result = $value;
+        }
+    } elseif ($argument !== null) {
+        [$known, $result] = $literal($argument);
+
+        if (!$known) {
+            return 'unknown';
+        }
+    } elseif ($coalesce !== null) {
+        $result = null;
+    } else {
         return 'unknown';
     }
 
-    $value = strtolower($value);
+    if ($result === null && $coalesce !== null) {
+        [$known, $result] = $literal($coalesce);
 
-    if (in_array($value, ['true', '1', 'yes', 'on'], true)) {
-        return 'active';
+        if (!$known) {
+            return 'unknown';
+        }
     }
 
-    return in_array($value, ['false', '0', 'no', 'off', ''], true) ? 'inactive' : 'unknown';
+    return $result ? 'active' : 'inactive';
 }
 
 /**
- * Ancienne protection PHP de la release en ligne : le provider Acorn
+ * Ancienne protection PHP d'une release : le provider Acorn
  * `Adeliom\HorizonTools\Providers\HttpLoginServiceProvider` (paquet
  * agence-adeliom/horizon-tools) répond 401 si la constante ENABLED_HTTP_LOGIN est vraie.
- * Lecture seule par une seule commande, rien n'est exécuté par PHP : présence du provider
- * dans {{current_path}}/vendor, puis lignes ENABLED_HTTP_LOGIN de
- * config/environments/<WP_ENV>.php et de config/application.php (httpAuthLegacyDefinition()).
- * Le fichier d'environnement l'emporte, comme dans Bedrock qui le charge en second. WP_ENV
- * absent, vide ou qui n'est pas un simple nom : application.php seul. `env('NOM')` est
- * résolu dans shared/.env (httpAuthLegacyEnvState()).
+ * $root vaut '{{current_path}}' (setup : release en ligne) ou '{{release_path}}'
+ * (deploy:http-auth : code en cours de déploiement). Lecture seule par une seule commande,
+ * rien n'est exécuté par PHP : présence du provider dans <release>/vendor, puis lignes
+ * ENABLED_HTTP_LOGIN de config/environments/<WP_ENV>.php et de config/application.php
+ * (httpAuthLegacyDefinition()). Le fichier d'environnement l'emporte, comme dans Bedrock
+ * qui le charge en second. WP_ENV absent ou vide vaut `production`, comme dans Bedrock.
+ * Un WP_ENV qui n'est pas un simple nom (« / », par exemple) : application.php seul.
+ * `env('NOM')` est résolu dans shared/.env (httpAuthLegacyEnvState()).
  *
  * Toute erreur de lecture rend null : la détection ne fait qu'enrichir un message, elle ne
  * doit jamais faire échouer setup ni un déploiement, et un « unknown » sans fichier lu
@@ -4686,12 +4739,12 @@ function httpAuthLegacyEnvState(?string $value): string
  *         sans définition ; sinon state `active` ou `unknown` et le chemin, relatif à la
  *         release, du fichier qui décide
  */
-function httpAuthLegacyProvider(Host $env, array $envValues): ?array
+function httpAuthLegacyProvider(Host $env, array $envValues, string $root = '{{current_path}}'): ?array
 {
     try {
-        $current = transferResolvePath($env, '{{current_path}}');
+        $release = transferResolvePath($env, $root);
         $files = [];
-        $wpEnv = $envValues['WP_ENV'] ?? '';
+        $wpEnv = ($envValues['WP_ENV'] ?? '') !== '' ? $envValues['WP_ENV'] : 'production';
 
         if (preg_match('/^[A-Za-z0-9_-]+$/', $wpEnv) === 1) {
             $files['env'] = "config/environments/$wpEnv.php";
@@ -4703,14 +4756,14 @@ function httpAuthLegacyProvider(Host $env, array $envValues): ?array
         foreach ($files as $key => $file) {
             $reads .= sprintf(
                 ' grep -F ENABLED_HTTP_LOGIN %s 2>/dev/null | sed %s;',
-                escapeshellarg("$current/$file"),
+                escapeshellarg("$release/$file"),
                 escapeshellarg("s/^/+dep-login-$key:/")
             );
         }
 
         $output = transferRun($env, sprintf(
             'if [ -f %s ]; then echo +dep-login;%s fi',
-            escapeshellarg("$current/vendor/agence-adeliom/horizon-tools/src/Providers/HttpLoginServiceProvider.php"),
+            escapeshellarg("$release/vendor/agence-adeliom/horizon-tools/src/Providers/HttpLoginServiceProvider.php"),
             $reads
         ));
 
@@ -4738,7 +4791,7 @@ function httpAuthLegacyProvider(Host $env, array $envValues): ?array
 
             if ($definition['form'] === 'env') {
                 $values = transferHostEnvValues($env, [(string) $definition['name']]);
-                $state = httpAuthLegacyEnvState($values[$definition['name']] ?? null);
+                $state = httpAuthLegacyEnvState($values[$definition['name']] ?? null, $definition['argument'], $definition['coalesce']);
             } else {
                 $state = ['true' => 'active', 'false' => 'inactive'][$definition['form']] ?? 'unknown';
             }
@@ -5351,10 +5404,11 @@ task('deploy:http-auth', static function (): void {
         info("Bloc d'authentification HTTP réinjecté dans $releasePath.");
     }
 
-    // 6. Provider HttpLogin de horizon-tools encore actif dans la release en ligne : le site
-    // demanderait deux authentifications. Simple avertissement, jamais d'échec.
+    // 6. Provider HttpLogin de horizon-tools encore actif dans la release déployée : le site
+    // demanderait deux authentifications. Lue dans {{release_path}}, la détection se tait
+    // dès le déploiement qui passe ENABLED_HTTP_LOGIN à false. Avertissement, jamais d'échec.
     try {
-        $legacy = httpAuthLegacyProvider($env, $values);
+        $legacy = httpAuthLegacyProvider($env, $values, '{{release_path}}');
 
         if ($legacy !== null && $legacy['state'] === 'active') {
             warning("Double authentification sur « $label » : le provider HttpLoginServiceProvider de horizon-tools est actif. Pour la retirer, passer ENABLED_HTTP_LOGIN à false dans {$legacy['file']}, commiter, puis déployer.");
