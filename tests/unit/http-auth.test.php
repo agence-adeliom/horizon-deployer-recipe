@@ -55,15 +55,34 @@ cas('httpAuthBlock : marqueurs, IP, exceptions, realm', static function (): void
     verifie('marqueur début en tête', strpos($bloc, "# BEGIN Horizon HTTP auth\n"), 0);
     verifie('fin du bloc', substr($bloc, -24), "# END Horizon HTTP auth\n");
     contient('AuthType', $bloc, "\nAuthType Basic\n");
-    contient('AuthUserFile', $bloc, "\nAuthUserFile /srv/s/shared/.htpasswd\n");
+    contient('AuthUserFile entre guillemets', $bloc, "\nAuthUserFile \"/srv/s/shared/.htpasswd\"\n");
     contient('IP locales en tête, dédupliquées', $bloc, "    Require ip 127.0.0.1 ::1 203.0.113.10\n");
     contient('exception ACME échappée', $bloc, '    Require expr %{REQUEST_URI} =~ m#^/\.well\-known/acme\-challenge/#' . "\n");
     contient('seconde exception', $bloc, '    Require expr %{REQUEST_URI} =~ m#^/wp\-json/gf/v2/#' . "\n");
     contient('utilisateur valide', $bloc, "    Require valid-user\n</RequireAny>\n");
     contient('realm échappé', $bloc, 'AuthName "Accès \"restreint\""');
-    contient('barre oblique inverse du realm échappée', httpAuthBlock('/p', 'a\\b', [], []), 'AuthName "a\\\\b"');
     contient('sans IP ni exception', httpAuthBlock('/p', 'r', [], []), "<RequireAny>\n    Require ip 127.0.0.1 ::1\n    Require valid-user\n</RequireAny>\n");
-    contient('délimiteur # échappé', httpAuthBlock('/p', 'r', [], ['/a#b/']), 'm#^/a\#b/#');
+});
+
+cas('httpAuthBlock : valeur qui casserait le .htaccess refusée', static function (): void {
+    $refus = [
+        'realm avec saut de ligne' => ['/p', "a\nRequire all granted", [], []],
+        'realm avec retour chariot' => ['/p', "a\rb", [], []],
+        'realm avec barre oblique inverse' => ['/p', 'a\\b', [], []],
+        'chemin du .htpasswd avec saut de ligne' => ["/p\nx", 'r', [], []],
+        'chemin du .htpasswd avec guillemet' => ['/p"x', 'r', [], []],
+        'IP avec saut de ligne' => ['/p', 'r', ["203.0.113.10\nRequire all granted"], []],
+        'IP avec retour chariot' => ['/p', 'r', ["203.0.113.10\r"], []],
+        'exception avec saut de ligne' => ['/p', 'r', [], ["/a\nb/"]],
+        'exception avec retour chariot' => ['/p', 'r', [], ["/a\rb/"]],
+        'exception avec #' => ['/p', 'r', [], ['/a#b/']],
+    ];
+
+    foreach ($refus as $libelle => $arguments) {
+        leve($libelle, static function () use ($arguments): void {
+            httpAuthBlock(...$arguments);
+        }, \InvalidArgumentException::class);
+    }
 });
 
 cas('httpAuthInsertBlock : en tête, reste du fichier intact (CRLF, sans saut final)', static function (): void {

@@ -4044,12 +4044,41 @@ task('roles:status', static function (): void {
  * seule ligne `Require ip`), puis chaque préfixe d'URL de $exceptPaths (une ligne
  * `Require expr` par préfixe, échappé pour l'expression régulière). Fonction pure.
  *
+ * Une valeur qui casserait la syntaxe du .htaccess est refusée avant toute écriture : Apache
+ * répondrait par une erreur 500 sur tout le site.
+ *
  * @param string   $htpasswdPath chemin absolu du .htpasswd sur le serveur
  * @param string[] $ips
  * @param string[] $exceptPaths
+ * @throws \InvalidArgumentException saut de ligne dans une valeur ; « " » dans le chemin ;
+ *         « \ » dans $realm (les anciens analyseurs d'Apache ne comprennent que \" entre
+ *         guillemets) ; « # » dans un préfixe (délimiteur de l'expression ap_expr, qu'on ne
+ *         peut pas échapper de façon fiable, et absent de REQUEST_URI de toute façon)
  */
 function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $exceptPaths): string
 {
+    $values = array_merge([$htpasswdPath, $realm], $ips, $exceptPaths);
+
+    foreach ($values as $value) {
+        if (strpbrk((string) $value, "\r\n") !== false) {
+            throw new \InvalidArgumentException('Saut de ligne dans une valeur du bloc .htaccess (http_auth_realm, http_auth_allow_ips, http_auth_except_paths ou chemin du .htpasswd) : ' . json_encode((string) $value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+        }
+    }
+
+    if (strpos($htpasswdPath, '"') !== false) {
+        throw new \InvalidArgumentException("Guillemet dans le chemin du .htpasswd : $htpasswdPath");
+    }
+
+    if (strpos($realm, '\\') !== false) {
+        throw new \InvalidArgumentException("Barre oblique inverse dans http_auth_realm : $realm");
+    }
+
+    foreach ($exceptPaths as $path) {
+        if (strpos((string) $path, '#') !== false) {
+            throw new \InvalidArgumentException("« # » dans un préfixe de http_auth_except_paths : $path");
+        }
+    }
+
     $allowed = ['127.0.0.1', '::1'];
 
     foreach ($ips as $ip) {
@@ -4064,8 +4093,8 @@ function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $e
         '# BEGIN Horizon HTTP auth',
         '# Géré par horizon-deployer-recipe (http-auth:setup). Ne pas modifier à la main.',
         'AuthType Basic',
-        'AuthName "' . str_replace(['\\', '"'], ['\\\\', '\\"'], $realm) . '"',
-        'AuthUserFile ' . $htpasswdPath,
+        'AuthName "' . str_replace('"', '\\"', $realm) . '"',
+        'AuthUserFile "' . $htpasswdPath . '"',
         '<RequireAny>',
         '    Require ip ' . implode(' ', $allowed),
     ];
@@ -4083,8 +4112,8 @@ function httpAuthBlock(string $htpasswdPath, string $realm, array $ips, array $e
 
 /**
  * Découpe un .htaccess autour du bloc d'authentification HTTP. Les lignes gardent leur fin
- * (CRLF compris) et ne sont comparées aux marqueurs qu'une fois celle-ci retirée : le reste
- * du fichier est rendu octet pour octet. Fonction pure.
+ * (CRLF compris) et ne sont comparées aux marqueurs qu'après trim() : le reste du fichier est
+ * rendu octet pour octet, et un marqueur indenté ou suivi d'espaces est reconnu. Fonction pure.
  *
  * @return ?array{0: string, 1: string, 2: string} texte avant le bloc, bloc, texte après ;
  *         null sans bloc
