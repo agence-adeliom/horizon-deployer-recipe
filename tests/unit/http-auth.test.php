@@ -233,6 +233,8 @@ cas('httpAuthReadFile / httpAuthWriteFile : aller-retour réel (CRLF, accents, s
 
     httpAuthWriteFile($h, "$dossier/.htaccess", '', '600');
     verifie('fichier vide : chaîne vide', httpAuthReadFile($h, "$dossier/.htaccess"), '');
+    // Avant PHP 8.3, fileperms() rend la valeur mise en cache pour ce chemin au premier appel.
+    clearstatcache();
     verifie('droits 600', fileperms("$dossier/.htaccess") & 0777, 0600);
 
     $gros = str_repeat("RewriteRule ^é(.*)$ /index.php [L]\n", 400);
