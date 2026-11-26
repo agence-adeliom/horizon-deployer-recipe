@@ -2072,25 +2072,27 @@ cas('http-auth:remove : sans garde-fou production', static function (): void {
 
 cas('httpAuthLegacyDefinition : formes reconnues, commentaires et autres constantes ignorés', static function (): void {
     $attendus = [
-        "Config::define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null, 'argument' => null, 'coalesce' => null],
-        'Config::define("ENABLED_HTTP_LOGIN", false);' => ['form' => 'false', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "    Config::define( 'ENABLED_HTTP_LOGIN' ,  TRUE ) ;" => ['form' => 'true', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "\\Roots\\WPConfig\\Config::define('ENABLED_HTTP_LOGIN', false);" => ['form' => 'false', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "Config::define('ENABLED_HTTP_LOGIN', true); // préproduction" => ['form' => 'true', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'argument' => null, 'coalesce' => null],
-        "Config::define('ENABLED_HTTP_LOGIN', env(\"HTTP_LOGIN\") ?? false);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'argument' => null, 'coalesce' => 'false'],
-        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN', true));" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'argument' => 'true', 'coalesce' => null],
-        "Config::define('ENABLED_HTTP_LOGIN', env( 'HTTP_LOGIN' , false ) ?? true);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'argument' => 'false', 'coalesce' => 'true'],
-        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? WP_DEBUG);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'argument' => null, 'coalesce' => 'WP_DEBUG'],
-        "Config::define('ENABLED_HTTP_LOGIN', 1);" => ['form' => 'unknown', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "Config::define('ENABLED_HTTP_LOGIN', WP_ENV === 'staging');" => ['form' => 'unknown', 'name' => null, 'argument' => null, 'coalesce' => null],
-        "if (\$preprod) { Config::define('ENABLED_HTTP_LOGIN', true); }" => ['form' => 'unknown', 'name' => null, 'argument' => null, 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null, 'coalesce' => null],
+        'Config::define("ENABLED_HTTP_LOGIN", false);' => ['form' => 'false', 'name' => null, 'coalesce' => null],
+        "    Config::define( 'ENABLED_HTTP_LOGIN' ,  TRUE ) ;" => ['form' => 'true', 'name' => null, 'coalesce' => null],
+        "define('ENABLED_HTTP_LOGIN', true);" => ['form' => 'true', 'name' => null, 'coalesce' => null],
+        "\\Roots\\WPConfig\\Config::define('ENABLED_HTTP_LOGIN', false);" => ['form' => 'false', 'name' => null, 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', true); // préproduction" => ['form' => 'true', 'name' => null, 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', env(\"HTTP_LOGIN\") ?? false);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'coalesce' => 'false'],
+        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN', true));" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', env( 'HTTP_LOGIN' , false ) ?? true);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'coalesce' => 'true'],
+        "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? WP_DEBUG);" => ['form' => 'env', 'name' => 'HTTP_LOGIN', 'coalesce' => 'WP_DEBUG'],
+        "Config::define('ENABLED_HTTP_LOGIN', 1);" => ['form' => 'unknown', 'name' => null, 'coalesce' => null],
+        "Config::define('ENABLED_HTTP_LOGIN', WP_ENV === 'staging');" => ['form' => 'unknown', 'name' => null, 'coalesce' => null],
+        "if (\$preprod) { Config::define('ENABLED_HTTP_LOGIN', true); }" => ['form' => 'unknown', 'name' => null, 'coalesce' => null],
         "// Config::define('ENABLED_HTTP_LOGIN', true);" => null,
         "# define('ENABLED_HTTP_LOGIN', true);" => null,
         " * Config::define('ENABLED_HTTP_LOGIN', true);" => null,
         "Config::define('ENABLED_HTTP_LOGIN_REALM', 'Website');" => null,
         "if (ENABLED_HTTP_LOGIN) {" => null,
+        "    'ENABLED_HTTP_LOGIN'," => ['form' => 'unknown', 'name' => null, 'coalesce' => null],
+        "if (defined(\"ENABLED_HTTP_LOGIN\")) {" => ['form' => 'unknown', 'name' => null, 'coalesce' => null],
         '' => null,
     ];
 
@@ -2098,42 +2100,38 @@ cas('httpAuthLegacyDefinition : formes reconnues, commentaires et autres constan
         verifie("« $lignes »", httpAuthLegacyDefinition($lignes), $attendu);
     }
 
-    verifie('CRLF', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\r\n"), ['form' => 'true', 'name' => null, 'argument' => null, 'coalesce' => null]);
-    verifie('dernière définition du fichier', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\n// x\nConfig::define('ENABLED_HTTP_LOGIN', false);"), ['form' => 'false', 'name' => null, 'argument' => null, 'coalesce' => null]);
+    verifie('définition sur plusieurs lignes : inconnue', httpAuthLegacyDefinition("Config::define(\n    'ENABLED_HTTP_LOGIN',\n    true\n);"), ['form' => 'unknown', 'name' => null, 'coalesce' => null]);
+    verifie('CRLF', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\r\n"), ['form' => 'true', 'name' => null, 'coalesce' => null]);
+    verifie('dernière définition du fichier', httpAuthLegacyDefinition("Config::define('ENABLED_HTTP_LOGIN', true);\n// x\nConfig::define('ENABLED_HTTP_LOGIN', false);"), ['form' => 'false', 'name' => null, 'coalesce' => null]);
 });
 
-cas('httpAuthLegacyEnvState : valeur convertie comme env() de Bedrock, puis vérité de PHP', static function (): void {
-    foreach (['true', 'TRUE', '(true)', '1', '2', 'yes', 'no', 'off', 'On', 'peut-être', 'False0'] as $valeur) {
+cas('httpAuthLegacyEnvState : valeur convertie comme oscarotero/env 2.1, puis vérité de PHP', static function (): void {
+    foreach (['true', 'TRUE', '(true)', '1', '2', 'yes', 'no', 'off', 'On', 'peut-être', 'False0', '(false)', '(NULL)', 'empty', '(empty)', '-1', '0.0'] as $valeur) {
         verifie("« $valeur » : actif", httpAuthLegacyEnvState($valeur), 'active');
     }
 
-    foreach (['false', 'False', '(false)', '0', '00', '', 'null', '(NULL)', 'empty', '(empty)'] as $valeur) {
+    foreach (['false', 'False', 'FALSE', '0', '00', '', 'null', 'NULL'] as $valeur) {
         verifie("« $valeur » : inactif", httpAuthLegacyEnvState($valeur), 'inactive');
     }
 
     verifie('variable absente, sans défaut', httpAuthLegacyEnvState(null), 'unknown');
 
-    // Défaut littéral : ?? (valeur nulle ou variable absente) et second argument (variable absente).
+    // Défaut littéral de ?? : variable absente ou valeur « null ».
     $defauts = [
-        'absente, ?? false' => [null, null, 'false', 'inactive'],
-        'absente, ?? true' => [null, null, 'true', 'active'],
-        'absente, env(X, true)' => [null, 'true', null, 'active'],
-        'absente, env(X, false)' => [null, 'false', null, 'inactive'],
-        'absente, env(X, null) ?? true' => [null, 'null', 'true', 'active'],
-        'absente, env(X, false) ?? true' => [null, 'false', 'true', 'inactive'],
-        'absente, ?? 0' => [null, null, '0', 'inactive'],
-        'absente, ?? chaîne « 1 »' => [null, null, "'1'", 'active'],
-        'absente, défaut non littéral' => [null, null, 'WP_DEBUG', 'unknown'],
-        'absente, env(X, WP_DEBUG)' => [null, 'WP_DEBUG', null, 'unknown'],
-        'présente, ?? ignoré' => ['off', null, 'false', 'active'],
-        'présente « null », ?? false' => ['null', null, 'false', 'inactive'],
-        'présente « null », ?? true' => ['(null)', null, 'true', 'active'],
-        'présente « null », env(X, true) : argument ignoré' => ['null', 'true', null, 'inactive'],
-        'présente, env(X, true) ignoré' => ['false', 'true', null, 'inactive'],
+        'absente, ?? false' => [null, 'false', 'inactive'],
+        'absente, ?? true' => [null, 'true', 'active'],
+        'absente, ?? null' => [null, 'null', 'inactive'],
+        'absente, ?? 0' => [null, '0', 'inactive'],
+        'absente, ?? chaîne « 1 »' => [null, "'1'", 'active'],
+        'absente, défaut non littéral' => [null, 'WP_DEBUG', 'unknown'],
+        'présente, ?? ignoré' => ['off', 'false', 'active'],
+        'présente « null », ?? false' => ['null', 'false', 'inactive'],
+        'présente « null », ?? true' => ['Null', 'true', 'active'],
+        'présente « (null) » : chaîne, ?? ignoré' => ['(null)', 'false', 'active'],
     ];
 
-    foreach ($defauts as $libelle => [$valeur, $argument, $coalesce, $attendu]) {
-        verifie($libelle, httpAuthLegacyEnvState($valeur, $argument, $coalesce), $attendu);
+    foreach ($defauts as $libelle => [$valeur, $coalesce, $attendu]) {
+        verifie($libelle, httpAuthLegacyEnvState($valeur, $coalesce), $attendu);
     }
 });
 
@@ -2179,10 +2177,12 @@ cas('httpAuthLegacyProvider : présence du paquet, fichier d\'environnement prio
         'WP_ENV hors du dossier : application seule' => [true, null, $vrai, '', ['WP_ENV' => '../environments/staging'], null],
         'aucune définition' => [true, "Config::define('WP_DEBUG', true);", null, '', $staging, null],
         'env() vrai' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));", "WP_ENV=staging\nHTTP_LOGIN=true\n", $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
-        'env() faux' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? true);", "HTTP_LOGIN='(false)'\n", $staging, null],
+        'env() faux' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? true);", "HTTP_LOGIN='false'\n", $staging, null],
         'env() « off » : chaîne non vide, actif' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));", "HTTP_LOGIN=off\n", $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
         'env() absent, ?? false' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? false);", "WP_ENV=staging\n", $staging, null],
-        'env() absent, env(X, true)' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN', true));", '', $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
+        'env() absent, second argument ignoré (une seule signature)' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN', false));", '', $staging, ['state' => 'unknown', 'file' => 'config/environments/staging.php']],
+        'env() « (false) » : chaîne non vide, actif' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN') ?? false);", "HTTP_LOGIN='(false)'\n", $staging, ['state' => 'active', 'file' => 'config/environments/staging.php']],
+        'définition sur plusieurs lignes : inconnue' => [true, null, "Config::define(\n    'ENABLED_HTTP_LOGIN',\n    false\n);", '', $staging, ['state' => 'unknown', 'file' => 'config/environments/staging.php']],
         'env() absent' => [true, null, "Config::define('ENABLED_HTTP_LOGIN', env('HTTP_LOGIN'));", "WP_ENV=staging\n", $staging, ['state' => 'unknown', 'file' => 'config/environments/staging.php']],
         'forme inconnue' => [true, "define('ENABLED_HTTP_LOGIN', WP_ENV !== 'production');", null, '', $staging, ['state' => 'unknown', 'file' => 'config/application.php']],
     ];
@@ -2260,7 +2260,8 @@ cas('http-auth:setup : 401 dû au provider HttpLogin actif, avertissement qui le
     $sortie = sortie();
     contient('provider nommé', $sortie, 'HttpLoginServiceProvider');
     contient('fichier cité', $sortie, 'config/environments/staging.php');
-    contient('marche à suivre', $sortie, 'passer ENABLED_HTTP_LOGIN à false');
+    contient('marche à suivre', $sortie, 'passer ENABLED_HTTP_LOGIN à false dans ce fichier, commiter, puis déployer. Sinon, le site demanderait deux authentifications.');
+    contient('constante vraie selon le fichier', $sortie, 'ENABLED_HTTP_LOGIN est vraie selon config/environments/staging.php');
     absent('pas d\'avertissement générique', $sortie, 'mu-plugin');
     contient('question posée', $sortie, 'Installer quand même ?');
     verifie('« non » : aucune écriture', httpAuthEcrituresHorsSonde(), []);

@@ -4608,19 +4608,21 @@ function httpAuthGuard(Host $env): array
  * (sortie de grep, jamais exécutée). Formes reconnues, en début de ligne :
  * `Config::define('ENABLED_HTTP_LOGIN', <valeur>);` (classe éventuellement qualifiée) et
  * `define('ENABLED_HTTP_LOGIN', <valeur>);`, guillemets simples ou doubles, espaces libres,
- * commentaire de fin permis. Valeurs : `true`, `false` (casse libre), `env('NOM')`, avec
- * un second argument éventuel (`argument`) et suivi ou non de `?? …` (`coalesce`), tous
- * deux rendus bruts. Une autre valeur, ou une définition qui n'ouvre pas la ligne (dans un
- * `if`), vaut `unknown`. Les lignes de commentaire sont ignorées. Plusieurs définitions :
- * la dernière l'emporte, comme Config::define(). Fonction pure.
+ * commentaire de fin permis. Valeurs : `true`, `false` (casse libre), `env('NOM')` suivi
+ * ou non de `?? …` (`coalesce`, rendu brut). Un second argument de env() est accepté et
+ * ignoré : Env\env() de Bedrock n'en prend qu'un, PHP écarte le surplus. Une autre valeur
+ * vaut `unknown`, comme toute ligne qui cite la constante entre guillemets sans être une
+ * définition complète (dans un `if`, sur plusieurs lignes). Les lignes de commentaire
+ * sont ignorées. Plusieurs définitions : la dernière l'emporte, comme Config::define().
+ * Fonction pure.
  *
- * @return ?array{form: string, name: ?string, argument: ?string, coalesce: ?string} form :
- *         'true', 'false', 'env' (name : la variable) ou 'unknown' ; null sans définition
+ * @return ?array{form: string, name: ?string, coalesce: ?string} form : 'true', 'false',
+ *         'env' (name : la variable) ou 'unknown' ; null sans définition
  */
 function httpAuthLegacyDefinition(string $lines): ?array
 {
     $found = null;
-    $none = ['name' => null, 'argument' => null, 'coalesce' => null];
+    $none = ['name' => null, 'coalesce' => null];
 
     foreach (preg_split('/\R/', $lines) as $line) {
         $line = trim($line);
@@ -4634,17 +4636,16 @@ function httpAuthLegacyDefinition(string $lines): ?array
 
             if (preg_match('/^(true|false)$/i', $value, $bool) === 1) {
                 $found = ['form' => strtolower($bool[1])] + $none;
-            } elseif (preg_match('/^env\s*\(\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:,\s*([^()]*?)\s*)?\)(?:\s*\?\?\s*(.+))?$/i', $value, $variable) === 1) {
+            } elseif (preg_match('/^env\s*\(\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:,[^()]*)?\)(?:\s*\?\?\s*(.+))?$/i', $value, $variable) === 1) {
                 $found = [
                     'form' => 'env',
                     'name' => $variable[2],
-                    'argument' => ($variable[3] ?? '') !== '' ? $variable[3] : null,
-                    'coalesce' => ($variable[4] ?? '') !== '' ? trim($variable[4]) : null,
+                    'coalesce' => ($variable[3] ?? '') !== '' ? trim($variable[3]) : null,
                 ];
             } else {
                 $found = ['form' => 'unknown'] + $none;
             }
-        } elseif (preg_match('/define\s*\(\s*([\'"])ENABLED_HTTP_LOGIN\1/i', $line) === 1) {
+        } elseif (preg_match('/([\'"])ENABLED_HTTP_LOGIN\1/', $line) === 1) {
             $found = ['form' => 'unknown'] + $none;
         }
     }
@@ -4653,39 +4654,22 @@ function httpAuthLegacyDefinition(string $lines): ?array
 }
 
 /**
- * État du provider HttpLogin pour `env('NOM', $argument) ?? $coalesce`, $value étant la
- * valeur brute de NOM dans shared/.env (null : variable absente). Le provider teste la
- * constante en booléen PHP. env() de Bedrock (oscarotero/env) ne convertit que true,
- * false, null, empty (entre parenthèses ou non, casse libre) et les entiers : `no` ou
- * `off` restent des chaînes non vides, donc vraies. Variable absente : le second argument,
- * sinon null. Résultat null : la valeur de `??`. Ces défauts ne comptent que s'ils sont
- * littéraux (true, false, null, entier, chaîne entre guillemets) ; sinon `unknown`, comme
- * une variable absente sans défaut. Fonction pure.
+ * État du provider HttpLogin pour `env('NOM') ?? $coalesce`, $value étant la valeur brute
+ * de NOM dans shared/.env (null : variable absente). Le provider teste la constante en
+ * booléen PHP. Env\env() de Bedrock (oscarotero/env 2.1) ne convertit que true, false et
+ * null (casse libre) et les chaînes de chiffres, en entier. `(false)`, `empty`, `no` ou
+ * `off` restent des chaînes non vides, donc vraies. Inactif : false, null, '' et un entier
+ * nul. Valeur null (variable absente ou « null ») : celle de `??`, si elle est littérale
+ * (true, false, null, entier, chaîne entre guillemets). Sinon, variable absente : `unknown`,
+ * une variable d'environnement du serveur pouvant aussi la fournir. Fonction pure.
  *
  * @return string `active`, `inactive` ou `unknown`
  */
-function httpAuthLegacyEnvState(?string $value, ?string $argument = null, ?string $coalesce = null): string
+function httpAuthLegacyEnvState(?string $value, ?string $coalesce = null): string
 {
-    // [littéral reconnu, valeur PHP].
-    $literal = static function (string $code): array {
-        if (preg_match('/^(true|false|null)$/i', $code, $m) === 1) {
-            return [true, ['true' => true, 'false' => false, 'null' => null][strtolower($m[1])]];
-        }
-
-        if (preg_match('/^-?[0-9]+$/', $code) === 1) {
-            return [true, (int) $code];
-        }
-
-        if (preg_match('/^(?:\'([^\'\\\\]*)\'|"([^"\\\\$]*)")$/', $code, $m) === 1) {
-            return [true, ($m[1] ?? '') . ($m[2] ?? '')];
-        }
-
-        return [false, null];
-    };
-
     if ($value !== null) {
+        $converted = ['true' => true, 'false' => false, 'null' => null];
         $lower = strtolower($value);
-        $converted = ['true' => true, '(true)' => true, 'false' => false, '(false)' => false, 'null' => null, '(null)' => null, 'empty' => '', '(empty)' => ''];
 
         if (array_key_exists($lower, $converted)) {
             $result = $converted[$lower];
@@ -4694,22 +4678,22 @@ function httpAuthLegacyEnvState(?string $value, ?string $argument = null, ?strin
         } else {
             $result = $value;
         }
-    } elseif ($argument !== null) {
-        [$known, $result] = $literal($argument);
-
-        if (!$known) {
-            return 'unknown';
-        }
-    } elseif ($coalesce !== null) {
-        $result = null;
     } else {
-        return 'unknown';
+        $result = null;
     }
 
-    if ($result === null && $coalesce !== null) {
-        [$known, $result] = $literal($coalesce);
+    if ($result === null) {
+        if ($coalesce === null) {
+            return $value === null ? 'unknown' : 'inactive';
+        }
 
-        if (!$known) {
+        if (preg_match('/^(true|false|null)$/i', $coalesce, $m) === 1) {
+            $result = ['true' => true, 'false' => false, 'null' => null][strtolower($m[1])];
+        } elseif (preg_match('/^-?[0-9]+$/', $coalesce) === 1) {
+            $result = (int) $coalesce;
+        } elseif (preg_match('/^(?:\'([^\'\\\\]*)\'|"([^"\\\\$]*)")$/', $coalesce, $m) === 1) {
+            $result = ($m[1] ?? '') . ($m[2] ?? '');
+        } else {
             return 'unknown';
         }
     }
@@ -4791,7 +4775,7 @@ function httpAuthLegacyProvider(Host $env, array $envValues, string $root = '{{c
 
             if ($definition['form'] === 'env') {
                 $values = transferHostEnvValues($env, [(string) $definition['name']]);
-                $state = httpAuthLegacyEnvState($values[$definition['name']] ?? null, $definition['argument'], $definition['coalesce']);
+                $state = httpAuthLegacyEnvState($values[$definition['name']] ?? null, $definition['coalesce']);
             } else {
                 $state = ['true' => 'active', 'false' => 'inactive'][$definition['form']] ?? 'unknown';
             }
@@ -4895,7 +4879,7 @@ task('http-auth:setup', static function (): void {
 
             if ($legacy !== null && $legacy['state'] === 'active') {
                 warning(sprintf(
-                    '%s répond déjà 401 : le provider HttpLoginServiceProvider de horizon-tools est actif (ENABLED_HTTP_LOGIN vaut true dans %s). Après l\'installation, passer ENABLED_HTTP_LOGIN à false dans ce fichier, commiter, puis déployer : le site demanderait sinon deux authentifications.',
+                    '%s répond déjà 401 : le provider HttpLoginServiceProvider de horizon-tools est actif (ENABLED_HTTP_LOGIN est vraie selon %s). Après l\'installation, passer ENABLED_HTTP_LOGIN à false dans ce fichier, commiter, puis déployer. Sinon, le site demanderait deux authentifications.',
                     $url,
                     $legacy['file']
                 ));

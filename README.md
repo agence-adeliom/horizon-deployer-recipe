@@ -466,22 +466,23 @@ avertissement. Il reste à tester le site dans un navigateur avec les nouveaux i
 Il faut ensuite retirer l'ancienne protection du projet, par un commit dans son dépôt.
 Tant que les deux coexistent, le navigateur demande deux fois des identifiants.
 
-**Provider HttpLogin de horizon-tools.** Le paquet `agence-adeliom/horizon-tools` enregistre
-toujours le provider Acorn `HttpLoginServiceProvider`. Celui-ci répond 401 depuis PHP si la
-constante `ENABLED_HTTP_LOGIN` est vraie. Quand le site répond déjà 401, `setup` cherche ce
-provider dans la release en ligne, sans exécuter le code du projet. Elle lit la valeur de
-`ENABLED_HTTP_LOGIN` dans `config/environments/<WP_ENV>.php`, puis dans
-`config/application.php`. Le fichier d'environnement l'emporte, comme dans Bedrock. Sans
-`WP_ENV`, c'est `production.php`, que Bedrock charge alors. Une valeur `env('NOM')` est lue
-dans `shared/.env` et convertie comme le fait `env()` : seuls `false`, `0`, une valeur vide,
-`null` et `empty` désactivent le provider. `no` ou `off` le laissent donc actif. Une
-variable absente prend le défaut littéral de l'appel (`env('NOM', false)`,
-`env('NOM') ?? false`). Sans défaut, la valeur est inconnue. Si le provider est actif, l'avertissement
-le nomme et cite le fichier à modifier. Après l'installation, il faut y passer
-`ENABLED_HTTP_LOGIN` à `false`, commiter, puis déployer. Si la valeur n'a pas pu être lue,
-l'avertissement générique le signale. À chaque déploiement, `deploy:http-auth` lit la
-release déployée. Elle avertit d'une double authentification tant que le provider y reste
-actif, sans jamais faire échouer le déploiement.
+**Provider HttpLogin de horizon-tools.** Le paquet `agence-adeliom/horizon-tools`
+enregistre toujours le provider Acorn `HttpLoginServiceProvider`. Celui-ci répond 401
+depuis PHP si la constante `ENABLED_HTTP_LOGIN` est vraie. Quand le site répond déjà 401,
+`setup` cherche ce provider dans la release en ligne, sans exécuter le code du projet. La
+tâche lit la valeur de `ENABLED_HTTP_LOGIN` dans `config/environments/<WP_ENV>.php`, puis
+dans `config/application.php`. Le fichier d'environnement l'emporte, comme dans Bedrock.
+Sans `WP_ENV`, c'est `production.php`, que Bedrock charge alors. Une valeur `env('NOM')`
+est lue dans `shared/.env` et convertie comme le fait `env()` dans Bedrock. Seuls `false`,
+`0`, une valeur vide et `null` désactivent le provider. `no`, `off`, `(false)` ou `empty`
+le laissent donc actif. Une variable absente prend le défaut littéral placé après `??`,
+par exemple `false` dans `env('NOM') ?? false`. Sans défaut, la valeur est inconnue, car
+une variable d'environnement du serveur peut aussi la fournir. Si le provider est actif,
+l'avertissement le nomme et cite le fichier à modifier. Après l'installation, il faut y
+passer `ENABLED_HTTP_LOGIN` à `false`, commiter, puis déployer. Si la valeur n'a pas pu
+être lue, l'avertissement générique le signale. À chaque déploiement, `deploy:http-auth`
+lit la release déployée. La tâche avertit d'une double authentification tant que le
+provider y reste actif, sans jamais faire échouer le déploiement.
 
 **Vérification depuis une IP autorisée.** Le bloc sert sans identifiants les IP détectées
 pour le serveur et celles de `http_auth_allow_ips`. Le poste qui lance `dep` peut avoir
