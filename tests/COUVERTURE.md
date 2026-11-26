@@ -7,8 +7,8 @@ Deux suites complémentaires :
 
 ## Résumé
 
-- 102 fonctions dans `recipe/horizon-transfer.php` : les 102 ont des tests unitaires. Pour 46 d'entre elles, une partie du comportement ne se voit qu'en intégration (SSH réel, WP-CLI et MariaDB réels, proxy des questions entre worker et master) : colonne « Reste à l'intégration ».
-- 15 tâches, 6 réglages calculés (closures) et les 7 réglages `http_auth*` : tous couverts en unitaire, les quatre tâches de transfert de bout en bout avec un hôte `localhost()` seulement (sans SSH).
+- 102 fonctions dans `recipe/horizon-transfer.php` : les 102 ont des tests unitaires. Pour 46 d'entre elles, une partie du comportement ne se voit qu'en intégration : SSH, WP-CLI et MariaDB réels, questions proxifiées entre worker et master. La colonne « Reste à l'intégration » le détaille.
+- 15 tâches, 6 réglages calculés (closures) et les 7 réglages `http_auth*` : tous sont couverts en unitaire. Les quatre tâches de transfert y sont testées entières, avec un hôte `localhost()` seulement (sans SSH).
 - Authentification HTTP (19 fonctions `httpAuth*`, `http-auth:setup`, `http-auth:update`, `http-auth:remove`, `deploy:http-auth`) : aucun scénario d'intégration pour l'instant. Les serveurs de test n'ont pas de serveur web, et le scénario `90-http-auth` demande d'y ajouter Apache.
 - 43 mutations représentatives du recipe, réparties sur les 14 fichiers d'avant l'authentification HTTP, font toutes échouer la suite. Le fichier `http-auth` a été vérifié pendant son écriture par des mutations ponctuelles (sonde, remise en état, droits, échappement curl), non comptées ici.
 - Bugs exposés, marqués `casBug()` (signalés sans faire échouer la suite, qui échoue s'ils disparaissent) : voir « Bugs connus » en fin de document.
@@ -101,16 +101,16 @@ Deux suites complémentaires :
 | `rolesCheckHostRoles` | `roles` | Options sérialisées réelles en `HEX()` | `60-roles` (vraies options sérialisées) |
 | `rolesCheckDiff` | `roles` | | `60-roles` (rôle en trop, cap retirée) |
 | `httpAuthBlock` | `http-auth` | Bloc interprété par un vrai Apache 2.4 (`RequireAny`, `Require expr`) | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthSplitBlock` | `http-auth` (par `httpAuthRemoveBlock`, `httpAuthInsertBlock`, `httpAuthBlockIps` et les tâches) |  | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthRemoveBlock` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthInsertBlock` | `http-auth` (CRLF, sans saut final) |  | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthBlockIps` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthGeneratePassword` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthSplitBlock` | `http-auth` (par `httpAuthRemoveBlock`, `httpAuthInsertBlock`, `httpAuthBlockIps` et les tâches) | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthRemoveBlock` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthInsertBlock` | `http-auth` (CRLF, sans saut final) | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthBlockIps` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthGeneratePassword` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthAskPassword` | `http-auth` (saisie scriptée) | Saisie masquée réelle, proxifiée vers le master et rognée par Symfony | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthValidUser` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthValidUser` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthHtpasswdLine` | `http-auth` (`password_verify()`) | Hash accepté par un vrai Apache (`mod_authn_file`) | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthHtpasswdUser` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthProductionRefusal` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthHtpasswdUser` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthProductionRefusal` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthGuard` | `http-auth` | `shared/.env` sur le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthHtaccessPath` | `http-auth` (liens réels en local, `~/`) | `readlink -f` et repli `pwd -P` sur le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthReadFile` | `http-auth` (aller-retour réel en local) | `base64` du serveur au travers de SSH | Non couvert (pas encore de scénario `90-http-auth`) |
@@ -118,7 +118,7 @@ Deux suites complémentaires :
 | `httpAuthHttpStatus` | `http-auth` (curl simulé, fichier `-K` réel) | Vraie réponse HTTP d'un site protégé | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthProbe` | `http-auth` (fichiers réels en local, curl simulés) | Vrai Apache (401), serveur qui ignore le `.htaccess` (200), directives refusées (500), IP vue pour le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthFileMode` | `http-auth` (par les tâches : droits conservés) | `stat` GNU ou BSD du serveur | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthPasswordAsker` | `http-auth` |  | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthPasswordAsker` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 
 ## Tâches et réglages calculés
 
@@ -138,7 +138,7 @@ Deux suites complémentaires :
 | `http-auth:update` | `http-auth` (fichiers réels en local, curl simulés) | Idem, nouveaux identifiants vérifiés par un vrai Apache | Non couvert (pas encore de scénario `90-http-auth`) |
 | `http-auth:remove` | `http-auth` (fichiers réels en local) | Site réellement déprotégé | Non couvert (pas encore de scénario `90-http-auth`) |
 | `deploy:http-auth` | `http-auth` (fichiers réels en local) | Avant `deploy:symlink` d'un vrai déploiement, `.htaccess` versionné ou partagé | Non couvert (pas encore de scénario `90-http-auth`) |
-| `http_auth`, `http_auth_user`, `http_auth_realm`, `http_auth_htaccess`, `http_auth_htpasswd`, `http_auth_except_paths`, `http_auth_allow_ips` | `http-auth` (défauts, surcharges par hôte) |  | Non couvert (pas encore de scénario `90-http-auth`) |
+| `http_auth`, `http_auth_user`, `http_auth_realm`, `http_auth_htaccess`, `http_auth_htpasswd`, `http_auth_except_paths`, `http_auth_allow_ips` | `http-auth` (défauts, surcharges par hôte) | | Non couvert (pas encore de scénario `90-http-auth`) |
 | Points d'accroche et `fail()` | `declarations` | Ordre d'exécution réel dans `dep deploy` | `60-roles` (ordre réel dans `dep deploy`), `30` (`fail()`) |
 | Options, défauts, marqueur de version | `declarations` | | Indirect (`--strategy`, `--checksum`, `--fix-collations`, `--favicon-only`, `--from`, `--to`) |
 | `bin/wp_local`, `bin/wp` | `wp-cli` | Téléchargement réel du phar | Tous (WP-CLI dans le PATH ; pas de téléchargement du phar) |

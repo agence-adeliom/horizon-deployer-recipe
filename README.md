@@ -77,10 +77,11 @@ Le recipe modifie le comportement de `dep deploy` à six endroits, chacun désar
   synchro à la fin** (`roles:status`), voir
   [Contrôle des rôles adeliom-roles](#contrôle-des-rôles-adeliom-roles) ;
   `set('roles_check', false)` les désarme. Sans ce mu-plugin, rien ne change ;
-- sur une préproduction dont l'inventaire porte `http_auth: true`, il **réinjecte le bloc
-  d'authentification HTTP dans chaque nouvelle release**, juste avant la bascule du symlink
-  (voir [Authentification HTTP des préproductions](#authentification-http-des-préproductions)) ;
-  sans cette clé (`http_auth` vaut `false` par défaut), rien ne change.
+- il **réinjecte le bloc d'authentification HTTP dans chaque nouvelle release**, juste
+  avant la bascule du symlink. Seules les préproductions dont l'inventaire porte
+  `http_auth: true` sont concernées (voir
+  [Authentification HTTP des préproductions](#authentification-http-des-préproductions)).
+  Sans cette clé, `false` par défaut, rien ne change.
 
 Ajoutez à votre `.gitignore` :
 
@@ -422,11 +423,14 @@ Le mot de passe n'apparaît jamais dans l'inventaire ni dans le dépôt.
 - Elle lit `WP_HOME` dans `shared/.env`. Sans cette variable, elle s'arrête sans rien
   écrire.
 - Elle interroge le site sans identifiants, depuis le poste local. Une réponse 401 signale
-  une protection déjà en place : avertissement, puis `Installer quand même ? [y/N]`.
+  une protection déjà en place : avertissement, puis `Installer quand même ? [y/N]`. En
+  `-n`, cette question n'est pas posée.
 - En `-n`, elle décrit ce qu'elle ferait et s'arrête.
 - Elle demande confirmation, avec « non » pour réponse par défaut.
 - Une sonde vérifie qu'Apache applique un `.htaccess` d'authentification.
 - Elle demande le mot de passe, sauf si le `.htpasswd` existe déjà.
+- Elle refuse un `.htpasswd` existant sans identifiant lisible, et renvoie vers
+  `http-auth:update` pour le remplacer. Rien n'est alors écrit.
 - Elle écrit le `.htpasswd`, puis le bloc en tête du `.htaccess` de la release en ligne.
   Si ce fichier est un lien vers `shared/`, c'est le fichier de `shared/` qui est modifié.
 - Elle vérifie le résultat depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
@@ -436,8 +440,8 @@ Le mot de passe n'apparaît jamais dans l'inventaire ni dans le dépôt.
 
 **Mot de passe.** Il est saisi deux fois, en saisie masquée. Après trois saisies qui
 diffèrent, la tâche s'arrête. Une saisie vide fait générer un mot de passe de 24
-caractères, sans caractère ambigu (`0`, `O`, `1`, `l`…) ni caractère spécial, pour une
-saisie facile sur mobile. Symfony supprime les espaces en début et en fin de saisie
+caractères. Il ne contient ni caractère ambigu (`0`, `O`, `1`, `l`…) ni caractère spécial,
+pour une saisie facile sur mobile. Symfony supprime les espaces en début et en fin de saisie
 masquée, qui ne font donc pas partie du mot de passe. Le hash bcrypt est calculé sur le
 poste local, et seul ce hash part vers le serveur. Le mot de passe en clair n'apparaît dans
 aucune commande, même en `-vvv`.
@@ -487,18 +491,18 @@ AuthUserFile "/srv/staging/shared/.htpasswd"
 ```
 
 Le reste du fichier est conservé octet pour octet, fins de ligne CRLF comprises. Un
-`.htaccess` absent est créé avec le seul bloc. Un bloc modifié à la main au point d'être
-mal formé (marqueur seul, ordre inversé, bloc en double) n'est jamais réécrit : la tâche
-s'arrête et demande de le corriger.
+`.htaccess` absent est créé avec le seul bloc. Un bloc retouché à la main peut devenir mal
+formé (marqueur seul, ordre inversé, bloc en double). Il n'est alors jamais réécrit : la
+tâche s'arrête et demande de le corriger.
 
 **Exceptions.** `http_auth_except_paths` liste les préfixes d'URL servis sans
 authentification. Le défaut, `/.well-known/acme-challenge/`, laisse passer le
 renouvellement des certificats Let's Encrypt. On y ajoute par exemple l'URL d'un webhook
 appelé par un service tiers. Chaque préfixe devient une ligne `Require expr`, échappée pour
 l'expression régulière. `http_auth_allow_ips` ajoute des IP servies sans authentification.
-Une valeur qui casserait le `.htaccess` est refusée avant toute écriture : saut de ligne,
-`#` dans un préfixe, `\` dans le realm, `"` dans le chemin du `.htpasswd`. Apache
-répondrait sinon par une erreur 500 sur tout le site.
+Une valeur qui casserait le `.htaccess` est refusée avant toute écriture. Sont refusés un
+saut de ligne, `#` dans un préfixe, `\` dans le realm et `"` dans le chemin du
+`.htpasswd`. Apache répondrait sinon par une erreur 500 sur tout le site.
 
 **IP du serveur.** Derrière un proxy (Cloudflare, frontal d'hébergeur), l'IP détectée peut
 être celle du proxy. Le récapitulatif l'affiche pour cette raison, et
