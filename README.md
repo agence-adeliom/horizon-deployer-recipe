@@ -424,17 +424,22 @@ Le mot de passe n'apparaît jamais dans l'inventaire ni dans le dépôt.
   écrire.
 - Elle interroge le site sans identifiants, depuis le poste local. Une réponse 401 signale
   une protection déjà en place : avertissement, puis `Installer quand même ? [y/N]`. En
-  `-n`, cette question n'est pas posée.
+  `-n`, cette question n'est pas posée. Si le `.htaccess` en ligne contient déjà le bloc
+  Horizon, la tâche affiche une ligne d'information, sans avertissement ni question. Ce
+  bloc sera remplacé, avec les IP à jour.
 - En `-n`, elle décrit ce qu'elle ferait et s'arrête.
 - Elle demande confirmation, avec « non » pour réponse par défaut.
-- Une sonde vérifie qu'Apache applique un `.htaccess` d'authentification.
+- Une sonde vérifie qu'Apache applique un `.htaccess` d'authentification. Si elle reçoit
+  une redirection, le message invite à vérifier `WP_HOME` dans `shared/.env` (http au lieu
+  de https, www manquant).
 - Elle demande le mot de passe, sauf si le `.htpasswd` existe déjà.
 - Elle refuse un `.htpasswd` existant sans identifiant lisible, et renvoie vers
   `http-auth:update` pour le remplacer. Rien n'est alors écrit.
 - Elle écrit le `.htpasswd`, puis le bloc en tête du `.htaccess` de la release en ligne.
   Si ce fichier est un lien vers `shared/`, c'est le fichier de `shared/` qui est modifié.
 - Elle vérifie le résultat depuis le poste local : 401 sans identifiants, 200 ou 30x avec.
-  En cas d'échec, les fichiers retrouvent leur état d'origine et la tâche échoue.
+  En cas d'échec, les fichiers retrouvent leur état d'origine et la tâche échoue. Une
+  exception est décrite plus bas (« Vérification depuis une IP autorisée »).
 - Elle affiche l'URL, l'identifiant, l'IP détectée pour le serveur et, s'il a été
   généré, le mot de passe.
 
@@ -458,6 +463,14 @@ conserve alors le bloc, puisque la sonde a prouvé qu'Apache l'applique, et affi
 avertissement. Il reste à tester le site dans un navigateur avec les nouveaux identifiants.
 Il faut ensuite retirer l'ancienne protection du projet, par un commit dans son dépôt.
 Tant que les deux coexistent, le navigateur demande deux fois des identifiants.
+
+**Vérification depuis une IP autorisée.** Le bloc sert sans identifiants l'IP détectée
+pour le serveur et celles de `http_auth_allow_ips`. Le poste qui lance `dep` peut avoir
+l'une de ces IP, par exemple celle du bureau. Le site lui répond alors 200 ou 30x sans
+identifiants, ce qui ne prouve rien. Dans ce cas, la tâche conserve le bloc et affiche un
+avertissement qui cite ces IP. Il reste à tester le site dans un navigateur depuis un autre
+réseau, par exemple le partage de connexion d'un téléphone. Sans autre IP que
+`127.0.0.1` et `::1`, la vérification reste stricte.
 
 **Sonde Apache.** L'en-tête `Server` ne dit pas de façon fiable si le serveur honore un
 `.htaccess` d'authentification, et les mutualisés la masquent souvent. La tâche le vérifie
@@ -503,6 +516,11 @@ l'expression régulière. `http_auth_allow_ips` ajoute des IP servies sans authe
 Une valeur qui casserait le `.htaccess` est refusée avant toute écriture. Sont refusés un
 saut de ligne, `#` dans un préfixe, `\` dans le realm et `"` dans le chemin du
 `.htpasswd`. Apache répondrait sinon par une erreur 500 sur tout le site.
+
+Chaque élément de `http_auth_allow_ips` est une seule adresse : IPv4, IPv6 ou adresse
+partielle (`10.1`), avec un masque éventuel (`/24`). Une liste séparée par des virgules, un
+nom d'hôte ou une chaîne vide sont refusés. `http-auth:setup` refuse avant toute question.
+Au déploiement, `deploy:http-auth` fait échouer le déploiement avant la bascule.
 
 **IP du serveur.** Derrière un proxy (Cloudflare, frontal d'hébergeur), l'IP détectée peut
 être celle du proxy. Le récapitulatif l'affiche pour cette raison, et
@@ -576,6 +594,10 @@ Limites connues :
   commit dans le dépôt du projet.
 - **Variable d'environnement du serveur** : une variable qui surchargerait `shared/.env`
   n'est pas vue par le garde-fou production.
+- **`dep rollback`** : revenir à une release antérieure à `http-auth:setup` remet en ligne
+  la préproduction sans protection. Le bloc n'existe en effet que dans les releases
+  installées ou déployées depuis. Un `.htaccess` partagé n'est pas concerné. Après un tel
+  rollback, relancer `dep http-auth:setup <hôte>`.
 
 ## Sûreté
 
@@ -885,7 +907,7 @@ Surchargeable depuis `deploy.php` ou l'inventaire, **après** le `require_once`.
 | `http_auth_htaccess` | `web/.htaccess` | `.htaccess` qui reçoit le bloc, relatif à la release. Pour un WordPress classique : `.htaccess` |
 | `http_auth_htpasswd` | `{{deploy_path}}/shared/.htpasswd` | `.htpasswd` sur le serveur, hors de la racine publique |
 | `http_auth_except_paths` | `['/.well-known/acme-challenge/']` | Préfixes d'URL servis sans authentification (renouvellement Let's Encrypt, webhooks). Sans `#` ni saut de ligne |
-| `http_auth_allow_ips` | `[]` | IP servies sans authentification, en plus de `127.0.0.1`, `::1` et de l'IP détectée pour le serveur |
+| `http_auth_allow_ips` | `[]` | IP servies sans authentification, en plus de `127.0.0.1`, `::1` et de l'IP détectée pour le serveur. Une adresse ou un réseau par élément (`203.0.113.10`, `10.1`, `198.51.100.0/24`) |
 | `transfer_update_db` | `true` | Accroche `wp:update-db` à `deploy:success`. À `false`, la tâche ne fait rien, même lancée à la main |
 | `transfer_wp_php_args` | `-d 'error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED'` | Options PHP du `wp-cli.phar` installé par le recipe : masque par défaut les notices de dépréciation qu'une bibliothèque ancienne émet à chaque appel WP-CLI sous PHP 8+. `''` pour garder la configuration PHP du serveur. Sans effet quand `wp` est trouvé dans le PATH |
 | `transfer_search_replace_skip_tables` | `*_wf*` | Tables exclues du search-replace (jokers acceptés) |

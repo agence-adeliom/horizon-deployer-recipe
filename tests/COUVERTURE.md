@@ -100,7 +100,7 @@ Deux suites complémentaires :
 | `transferEnvironmentType` | `roles`, `http-auth` (par `httpAuthProductionRefusal`) | | `61-roles-environnements` |
 | `rolesCheckHostRoles` | `roles` | Options sérialisées réelles en `HEX()` | `60-roles` (vraies options sérialisées) |
 | `rolesCheckDiff` | `roles` | | `60-roles` (rôle en trop, cap retirée) |
-| `httpAuthBlock` | `http-auth` | Bloc interprété par un vrai Apache 2.4 (`RequireAny`, `Require expr`) | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthBlock` | `http-auth` (IP contrôlées une à une) | Bloc interprété par un vrai Apache 2.4 (`RequireAny`, `Require expr`) | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthSplitBlock` | `http-auth` (par `httpAuthRemoveBlock`, `httpAuthInsertBlock`, `httpAuthBlockIps` et les tâches) | | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthRemoveBlock` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthInsertBlock` | `http-auth` (CRLF, sans saut final) | | Non couvert (pas encore de scénario `90-http-auth`) |
@@ -115,7 +115,7 @@ Deux suites complémentaires :
 | `httpAuthHtaccessPath` | `http-auth` (liens réels en local, `~/`) | `readlink -f` et repli `pwd -P` sur le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthReadFile` | `http-auth` (aller-retour réel en local) | `base64` du serveur au travers de SSH | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthWriteFile` | `http-auth` (aller-retour réel en local) | Écriture, `chmod` et `mv` sur le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
-| `httpAuthHttpStatus` | `http-auth` (curl simulé, fichier `-K` réel) | Vraie réponse HTTP d'un site protégé | Non couvert (pas encore de scénario `90-http-auth`) |
+| `httpAuthHttpStatus` | `http-auth` (curl simulé, `-q` en tête, fichier `-K` réel) | Vraie réponse HTTP d'un site protégé | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthProbe` | `http-auth` (fichiers réels en local, curl simulés) | Vrai Apache (401), serveur qui ignore le `.htaccess` (200), directives refusées (500), IP vue pour le serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthFileMode` | `http-auth` (par les tâches : droits conservés) | `stat` GNU ou BSD du serveur | Non couvert (pas encore de scénario `90-http-auth`) |
 | `httpAuthPasswordAsker` | `http-auth` | | Non couvert (pas encore de scénario `90-http-auth`) |
