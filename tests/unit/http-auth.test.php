@@ -1468,3 +1468,56 @@ cas('http-auth:update : de bout en bout sur le disque (réel, curl simulés)', s
     absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), 'mot de "passe"');
     contient('récapitulatif', sortie(), 'https://staging.site.test');
 });
+
+cas('httpAuthValidUser : identifiant vide, avec « : » ou saut de ligne refusé, sans hash', static function (): void {
+    foreach (['', 'a:b', "a\nb", "a\rb"] as $id) {
+        leve('refusé : ' . json_encode($id), static function () use ($id): void {
+            httpAuthValidUser($id);
+        }, \InvalidArgumentException::class, 'Identifiant invalide');
+    }
+
+    httpAuthValidUser('client');
+    vrai('identifiant valide accepté', true);
+});
+
+cas('http-auth:update : copie .htpasswd.bak déjà présente, refus avant toute question', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-bak', [], [''], $questions);
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    Shell::quand('#\[ -e ' . preg_quote(escapeshellarg($htpasswd . '.bak'), '#') . ' \]#', '+true');
+    entree([], true, ['', 'y']);
+    sortie();
+
+    $e = leve('refus', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, $htpasswd . '.bak');
+    $message = $e !== null ? $e->getMessage() : '';
+    contient('.htpasswd cité', $message, "$htpasswd ");
+    contient('consigne', $message, 'à la main');
+    absent('aucune question', sortie(), 'Identifiant HTTP');
+    verifie('aucune saisie', $questions, []);
+    httpAuthAucuneEcritureUpdate('copie présente');
+});
+
+cas('http-auth:update : AuthUserFile du bloc différent de http_auth_htpasswd, refus avant toute question', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-autre', [], [''], $questions);
+    $ancien = '/srv/ancien/.htpasswd';
+    [, $htpasswd] = httpAuthInstallationTest($h, "adeliom:\$2y\$10\$abc\n", httpAuthBlock($ancien, 'Accès restreint', [], []) . "\n# BEGIN WordPress\n# END WordPress\n");
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    entree([], true, ['', 'y']);
+    sortie();
+
+    $e = leve('refus', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, 'http-auth:setup');
+    $message = $e !== null ? $e->getMessage() : '';
+    contient('chemin du bloc cité', $message, $ancien);
+    contient('chemin de l\'inventaire cité', $message, $htpasswd);
+    absent('aucune question', sortie(), 'Identifiant HTTP');
+    verifie('aucune saisie', $questions, []);
+    httpAuthAucuneEcritureUpdate('AuthUserFile différent');
+});

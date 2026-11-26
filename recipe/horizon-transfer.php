@@ -4255,6 +4255,18 @@ function httpAuthAskPassword(?callable $askHidden = null): array
 }
 
 /**
+ * Contrôle d'un identifiant du .htpasswd, sans calcul de hash. Fonction pure.
+ *
+ * @throws \InvalidArgumentException identifiant vide ou contenant « : » ou un saut de ligne
+ */
+function httpAuthValidUser(string $user): void
+{
+    if ($user === '' || strpbrk($user, ":\r\n") !== false) {
+        throw new \InvalidArgumentException('Identifiant invalide : il ne peut être vide ni contenir « : » ou un saut de ligne.');
+    }
+}
+
+/**
  * Ligne du .htpasswd, hash bcrypt calculé en local : seul le hash part vers le serveur, le
  * mot de passe en clair n'apparaît dans aucune commande.
  *
@@ -4262,9 +4274,7 @@ function httpAuthAskPassword(?callable $askHidden = null): array
  */
 function httpAuthHtpasswdLine(string $user, string $password): string
 {
-    if ($user === '' || strpbrk($user, ":\r\n") !== false) {
-        throw new \InvalidArgumentException('Identifiant invalide : il ne peut être vide ni contenir « : » ou un saut de ligne.');
-    }
+    httpAuthValidUser($user);
 
     return $user . ':' . password_hash($password, PASSWORD_BCRYPT) . "\n";
 }
@@ -4814,6 +4824,22 @@ task('http-auth:update', static function (): void {
         throw error("Aucun bloc d'authentification HTTP dans $htaccessPath : l'installer par dep http-auth:setup $label. Rien n'a été écrit.");
     }
 
+    // Le bloc doit désigner ce .htpasswd : réécrire un autre fichier que celui lu par Apache
+    // (http_auth_htpasswd modifié depuis l'installation) ne changerait rien.
+    $blockHtpasswd = preg_match('/^\s*AuthUserFile\s+"?([^"\r\n]*?)"?\s*$/mi', $parts[1], $m) === 1 ? $m[1] : null;
+
+    if ($blockHtpasswd !== $htpasswdPath) {
+        throw error(sprintf('Le bloc de %s désigne %s, mais http_auth_htpasswd vaut %s : relancer dep http-auth:setup %s pour aligner le bloc. Rien n\'a été écrit.', $htaccessPath, $blockHtpasswd ?? 'aucun .htpasswd', $htpasswdPath, $label));
+    }
+
+    // Copie laissée par une exécution interrompue : la seule trace des identifiants
+    // précédents, qu'une nouvelle copie écraserait.
+    $backupPath = $htpasswdPath . '.bak';
+
+    if (transferTest($env, '[ -e ' . escapeshellarg($backupPath) . ' ]')) {
+        throw error("$backupPath existe déjà (exécution précédente interrompue ?) : le remettre en place sur $htpasswdPath ou le supprimer à la main, puis relancer la tâche. Rien n'a été écrit.");
+    }
+
     // 2. Garde-fou production ; URL de la vérification.
     $values = httpAuthGuard($env);
     $url = $values['WP_HOME'] ?? '';
@@ -4831,8 +4857,7 @@ task('http-auth:update', static function (): void {
         return;
     }
 
-    // 4. Identifiant, proposé depuis l'inventaire. La validation est celle de la ligne écrite
-    // (le hash d'un mot de passe vide est jeté).
+    // 4. Identifiant, proposé depuis l'inventaire, contrôlé comme la ligne écrite.
     $inventoryUser = (string) get('http_auth_user');
     $user = null;
 
@@ -4840,7 +4865,7 @@ task('http-auth:update', static function (): void {
         $answer = (string) ask('Identifiant HTTP', $inventoryUser);
 
         try {
-            httpAuthHtpasswdLine($answer, '');
+            httpAuthValidUser($answer);
             $user = $answer;
         } catch (\InvalidArgumentException $e) {
             warning($e->getMessage() . ' Recommencez.');
@@ -4870,7 +4895,6 @@ task('http-auth:update', static function (): void {
     // 7. Copie de l'ancien .htpasswd, puis écriture du nouveau (temporaire et mv, droits du
     // fichier conservés). 8. Vérification. À partir de la copie, tout échec ou exception remet
     // l'ancien .htpasswd en place ; le .htaccess n'est jamais touché.
-    $backupPath = $htpasswdPath . '.bak';
     $mode = httpAuthFileMode($env, $htpasswdPath, '644');
     $backedUp = false;
     $restore = static function () use ($env, $htpasswdPath, $backupPath, &$backedUp): string {
