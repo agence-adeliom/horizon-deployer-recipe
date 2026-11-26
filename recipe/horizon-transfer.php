@@ -4580,6 +4580,7 @@ task('http-auth:setup', static function (): void {
     // 4. Protection existante, vue depuis le poste local : depuis le serveur, la requête
     // passerait par l'exception d'IP d'un bloc déjà posé.
     $status = httpAuthHttpStatus(null, $url);
+    $alreadyProtected = $status === 401;
 
     if ($status === null) {
         warning("$url ne répond pas depuis ce poste (DNS, TLS ?) : protection existante non vérifiée.");
@@ -4692,7 +4693,14 @@ task('http-auth:setup', static function (): void {
         $with = httpAuthHttpStatus(null, $url, $user, $password);
 
         if ($with === null || ($with !== 200 && ($with < 300 || $with > 399))) {
-            $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
+            if ($alreadyProtected && $with === 401) {
+                // Protection détectée à l'étape 4 : l'autre couche (mu-plugin, provider Acorn)
+                // répond 401 à tout le monde, la vérification ne peut pas conclure. La sonde a
+                // déjà prouvé qu'Apache applique le bloc : il est conservé.
+                warning("Vérification non concluante : une autre protection répond déjà 401 sur $url, même avec les nouveaux identifiants. Bloc conservé. Tester dans un navigateur avec les nouveaux identifiants, puis retirer l'ancienne protection PHP du projet.");
+            } else {
+                $failure = sprintf('avec les identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
+            }
         }
     } else {
         info('Mot de passe du .htpasswd existant inconnu : vérification avec identifiants sautée.');

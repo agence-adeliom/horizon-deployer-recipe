@@ -882,3 +882,44 @@ cas('http-auth:setup : de bout en bout sur le disque (réel, curl simulés)', st
     absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), 'mot de "passe"');
     contient('récapitulatif', sortie(), 'https://staging.site.test');
 });
+
+cas('http-auth:setup : site déjà protégé (401 initial), 401 avec identifiants : bloc conservé, avertissement', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deja-verif');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401'], '401', '401');
+    entree([], true, ['y', 'y']);
+    sortie();
+
+    tache('http-auth:setup', $h);
+    $sortie = sortie();
+    $chemin = '/srv/' . $h->getAlias() . '/current/web/.htaccess';
+    contient('avertissement', $sortie, 'Vérification non concluante');
+    contient('test au navigateur', $sortie, 'navigateur');
+    contient('récapitulatif', $sortie, 'Authentification HTTP installée');
+    vrai('bloc écrit', strpos((string) httpAuthEcritTest($chemin), '# BEGIN Horizon HTTP auth') === 0);
+    aucuneCommande('pas de retrait', '#^rm -f #');
+});
+
+cas('http-auth:setup : site déjà protégé, mais 200 sans identifiants après installation : retrait et erreur', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deja-echec');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401', '200']);
+    entree([], true, ['y', 'y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '401 attendu');
+    uneCommande('.htaccess créé puis supprimé', '#^rm -f ' . preg_quote(escapeshellarg('/srv/' . $h->getAlias() . '/current/web/.htaccess'), '#') . '$#');
+});
+
+cas('http-auth:setup : site déjà protégé, identifiants en 500 : retrait et erreur', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-deja-500');
+    httpAuthEnvTest();
+    httpAuthCurlTest(['401'], '401', '500');
+    entree([], true, ['y', 'y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:setup', $h);
+    }, \Throwable::class, '200 ou 30x attendu');
+    uneCommande('.htaccess retiré', '#^rm -f #');
+});
