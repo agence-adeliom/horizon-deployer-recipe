@@ -4864,7 +4864,7 @@ task('http-auth:setup', static function (): void {
     }
 
     // 5. Mode non interactif : description, aucune écriture. Le chemin décrit est celui du
-    // fichier réellement écrit : un .htaccess partagé désigne shared/, et non la release.
+    // fichier réellement écrit, celui de shared/ pour un .htaccess partagé.
     if (!input()->isInteractive()) {
         $describedHtaccess = $liveHtaccessPath ?? httpAuthHtaccessPath($env, '{{current_path}}');
         warning("Mode non interactif (-n) : rien n'est écrit sur « $label ». Sans -n, la tâche :");
