@@ -4557,6 +4557,20 @@ function httpAuthFileMode(Host $env, string $path, string $default): string
     return preg_match('/^[0-7]{3,4}$/', $mode) === 1 ? $mode : $default;
 }
 
+/**
+ * Fonction de saisie masquée des tâches http-auth : null en usage normal (askHiddenResponse()).
+ * http_auth_password_asker, réservé aux tests et absent par défaut, est une closure qui rend
+ * la fonction de saisie passée à httpAuthAskPassword() (Deployer évalue une closure stockée
+ * en configuration), askHiddenResponse() refusant une entrée sans TTY. Closure exigée : une
+ * chaîne de l'inventaire (« system ») ne doit jamais être appelée.
+ */
+function httpAuthPasswordAsker(): ?\Closure
+{
+    $asker = has('http_auth_password_asker') ? get('http_auth_password_asker') : null;
+
+    return $asker instanceof \Closure ? $asker : null;
+}
+
 desc('Installe l\'authentification HTTP (bloc .htaccess + .htpasswd) sur une préproduction dont l\'inventaire porte http_auth: true : dep http-auth:setup staging');
 task('http-auth:setup', static function (): void {
     $env = currentHost();
@@ -4657,12 +4671,7 @@ task('http-auth:setup', static function (): void {
             warning(sprintf('L\'identifiant du .htpasswd (« %s ») diffère de http_auth_user (« %s »).', $user, (string) get('http_auth_user')));
         }
     } else {
-        // http_auth_password_asker, réservé aux tests et absent par défaut : closure qui rend
-        // la fonction de saisie passée à httpAuthAskPassword() (Deployer évalue une closure
-        // stockée en configuration), askHiddenResponse() refusant une entrée sans TTY.
-        $asker = has('http_auth_password_asker') ? get('http_auth_password_asker') : null;
-        // Closure exigée : une chaîne de l'inventaire (« system ») ne doit jamais être appelée.
-        $asked = httpAuthAskPassword($asker instanceof \Closure ? $asker : null);
+        $asked = httpAuthAskPassword(httpAuthPasswordAsker());
         $password = $asked['password'];
         $generated = $asked['generated'];
         $htpasswdLine = httpAuthHtpasswdLine($user, $password);
@@ -4776,6 +4785,148 @@ task('http-auth:setup', static function (): void {
     if ($generated) {
         writeln("   Mot de passe : $password");
         writeln('   Copiez-le dans Bitwarden : il ne sera plus affiché.');
+    }
+});
+
+desc('Change l\'identifiant et le mot de passe de l\'authentification HTTP d\'une préproduction (seul le .htpasswd est réécrit) : dep http-auth:update staging');
+task('http-auth:update', static function (): void {
+    $env = currentHost();
+    $label = $env->getAlias();
+
+    // 1. Installation existante : .htpasswd, et bloc dans le .htaccess de la release en ligne.
+    $htpasswdPath = transferResolvePath($env, '{{http_auth_htpasswd}}');
+    $existing = httpAuthReadFile($env, $htpasswdPath);
+
+    if ($existing === null) {
+        throw error("$htpasswdPath introuvable sur « $label » : aucune authentification HTTP installée. L'installer par dep http-auth:setup $label. Rien n'a été écrit.");
+    }
+
+    $htaccessPath = httpAuthHtaccessPath($env, '{{current_path}}');
+    $htaccess = httpAuthReadFile($env, $htaccessPath);
+
+    try {
+        $parts = $htaccess !== null ? httpAuthSplitBlock($htaccess) : null;
+    } catch (\UnexpectedValueException $e) {
+        throw error("$htaccessPath : " . $e->getMessage() . ' Rien n\'a été écrit.');
+    }
+
+    if ($parts === null) {
+        throw error("Aucun bloc d'authentification HTTP dans $htaccessPath : l'installer par dep http-auth:setup $label. Rien n'a été écrit.");
+    }
+
+    // 2. Garde-fou production ; URL de la vérification.
+    $values = httpAuthGuard($env);
+    $url = $values['WP_HOME'] ?? '';
+
+    if ($url === '') {
+        throw error("WP_HOME introuvable dans shared/.env de « $label » : URL du site inconnue. Rien n'a été écrit.");
+    }
+
+    // 3. Mode non interactif : identifiant actuel, aucune question ni écriture.
+    if (!input()->isInteractive()) {
+        $current = httpAuthHtpasswdUser($existing);
+        warning("Mode non interactif (-n) : rien n'est écrit sur « $label ».");
+        writeln($current !== null ? "   Identifiant actuel : « $current »." : "   Aucun identifiant lisible dans $htpasswdPath.");
+
+        return;
+    }
+
+    // 4. Identifiant, proposé depuis l'inventaire. La validation est celle de la ligne écrite
+    // (le hash d'un mot de passe vide est jeté).
+    $inventoryUser = (string) get('http_auth_user');
+    $user = null;
+
+    for ($attempt = 0; $attempt < 3 && $user === null; $attempt++) {
+        $answer = (string) ask('Identifiant HTTP', $inventoryUser);
+
+        try {
+            httpAuthHtpasswdLine($answer, '');
+            $user = $answer;
+        } catch (\InvalidArgumentException $e) {
+            warning($e->getMessage() . ' Recommencez.');
+        }
+    }
+
+    if ($user === null) {
+        throw error('Identifiant invalide trois fois de suite : rien n\'a été écrit.');
+    }
+
+    if ($user !== $inventoryUser) {
+        info("Pensez à reporter http_auth_user: $user dans .inventory.yaml.");
+    }
+
+    // 5. Mot de passe, comme pour http-auth:setup.
+    $asked = httpAuthAskPassword(httpAuthPasswordAsker());
+    $password = $asked['password'];
+    $line = httpAuthHtpasswdLine($user, $password);
+
+    // 6. Confirmation, défaut « non » (voir transferConfirm()).
+    if (!transferConfirm("Remplacer les identifiants HTTP de « $label » ?", false)) {
+        info('Mise à jour abandonnée : rien n\'a été écrit.');
+
+        return;
+    }
+
+    // 7. Copie de l'ancien .htpasswd, puis écriture du nouveau (temporaire et mv, droits du
+    // fichier conservés). 8. Vérification. À partir de la copie, tout échec ou exception remet
+    // l'ancien .htpasswd en place ; le .htaccess n'est jamais touché.
+    $backupPath = $htpasswdPath . '.bak';
+    $mode = httpAuthFileMode($env, $htpasswdPath, '644');
+    $backedUp = false;
+    $restore = static function () use ($env, $htpasswdPath, $backupPath, &$backedUp): string {
+        if (!$backedUp) {
+            return "Le .htpasswd ($htpasswdPath) n'a pas été modifié.";
+        }
+
+        try {
+            transferRun($env, sprintf('mv -f %s %s', escapeshellarg($backupPath), escapeshellarg($htpasswdPath)));
+
+            return "L'ancien .htpasswd ($htpasswdPath) est remis en place.";
+        } catch (\Throwable $e) {
+            writeln('   ' . $e->getMessage());
+
+            return "L'ancien .htpasswd n'a pas pu être remis en place : le restaurer à la main depuis $backupPath.";
+        }
+    };
+
+    $failure = null;
+
+    try {
+        transferRun($env, sprintf('cp -p %s %s', escapeshellarg($htpasswdPath), escapeshellarg($backupPath)));
+        $backedUp = true;
+        httpAuthWriteFile($env, $htpasswdPath, $line, $mode);
+
+        // 8. Vérification depuis le poste local avec les nouveaux identifiants.
+        $with = httpAuthHttpStatus(null, $url, $user, $password);
+
+        if ($with === null || ($with !== 200 && ($with < 300 || $with > 399))) {
+            $failure = sprintf('avec les nouveaux identifiants, %s répond %s (200 ou 30x attendu)', $url, $with ?? 'rien');
+        }
+    } catch (\Throwable $e) {
+        warning('Mise à jour interrompue. ' . $restore());
+
+        throw $e;
+    }
+
+    if ($failure !== null) {
+        throw error("Vérification en échec : $failure. " . $restore());
+    }
+
+    try {
+        transferRun($env, 'rm -f ' . escapeshellarg($backupPath));
+    } catch (\Throwable $e) {
+        warning("Copie de l'ancien .htpasswd laissée en place, à supprimer à la main : $backupPath");
+    }
+
+    // 9. Récapitulatif. Le mot de passe généré n'est affiché qu'ici, une seule fois ; un mot
+    // de passe saisi ne l'est jamais.
+    info("Identifiants HTTP remplacés sur « $label ».");
+    writeln("   URL : $url");
+    writeln("   Identifiant : $user");
+
+    if ($asked['generated']) {
+        writeln("   Mot de passe : $password");
+        writeln('   Mettez à jour l\'entrée Bitwarden : le mot de passe ne sera plus affiché.');
     }
 });
 

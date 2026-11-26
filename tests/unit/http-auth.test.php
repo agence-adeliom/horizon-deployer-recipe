@@ -1135,3 +1135,336 @@ cas('http-auth:setup : http_auth_password_asker qui n\'est pas une closure, igno
     vrai('chaîne jamais appelée', !isset($GLOBALS['http_auth_espion']));
     verifie('aucune écriture', httpAuthEcrituresHorsSonde(), []);
 });
+
+/*
+ * Tâche http-auth:update.
+ */
+
+/**
+ * Installation existante sur l'hôte de test : .htpasswd de $htpasswd (null : absent) et
+ * .htaccess de $htaccess (null : absent). Rend [.htaccess, .htpasswd].
+ */
+function httpAuthInstallationTest(\Deployer\Host\Host $h, ?string $htpasswd = "adeliom:\$2y\$10\$abc\n", ?string $htaccess = null): array
+{
+    [$cheminHtaccess, $cheminHtpasswd] = httpAuthCheminsTest($h);
+    $htaccess = $htaccess ?? httpAuthBlock($cheminHtpasswd, 'Accès restreint', [], ['/.well-known/acme-challenge/']) . "\n# BEGIN WordPress\n# END WordPress\n";
+
+    if ($htpasswd !== null) {
+        Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($cheminHtpasswd), '#') . ' \]#', "+dep\n" . base64_encode($htpasswd));
+    }
+
+    if ($htaccess !== '') {
+        Shell::quand('#^if \[ -f ' . preg_quote(escapeshellarg($cheminHtaccess), '#') . ' \]#', "+dep\n" . base64_encode($htaccess));
+    }
+
+    return [$cheminHtaccess, $cheminHtpasswd];
+}
+
+/** Code des curl locaux avec identifiants ; tout curl sans identifiants répond $sans. */
+function httpAuthCurlUpdateTest(string $avec, string $sans = '401'): void
+{
+    Shell::quand('/^curl -sS -o /', static function (array $appel) use ($avec, $sans): string {
+        return strpos($appel['commande'], ' -K ') !== false ? $avec : $sans;
+    }, 'local');
+}
+
+/** Aucune écriture : ni copie, ni fichier écrit, ni déplacement, ni suppression. */
+function httpAuthAucuneEcritureUpdate(string $prefixe): void
+{
+    aucuneCommande("$prefixe : aucune écriture", '/base64 -d|^cp |^mv |^rm /');
+}
+
+cas('http-auth:update : refus sans .htpasswd, renvoi vers http-auth:setup', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-sans-htpasswd', [], [], $questions);
+    httpAuthInstallationTest($h, null);
+    httpAuthEnvTest();
+    entree([], true, ['', 'y']);
+
+    leve('refus', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, 'http-auth:setup');
+    httpAuthAucuneEcritureUpdate('sans .htpasswd');
+    verifie('aucune saisie', $questions, []);
+});
+
+cas('http-auth:update : refus sans bloc (absent, .htaccess absent, bloc mal formé)', static function (): void {
+    $cas = [
+        'sans-bloc' => ["# BEGIN WordPress\n# END WordPress\n", 'http-auth:setup'],
+        'sans-htaccess' => ['', 'http-auth:setup'],
+        'mal-forme' => ["# BEGIN Horizon HTTP auth\nAuthType Basic\n", 'à la main'],
+    ];
+
+    foreach ($cas as $nom => [$htaccess, $fragment]) {
+        $questions = [];
+        $h = httpAuthHoteSetup('http-auth-maj-' . $nom, [], [], $questions);
+        Shell::reinitialiser();
+        httpAuthInstallationTest($h, "adeliom:\$2y\$10\$abc\n", $htaccess);
+        httpAuthEnvTest();
+        entree([], true, ['', 'y']);
+
+        leve("$nom : refus", static function () use ($h): void {
+            tache('http-auth:update', $h);
+        }, \Throwable::class, $fragment);
+        httpAuthAucuneEcritureUpdate($nom);
+        verifie("$nom : aucune saisie", $questions, []);
+    }
+});
+
+cas('http-auth:update : refus en production, sans écriture', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-prod', [], [], $questions);
+    httpAuthInstallationTest($h);
+    httpAuthEnvTest("WP_ENV=production\nWP_HOME=https://www.site.test");
+    httpAuthCurlUpdateTest('200');
+    entree([], true, ['', 'y']);
+
+    leve('refus', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, 'WP_ENV=production');
+    httpAuthAucuneEcritureUpdate('production');
+    aucuneCommande('aucun curl', '/curl /');
+    verifie('aucune saisie', $questions, []);
+});
+
+cas('http-auth:update : WP_HOME absent, erreur avant toute question', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-sans-home', [], [], $questions);
+    httpAuthInstallationTest($h);
+    httpAuthEnvTest('WP_ENV=staging');
+    entree([], true, ['', 'y']);
+
+    leve('erreur', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, 'WP_HOME');
+    httpAuthAucuneEcritureUpdate('sans WP_HOME');
+    verifie('aucune saisie', $questions, []);
+});
+
+cas('http-auth:update : -n, identifiant actuel affiché, rien d\'écrit ni demandé', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-n', [], [], $questions);
+    httpAuthInstallationTest($h, "client:\$2y\$10\$abc\n");
+    httpAuthEnvTest();
+    sortie();
+
+    tache('http-auth:update', $h);
+    $sortie = sortie();
+    contient('mode non interactif', $sortie, 'Mode non interactif');
+    contient('identifiant actuel', $sortie, '« client »');
+    httpAuthAucuneEcritureUpdate('-n');
+    verifie('aucune saisie', $questions, []);
+    aucuneCommande('aucun curl', '/curl /');
+});
+
+cas('http-auth:update : identifiant proposé (réponse vide), mot de passe généré, copie supprimée', static function (): void {
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-ok', [], [''], $questions);
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    Shell::quand('/^stat -c %a /', "600\n");
+    entree([], true, ['', 'y']);
+    sortie();
+
+    tache('http-auth:update', $h);
+    $sortie = sortie();
+    $commandes = implode("\n", Shell::commandes());
+
+    contient('question de l\'identifiant, défaut de l\'inventaire', $sortie, 'Identifiant HTTP');
+    absent('pas de rappel d\'inventaire', $sortie, '.inventory.yaml');
+    vrai('mot de passe affiché', preg_match('/Mot de passe : ([a-hjkmnp-zA-HJKLMNP-Z2-9]{24})\b/', $sortie, $m) === 1);
+    $clair = $m[1] ?? 'introuvable';
+    verifie('affiché une seule fois', substr_count($sortie, $clair), 1);
+    contient('consigne Bitwarden', $sortie, 'Mettez à jour l\'entrée Bitwarden : le mot de passe ne sera plus affiché.');
+    contient('URL', $sortie, 'https://staging.site.test');
+    absent('mot de passe absent des commandes', $commandes, $clair);
+
+    $ligne = (string) httpAuthEcritTest($htpasswd);
+    vrai('.htpasswd : identifiant proposé et hash', strpos($ligne, 'adeliom:') === 0 && password_verify($clair, substr(trim($ligne), 8)));
+    contient('droits conservés', $commandes, 'chmod 600 ' . escapeshellarg($htpasswd . '.horizon-tmp'));
+    $copie = uneCommande('copie avant écriture', '#^cp -p ' . preg_quote(escapeshellarg($htpasswd) . ' ' . escapeshellarg($htpasswd . '.bak'), '#') . '$#');
+    vrai('copie avant l\'écriture', $copie !== null && strpos($commandes, 'cp -p') < strpos($commandes, 'base64 -d'));
+    uneCommande('vérification avec identifiants', '/^curl -sS -o .* -K /');
+    uneCommande('copie supprimée', '/rm -f .*\.htpasswd\.bak/');
+    aucuneCommande('pas de restauration', '/mv .*\.htpasswd\.bak/');
+    aucuneCommande('.htaccess jamais écrit', '/base64 -d.*\.htaccess/');
+});
+
+cas('http-auth:update : identifiant différent, rappel d\'inventaire ; mot de passe saisi jamais affiché', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-client', [], ['secret', 'secret']);
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('302');
+    entree([], true, ['client', 'y']);
+    sortie();
+
+    tache('http-auth:update', $h);
+    $sortie = sortie();
+    contient('rappel d\'inventaire', $sortie, 'Pensez à reporter http_auth_user: client dans .inventory.yaml.');
+    vrai('.htpasswd : nouvel identifiant', strpos((string) httpAuthEcritTest($htpasswd), 'client:') === 0);
+    contient('identifiant récapitulé', $sortie, 'client');
+    absent('mot de passe saisi non affiché', $sortie, 'secret');
+    absent('pas de consigne Bitwarden', $sortie, 'Bitwarden');
+    absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), 'secret');
+    contient('droits illisibles : 644', implode("\n", Shell::commandes()), 'chmod 644 ' . escapeshellarg($htpasswd . '.horizon-tmp'));
+    uneCommande('copie supprimée', '/rm -f .*\.htpasswd\.bak/');
+    aucuneCommande('.htaccess jamais écrit', '/base64 -d.*\.htaccess/');
+});
+
+cas('http-auth:update : identifiant invalide redemandé, trois échecs refusés', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-deux-points');
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    entree([], true, ['a:b', 'client', 'y']);
+    sortie();
+
+    tache('http-auth:update', $h);
+    $sortie = sortie();
+    contient('avertissement', $sortie, 'Identifiant invalide');
+    vrai('.htpasswd : identifiant redemandé', strpos((string) httpAuthEcritTest($htpasswd), 'client:') === 0);
+    aucuneCommande('.htaccess jamais écrit', '/base64 -d.*\.htaccess/');
+
+    $questions = [];
+    $h = httpAuthHoteSetup('http-auth-maj-trois', ['http_auth_user' => ''], [''], $questions);
+    Shell::reinitialiser();
+    httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    entree([], true, ['a:b', '', 'x:y', 'y']);
+
+    leve('trois échecs : erreur', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, 'Identifiant');
+    httpAuthAucuneEcritureUpdate('trois échecs');
+    verifie('mot de passe non demandé', $questions, []);
+});
+
+cas('http-auth:update : confirmation refusée, et fin d\'entrée sans TTY, sans écriture', static function (): void {
+    foreach (['refus' => ['', 'n'], 'eof' => ['']] as $nom => $reponses) {
+        $h = httpAuthHoteSetup('http-auth-maj-' . $nom);
+        Shell::reinitialiser();
+        httpAuthInstallationTest($h);
+        httpAuthEnvTest();
+        httpAuthCurlUpdateTest('200');
+        entree([], true, $reponses);
+
+        tache('http-auth:update', $h);
+        httpAuthAucuneEcritureUpdate($nom);
+        aucuneCommande("$nom : aucun curl", '/curl /');
+    }
+});
+
+cas('http-auth:update : vérification en 401, ancien .htpasswd remis en place, tâche en erreur', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-401');
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('401');
+    entree([], true, ['', 'y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, '200 ou 30x attendu');
+    contient('restauration signalée', $e !== null ? $e->getMessage() : '', 'remis en place');
+    uneCommande('restauration', '#^mv -f ' . preg_quote(escapeshellarg($htpasswd . '.bak') . ' ' . escapeshellarg($htpasswd), '#') . '$#');
+    aucuneCommande('copie non supprimée', '/rm -f .*\.htpasswd\.bak/');
+    aucuneCommande('.htaccess jamais écrit', '/base64 -d.*\.htaccess/');
+});
+
+cas('http-auth:update : exception à l\'écriture, ancien .htpasswd remis, exception d\'origine relancée', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-exception');
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('200');
+    Shell::quand('#base64 -d > ' . preg_quote(escapeshellarg($htpasswd . '.horizon-tmp'), '#') . '#', new \RuntimeException('Disque plein'));
+    entree([], true, ['', 'y']);
+    sortie();
+
+    leve('exception d\'origine', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \RuntimeException::class, 'Disque plein');
+    contient('restauration signalée', sortie(), 'remis en place');
+    uneCommande('restauration', '/mv -f .*\.htpasswd\.bak/');
+    aucuneCommande('pas de vérification', '/curl /');
+});
+
+cas('http-auth:update : copie impossible, rien n\'est prétendu restauré', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-cp-ko');
+    httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    Shell::quand('/^cp -p /', new \RuntimeException('Permission denied'));
+    entree([], true, ['', 'y']);
+    sortie();
+
+    leve('exception d\'origine', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \RuntimeException::class, 'Permission denied');
+    contient('rien de modifié', sortie(), 'n\'a pas été modifié');
+    aucuneCommande('pas de restauration', '/^mv /');
+    aucuneCommande('pas d\'écriture', '/base64 -d/');
+});
+
+cas('http-auth:update : restauration impossible, message qui le dit', static function (): void {
+    $h = httpAuthHoteSetup('http-auth-maj-mv-ko');
+    [, $htpasswd] = httpAuthInstallationTest($h);
+    httpAuthEnvTest();
+    httpAuthCurlUpdateTest('500');
+    Shell::quand('/^mv -f /', new \RuntimeException('Read-only file system'));
+    entree([], true, ['', 'y']);
+
+    $e = leve('erreur', static function () use ($h): void {
+        tache('http-auth:update', $h);
+    }, \Throwable::class, '200 ou 30x attendu');
+    $message = $e !== null ? $e->getMessage() : '';
+    contient('échec de la restauration signalé', $message, $htpasswd . '.bak');
+    absent('pas de « remis en place »', $message, 'est remis en place');
+});
+
+cas('http-auth:update : de bout en bout sur le disque (réel, curl simulés)', static function (): void {
+    $racine = dossierTemporaire();
+    mkdir("$racine/releases/1/web", 0777, true);
+    mkdir("$racine/shared", 0777, true);
+    symlink("$racine/releases/1", "$racine/current");
+    file_put_contents("$racine/shared/.env", "WP_ENV='staging'\nWP_HOME='https://staging.site.test'\n");
+    $htaccess = httpAuthBlock("$racine/shared/.htpasswd", 'Accès restreint', [], ['/.well-known/acme-challenge/']) . "\n# BEGIN WordPress\r\n# END WordPress";
+    file_put_contents("$racine/releases/1/web/.htaccess", $htaccess);
+    file_put_contents("$racine/shared/.htpasswd", "adeliom:\$2y\$10\$ancien\n");
+    chmod("$racine/shared/.htpasswd", 0640);
+
+    $questions = [];
+    $saisie = httpAuthSaisieTest(['mot de "passe"', 'mot de "passe"'], $questions);
+    $h = hoteLocal('http-auth-maj-reel', [
+        'deploy_path' => $racine,
+        'http_auth_password_asker' => static function () use ($saisie): callable {
+            return $saisie;
+        },
+    ]);
+    Shell::$reel = true;
+    $avec = null;
+    $bakPendantVerif = null;
+    Shell::quand('/^curl -sS -o /', static function (array $appel) use ($racine, &$avec, &$bakPendantVerif): string {
+        if (preg_match("/ -K '([^']+)'/", $appel['commande'], $m) === 1) {
+            $avec = file_get_contents($m[1]);
+            $bakPendantVerif = @file_get_contents("$racine/shared/.htpasswd.bak");
+
+            return '200';
+        }
+
+        return '401';
+    });
+    entree([], true, ['client', 'y']);
+    sortie();
+
+    tache('http-auth:update', $h);
+
+    $htpasswd = (string) file_get_contents("$racine/shared/.htpasswd");
+    vrai('.htpasswd : identifiant et hash', strpos($htpasswd, 'client:$2y$') === 0 && password_verify('mot de "passe"', substr(trim($htpasswd), 7)));
+    verifie('droits conservés', fileperms("$racine/shared/.htpasswd") & 0777, 0640);
+    verifie('copie présente pendant la vérification', $bakPendantVerif, "adeliom:\$2y\$10\$ancien\n");
+    vrai('copie supprimée', !file_exists("$racine/shared/.htpasswd.bak"));
+    verifie('.htaccess intact', file_get_contents("$racine/releases/1/web/.htaccess"), $htaccess);
+    verifie('identifiants de la vérification', $avec, 'user = "client:mot de \\"passe\\""' . "\n");
+    absent('mot de passe absent des commandes', implode("\n", Shell::commandes()), 'mot de "passe"');
+    contient('récapitulatif', sortie(), 'https://staging.site.test');
+});
